@@ -1,0 +1,23 @@
+[workspace]
+
+[workspace.dependencies]
+# Pinned to a commit; its embedded artifacts are vendored by
+# `scripts/vendor-contracts.sh` (see the README).
+libid-contracts = { git = "https://github.com/libid-org/libID-contracts", rev = "7bb160f37e71e1d8943979f7608577d9c94e1634" }
+
+[package]
+name = "relayer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+alloy = { version = "2", features = ["contract", "network", "providers", "rpc-types", "transport-http"] }
+libid-contracts.workspace = true
+
+[dev-dependencies]
+alloy = { version = "2", features = ["node-bindings", "provider-anvil-api", "signer-local"] }
+libid-contracts = { workspace = true, features = ["testing"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
