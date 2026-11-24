@@ -30,6 +30,8 @@ elif [[ $# -eq 1 ]]; then
     [[ "$FROM" == "$REV" ]] || { echo "$1 is at $FROM, the pin is $REV" >&2; exit 1; }
     for dir in artifacts artifacts-testing abi; do
         [[ -d "$1/rust/contracts/$dir" ]] || { echo "no rust/contracts/$dir in $1; run its scripts/vendor-artifacts.sh" >&2; exit 1; }
+    done
+    for dir in artifacts artifacts-testing abi; do
         rm -rf "${CRATE:?}/$dir"
         cp -R "$1/rust/contracts/$dir" "$CRATE/$dir"
     done
