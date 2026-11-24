@@ -15,6 +15,7 @@ use alloy::{
 };
 use relayer::{
     check::Checked,
+    config::FeeParams,
     quote::{
         quote,
         Draft,
@@ -426,10 +427,12 @@ fn fillable(data: &Bytes, refunds: &[U256]) -> u64 {
 async fn the_quote_bounds_the_l1_fee_on_a_base_sepolia_fork() {
     let fork = Anvil::new()
         .fork("https://sepolia.base.org")
-        .chain_id(84_532);
+        .chain_id(84_532)
+        .args(["--network", "optimism"]); // mines the fork's extraData
     let o = Onboarding::on(fork, true).await;
     let op_stack = Config {
         l1_fee: L1Fee::OpStack,
+        fee_params: FeeParams::Header,
         ..o.config()
     };
     let b = Batch(o.onboarding(), o.value, vec![&o.k], None);

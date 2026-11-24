@@ -77,10 +77,10 @@ async fn refuses_before_sending() {
         .unwrap();
     // Nothing is mined below, so the check reads this fee and this time.
     let (r, now) = (o.refund(), o.now().await);
-    // The relay-time fee floor: the base fee grown 0.4% a block over the window's 5.
+    // The relay-time fee floor: the base fee grown 12.5% a block over the window's 5.
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
-    let floor = (0..5).fold(u128::from(base), |f, _| (f * 1004).div_ceil(1000));
+    let floor = (0..5).fold(u128::from(base), |f, _| (f * 9).div_ceil(8));
     let bound = o.value + U256::from(GAS_LIMIT) * U256::from(floor);
     let good = o.sign(&o.onboarding()).await;
     let calldata = encode_executions(&o.onboarding());

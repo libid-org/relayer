@@ -41,6 +41,8 @@ use crate::{
     },
     config::{
         Config,
+        Eip1559,
+        FeeParams,
         L1Fee,
     },
 };
@@ -103,16 +105,24 @@ pub(crate) async fn price<P: Provider>(
     Ok((l1_fee_bound, cost))
 }
 
-/// The latest base fee grown by its most, 0.4% a block, over `time`'s blocks.
+/// The latest base fee, at least the chain's minimum, grown by its most over
+/// `time`'s blocks.
 pub(crate) async fn fee_floor<P: Provider>(
     provider: &P,
     config: &Config,
     time: Duration,
 ) -> Result<u128, Refusal> {
-    let base = latest(provider).await?.base_fee_per_gas.unwrap_or_default();
+    let latest = latest(provider).await?;
+    let extra = &latest.extra_data;
+    let unknown = || format!("extraData {extra} is no OP-stack fee rule; set fee_params");
+    let rule = match config.fee_params {
+        FeeParams::Fixed(rule) => rule,
+        FeeParams::Header => {
+            Eip1559::from_extra_data(extra).ok_or_else(|| node(unknown()))?
+        }
+    };
     let blocks = time.as_millis() / config.block_time.as_millis().max(1);
-    let grow = |fee: u128, _| fee.saturating_mul(1004).div_ceil(1000);
-    Ok((0..blocks).fold(u128::from(base), grow))
+    Ok(rule.grow(latest.base_fee_per_gas.unwrap_or_default().into(), blocks))
 }
 
 /// The tip at `percentile` of the latest block's, from `eth_feeHistory`.

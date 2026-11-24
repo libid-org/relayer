@@ -5,7 +5,7 @@ use std::time::Duration;
 use alloy::primitives::Address;
 
 /// The send-to-inclusion window a production chain is configured with.
-pub const INCLUSION_WINDOW: Duration = Duration::from_secs(120);
+pub const INCLUSION_WINDOW: Duration = Duration::from_secs(20);
 
 /// The L1 margin `k` of a production chain, in percent: the L1 fee bound a
 /// refund covers is `k × getL1FeeUpperBound`, sized to the inclusion window.
@@ -24,6 +24,64 @@ pub enum L1Fee {
     OpStack,
     /// No L1 fee, as on anvil.
     None,
+}
+
+/// A chain's EIP-1559 base fee rule: each block's base fee grows at most
+/// `(elasticity - 1) / denominator`, and is never below `min_base_fee`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Eip1559 {
+    /// The base fee change denominator.
+    pub denominator: u32,
+    /// The elasticity multiplier.
+    pub elasticity: u32,
+    /// The minimum base fee, in wei.
+    pub min_base_fee: u64,
+}
+
+impl Eip1559 {
+    /// Ethereum L1's rule: 12.5% a block, no minimum.
+    pub const L1: Self = Self {
+        denominator: 8,
+        elasticity: 2,
+        min_base_fee: 0,
+    };
+
+    /// The rule in an OP-stack header's `extraData`: version 0 (Holocene),
+    /// `0x00 ‖ denominator u32 ‖ elasticity u32`, or version 1 (Jovian), which
+    /// appends `min_base_fee u64`; big-endian.
+    pub fn from_extra_data(extra: &[u8]) -> Option<Self> {
+        let u32_at =
+            |i: usize| Some(u32::from_be_bytes(extra.get(i..i + 4)?.try_into().ok()?));
+        let min_base_fee = match (extra.first(), extra.len()) {
+            (Some(0), 9) => 0,
+            (Some(1), 17) => u64::from_be_bytes(extra[9..17].try_into().ok()?),
+            _ => return None,
+        };
+        let (denominator, elasticity) = (u32_at(1)?, u32_at(5)?);
+        (denominator != 0 && elasticity != 0).then_some(Self {
+            denominator,
+            elasticity,
+            min_base_fee,
+        })
+    }
+
+    /// `max(base_fee, min_base_fee)` grown by its most over `blocks`, rounded up
+    /// each block.
+    pub fn grow(&self, base_fee: u128, blocks: u128) -> u128 {
+        let d = u128::from(self.denominator.max(1));
+        let n = d + u128::from(self.elasticity.max(1)) - 1;
+        let base = base_fee.max(u128::from(self.min_base_fee));
+        (0..blocks).fold(base, |fee, _| fee.saturating_mul(n).div_ceil(d))
+    }
+}
+
+/// Where the relayer reads a chain's base fee rule, at each fee it computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeParams {
+    /// The latest OP-stack header's `extraData`.
+    Header,
+    /// A fixed rule.
+    Fixed(Eip1559),
 }
 
 /// One chain's relayer configuration.
@@ -46,15 +104,17 @@ pub struct Config {
     pub inclusion_window: Duration,
     /// How long a quote stays valid; its fee covers the base fee's growth meanwhile.
     pub quote_validity: Duration,
-    /// The chain's block time, over which the base fee grows at most 0.4% a block.
+    /// The chain's block time, the step of the base fee's growth.
     pub block_time: Duration,
+    /// The chain's base fee rule.
+    pub fee_params: FeeParams,
     /// The fee-history percentile a send's tip is read at.
     pub tip_percentile: f64,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
-    /// as anvil mines each send at once; 1 s blocks.
+    /// as anvil mines each send at once; 1 s blocks and L1's base fee rule.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -71,6 +131,7 @@ impl Config {
             inclusion_window: Duration::from_secs(5),
             quote_validity: QUOTE_VALIDITY,
             block_time: Duration::from_secs(1),
+            fee_params: FeeParams::Fixed(Eip1559::L1),
             tip_percentile: TIP_PERCENTILE,
         }
     }
