@@ -11,6 +11,12 @@ pub const INCLUSION_WINDOW: Duration = Duration::from_secs(120);
 /// refund covers is `k × getL1FeeUpperBound`, sized to the inclusion window.
 pub const L1_MARGIN: u64 = 130;
 
+/// How long a quote stays valid on a production chain.
+pub const QUOTE_VALIDITY: Duration = Duration::from_secs(30);
+
+/// The fee-history percentile a send's tip is read at, between 50 and 90.
+pub const TIP_PERCENTILE: f64 = 75.0;
+
 /// How the relayer bounds the L1 data fee of a send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L1Fee {
@@ -38,11 +44,17 @@ pub struct Config {
     /// How long a send may take to be included: a batch must still run that
     /// long after the latest block, and a send waits that long for its receipt.
     pub inclusion_window: Duration,
+    /// How long a quote stays valid; its fee covers the base fee's growth meanwhile.
+    pub quote_validity: Duration,
+    /// The chain's block time, over which the base fee grows at most 0.4% a block.
+    pub block_time: Duration,
+    /// The fee-history percentile a send's tip is read at.
+    pub tip_percentile: f64,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
-    /// as anvil mines each send at once.
+    /// as anvil mines each send at once; 1 s blocks.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -57,6 +69,9 @@ impl Config {
             l1_fee: L1Fee::None,
             l1_margin: L1_MARGIN,
             inclusion_window: Duration::from_secs(5),
+            quote_validity: QUOTE_VALIDITY,
+            block_time: Duration::from_secs(1),
+            tip_percentile: TIP_PERCENTILE,
         }
     }
 }

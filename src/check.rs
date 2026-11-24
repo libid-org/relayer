@@ -134,13 +134,14 @@ pub async fn check<P: Provider>(
         message.value,
     );
     let call = call.await?;
-    let priced = gas::price(provider, config, call.clone(), request.gas_limit);
-    let (mut tx, _, cost) = priced.await?;
+    let floor = gas::fee_floor(provider, config, config.inclusion_window).await?;
+    let priced = gas::price(provider, config, &call, request.gas_limit, floor);
+    let (l1_fee_bound, cost) = priced.await?;
     let value = message.value;
-    if refund.checked_sub(value).is_none_or(|net| net < cost) {
+    let Some(net) = refund.checked_sub(value).filter(|net| *net >= cost) else {
         let required = value.saturating_add(cost);
         return Err(Refusal::RefundTooLow { refund, required });
-    }
+    };
     let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
     let (create, priced_for) = (create.is_some(), request.gas_limit);
     let refunds = refunds(&executions, config.relayer);
@@ -148,7 +149,16 @@ pub async fn check<P: Provider>(
     let limit = relay_limit(
         provider, &call, late, call_gas, create, priced_for, fillable,
     );
-    tx.set_gas_limit(limit.await?);
+    let limit = limit.await?;
+    // The fee cap the refund pays for at the limit sent: at least `floor`.
+    let cap = (net - l1_fee_bound) / U256::from(limit);
+    let cap = u128::try_from(cap).unwrap_or(u128::MAX);
+    let tip = gas::tip(provider, config.tip_percentile).await?.min(cap);
+    let tx = call
+        .with_gas_limit(limit)
+        .with_max_fee_per_gas(cap)
+        .with_max_priority_fee_per_gas(tip)
+        .with_chain_id(config.chain_id);
     simulate(provider, &tx, late).await?;
     let timeout = config.inclusion_window;
     Ok(Checked { tx, timeout })

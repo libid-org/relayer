@@ -1,7 +1,12 @@
 //! What a send needs in gas and in L1 fee, from one simulation.
 
+use std::time::Duration;
+
 use alloy::{
-    consensus::SignableTransaction,
+    consensus::{
+        Header,
+        SignableTransaction,
+    },
     eips::BlockNumberOrTag,
     network::TransactionBuilder,
     primitives::{
@@ -80,36 +85,56 @@ pub(crate) fn fillable(
     NONZERO_BYTE * (signed.sum::<u64>() + refunds.sum::<u64>() + stamps)
 }
 
-/// `call` priced at `gas_limit` and the node's fees, the tip at most the fee cap; its
-/// L1 fee bound; and the most it costs the relayer, `gas_limit × max fee + L1 bound`.
+/// `call`'s L1 fee bound at `gas_limit`, and the most it costs the relayer at
+/// `max_fee_per_gas`: `gas_limit × max fee + L1 bound`.
 pub(crate) async fn price<P: Provider>(
     provider: &P,
     config: &Config,
-    call: TransactionRequest,
+    call: &TransactionRequest,
     gas_limit: u64,
-) -> Result<(TransactionRequest, U256, U256), Refusal> {
-    let fees = provider.estimate_eip1559_fees().await.map_err(node)?;
-    let max_fee_per_gas = fees.max_fee_per_gas;
-    let tx = call
-        .with_gas_limit(gas_limit)
-        .with_max_fee_per_gas(max_fee_per_gas)
-        .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(max_fee_per_gas))
-        .with_chain_id(config.chain_id);
-    let l1_fee_bound = l1_fee_bound(provider, config, &tx).await?;
+    max_fee_per_gas: u128,
+) -> Result<(U256, U256), Refusal> {
+    let l1_fee_bound = l1_fee_bound(provider, config, call, gas_limit).await?;
     let cost = U256::from(gas_limit)
         .saturating_mul(U256::from(max_fee_per_gas))
         .saturating_add(l1_fee_bound);
-    Ok((tx, l1_fee_bound, cost))
+    Ok((l1_fee_bound, cost))
+}
+
+/// The latest base fee grown by its most, 0.4% a block, over `time`'s blocks.
+pub(crate) async fn fee_floor<P: Provider>(
+    provider: &P,
+    config: &Config,
+    time: Duration,
+) -> Result<u128, Refusal> {
+    let base = latest(provider).await?.base_fee_per_gas.unwrap_or_default();
+    let blocks = time.as_millis() / config.block_time.as_millis().max(1);
+    let grow = |fee: u128, _| fee.saturating_mul(1004).div_ceil(1000);
+    Ok((0..blocks).fold(u128::from(base), grow))
+}
+
+/// The tip at `percentile` of the latest block's, from `eth_feeHistory`.
+pub(crate) async fn tip<P: Provider>(
+    provider: &P,
+    percentile: f64,
+) -> Result<u128, Refusal> {
+    let percentiles = [percentile];
+    let history = provider.get_fee_history(1, BlockNumberOrTag::Latest, &percentiles);
+    let reward = history.await.map_err(node)?.reward;
+    Ok(reward
+        .and_then(|r| r.last()?.first().copied())
+        .unwrap_or_default())
 }
 
 /// The latest block's timestamp.
 pub(crate) async fn latest_time<P: Provider>(provider: &P) -> Result<u64, Refusal> {
+    Ok(latest(provider).await?.timestamp)
+}
+
+async fn latest<P: Provider>(provider: &P) -> Result<Header, Refusal> {
     let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
     let latest = latest.await.map_err(node)?;
-    Ok(latest
-        .ok_or_else(|| node("no latest block"))?
-        .header
-        .timestamp)
+    Ok(latest.ok_or_else(|| node("no latest block"))?.header.inner)
 }
 
 /// `tx` run once with `eth_simulateV1` after the latest block, in a block at `time`.
@@ -144,18 +169,25 @@ pub(crate) async fn simulate<P: Provider>(
     Ok(call)
 }
 
-/// `k × getL1FeeUpperBound` of `tx`'s unsigned size: the L1 fee a refund covers.
+/// `k × getL1FeeUpperBound` of `call`'s unsigned size at `gas_limit`: the L1 fee a
+/// refund covers.
 async fn l1_fee_bound<P: Provider>(
     provider: &P,
     config: &Config,
-    tx: &TransactionRequest,
+    call: &TransactionRequest,
+    gas_limit: u64,
 ) -> Result<U256, Refusal> {
     if config.l1_fee == L1Fee::None {
         return Ok(U256::ZERO);
     }
-    // The provider fills the nonce at send; the largest one sizes the bound.
-    let mut tx = tx.clone();
-    tx.nonce.get_or_insert(u64::MAX);
+    // The nonce and fees are set at send; the largest ones size the bound.
+    let tx = call
+        .clone()
+        .with_gas_limit(gas_limit)
+        .with_chain_id(config.chain_id)
+        .nonce(u64::MAX)
+        .max_fee_per_gas(u128::MAX)
+        .max_priority_fee_per_gas(u128::MAX);
     let size = tx.build_1559().map_err(node)?.encoded_for_signing().len();
     let oracle = GasPriceOracle::new(GAS_PRICE_ORACLE, provider);
     let bound = oracle.getL1FeeUpperBound(U256::from(size));

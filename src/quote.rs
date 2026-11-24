@@ -54,19 +54,22 @@ pub struct Draft {
 }
 
 /// What the client signs: `call_gas`, and a refund of at least `value + min_refund`
-/// for a send at `gas_limit`. Its fee is the node's estimate when quoted.
+/// for a send at `gas_limit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quote {
     /// The gas the wallet reserves for each call: the simulation's gas used.
     pub call_gas: u64,
     /// The gas limit the refund is priced for.
     pub gas_limit: u64,
-    /// The fee cap the refund is priced at.
+    /// The fee cap the refund is priced at: the base fee grown by its most until
+    /// `valid_until` and over the inclusion window, plus the tip.
     pub max_fee_per_gas: u128,
     /// The L1 fee bound with its margin.
     pub l1_fee_bound: U256,
     /// `gas_limit × max_fee_per_gas + l1_fee_bound`.
     pub min_refund: U256,
+    /// The latest block time the quote is priced for, in Unix seconds.
+    pub valid_until: u64,
 }
 
 /// Quote `draft` against `config` on the chain `provider` reads.
@@ -81,7 +84,8 @@ pub async fn quote<P: Provider>(
     let call = target(provider, config, wallet, create, &draft.data, message.value);
     let call = call.await?;
     // After the latest block: nodes refuse a simulated block that is not.
-    let late = gas::latest_time(provider).await? + config.inclusion_window.as_secs();
+    let now = gas::latest_time(provider).await?;
+    let late = now + config.inclusion_window.as_secs();
     let sim = gas::simulate(provider, &call, late).await?;
     // Every call ran; only the dummy signatures failed.
     let unsigned = sim.return_data[..] == IWebWallet::ExecutionNotSigned::SELECTOR;
@@ -97,14 +101,18 @@ pub async fn quote<P: Provider>(
     let unmeasured =
         unmeasured(&message, &authorization, refunds, call_gas, below_quorum);
     let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
-    let (tx, l1_fee_bound, min_refund) =
-        gas::price(provider, config, call, gas_limit).await?;
+    let growth = config.quote_validity + config.inclusion_window;
+    let floor = gas::fee_floor(provider, config, growth).await?;
+    let max_fee_per_gas = floor + gas::tip(provider, config.tip_percentile).await?;
+    let priced = gas::price(provider, config, &call, gas_limit, max_fee_per_gas);
+    let (l1_fee_bound, min_refund) = priced.await?;
     Ok(Quote {
         call_gas,
         gas_limit,
-        max_fee_per_gas: tx.max_fee_per_gas.unwrap_or_default(),
+        max_fee_per_gas,
         l1_fee_bound,
         min_refund,
+        valid_until: now + config.quote_validity.as_secs(),
     })
 }
 
