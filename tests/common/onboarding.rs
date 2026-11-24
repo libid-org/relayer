@@ -63,7 +63,6 @@ use libid_contracts::{
 };
 use relayer::{
     check::{
-        check,
         Create,
         Refusal,
         Request,

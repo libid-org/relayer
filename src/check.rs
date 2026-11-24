@@ -127,69 +127,64 @@ pub enum Refusal {
     Node(String),
 }
 
-/// Check `request` against `config` on the chain `provider` reads, and set its
-/// gas limit from its simulation.
-pub async fn check<P: Provider>(
-    provider: &P,
-    config: &Config,
-    request: &Request,
-) -> Result<Checked, Refusal> {
-    let (message, authorization, executions) =
-        decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
-    let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
-    let late =
-        unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
-    let (wallet, create) = (request.wallet, request.create);
-    let call = target(
-        provider,
-        config,
-        wallet,
-        create,
-        &request.data,
-        message.value,
-    );
-    let call = call.await?;
-    let head = gas::head(provider, config).await?;
-    let priced = gas::price(provider, config, &call, request.gas_limit, head.floor);
-    let (l1_fee_bound, cost) = priced.await?;
-    let value = message.value;
-    let Some(net) = refund.checked_sub(value).filter(|net| *net >= cost) else {
-        let required = value.saturating_add(cost);
-        return Err(Refusal::RefundTooLow { refund, required });
-    };
-    let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
-    let (create, priced_for) = (create.is_some(), request.gas_limit);
-    let refunds = refunds(&executions, config.relayer);
-    let fillable = gas::fillable(&message, &authorization, refunds);
-    let limit = relay_limit(
-        provider, &call, late, call_gas, create, priced_for, fillable,
-    );
-    let limit = limit.await?;
-    // The fee cap the refund pays for at the limit sent: at least the floor.
-    let cap = (net - l1_fee_bound) / U256::from(limit);
-    let cap = u128::try_from(cap).unwrap_or(u128::MAX);
-    let tip = gas::tip(provider, config.tip_percentile).await?;
-    let at_cap = |cap: u128| {
-        call.clone()
-            .with_gas_limit(limit)
-            .with_max_fee_per_gas(cap)
-            .with_max_priority_fee_per_gas(tip.min(cap))
-            .with_chain_id(config.chain_id)
-    };
-    // Run at the cap a send uses; queued at the cap from R.
-    simulate(
-        provider,
-        &at_cap(cap.min(head.fee_bound(config))),
-        None,
-        late,
-    )
-    .await?;
-    let tx = at_cap(cap);
-    Ok(Checked {
-        tx,
-        net,
-        l1_fee_bound,
-    })
+impl Request {
+    /// Check this request against `config` on the chain `provider` reads, and set
+    /// its gas limit from its simulation.
+    pub async fn check<P: Provider>(
+        &self,
+        provider: &P,
+        config: &Config,
+    ) -> Result<Checked, Refusal> {
+        let (message, authorization, executions) =
+            decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
+        let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
+        let late =
+            unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
+        let (wallet, create) = (self.wallet, self.create);
+        let call = target(provider, config, wallet, create, &self.data, message.value);
+        let call = call.await?;
+        let head = gas::head(provider, config).await?;
+        let priced = gas::price(provider, config, &call, self.gas_limit, head.floor);
+        let (l1_fee_bound, cost) = priced.await?;
+        let value = message.value;
+        let Some(net) = refund.checked_sub(value).filter(|net| *net >= cost) else {
+            let required = value.saturating_add(cost);
+            return Err(Refusal::RefundTooLow { refund, required });
+        };
+        let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
+        let (create, priced_for) = (create.is_some(), self.gas_limit);
+        let refunds = refunds(&executions, config.relayer);
+        let fillable = gas::fillable(&message, &authorization, refunds);
+        let limit = relay_limit(
+            provider, &call, late, call_gas, create, priced_for, fillable,
+        );
+        let limit = limit.await?;
+        // The fee cap the refund pays for at the limit sent: at least the floor.
+        let cap = (net - l1_fee_bound) / U256::from(limit);
+        let cap = u128::try_from(cap).unwrap_or(u128::MAX);
+        let tip = gas::tip(provider, config.tip_percentile).await?;
+        let at_cap = |cap: u128| {
+            call.clone()
+                .with_gas_limit(limit)
+                .with_max_fee_per_gas(cap)
+                .with_max_priority_fee_per_gas(tip.min(cap))
+                .with_chain_id(config.chain_id)
+        };
+        // Run at the cap a send uses; queued at the cap from R.
+        simulate(
+            provider,
+            &at_cap(cap.min(head.fee_bound(config))),
+            None,
+            late,
+        )
+        .await?;
+        let tx = at_cap(cap);
+        Ok(Checked {
+            tx,
+            net,
+            l1_fee_bound,
+        })
+    }
 }
 
 /// The message `data` carries, its authorization and its batch, all canonical.

@@ -17,7 +17,6 @@ use relayer::{
     check::Checked,
     config::FeeParams,
     quote::{
-        quote,
         Draft,
         Quote,
     },
@@ -90,7 +89,7 @@ impl Onboarding {
             data: self.authorize(b, None).await,
             below_quorum: b.3.is_some(),
         };
-        quote(&self.relayer, config, &draft).await
+        draft.quote(&self.relayer, config).await
     }
 
     /// The request for `data` on the wallet's current path, priced at `gas_limit`.
@@ -106,7 +105,7 @@ impl Onboarding {
     /// The relayer's check of `data` at `gas_limit`, without sending.
     async fn check_at(&self, data: &Bytes, gas_limit: u64) -> Result<Checked, Refusal> {
         let request = self.request_at(data, gas_limit).await;
-        check(&self.relayer, &self.config(), &request).await
+        request.check(&self.relayer, &self.config()).await
     }
 
     /// This test's own `eth_simulateV1` of the outer call for `data`.
@@ -287,7 +286,7 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
         data: o.authorize(&b, None).await,
         below_quorum: false,
     };
-    let refused = quote(&o.relayer, &o.config(), &draft).await.err();
+    let refused = draft.quote(&o.relayer, &o.config()).await.err();
     let spent = |r: &Refusal| reverted(r, "DigestSpent"); // the link's, spent by its landing
     assert!(refused.as_ref().is_some_and(spent), "{refused:?}");
 }
@@ -339,7 +338,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         data: message.authorized_data(authorization),
         below_quorum: false,
     };
-    let q3 = quote(&o.relayer, &o.config(), &draft).await.unwrap();
+    let q3 = draft.quote(&o.relayer, &o.config()).await.unwrap();
     assert_eq!(unreserved(&q3), unreserved(&q));
     o.send(&o.request_at(&data, q.gas_limit).await).await;
 

@@ -72,48 +72,50 @@ pub struct Quote {
     pub valid_until: u64,
 }
 
-/// Quote `draft` against `config` on the chain `provider` reads.
-pub async fn quote<P: Provider>(
-    provider: &P,
-    config: &Config,
-    draft: &Draft,
-) -> Result<Quote, Refusal> {
-    let (message, authorization, executions) =
-        decode(&draft.data).ok_or(Refusal::NoncanonicalData)?;
-    let (wallet, create) = (draft.wallet, draft.create);
-    let call = target(provider, config, wallet, create, &draft.data, message.value);
-    let call = call.await?;
-    // After the latest block: nodes refuse a simulated block that is not.
-    let now = gas::latest_time(provider).await?;
-    let late = now + config.inclusion_window.as_secs();
-    let sim = gas::simulate(provider, &call, late).await?;
-    // Every call ran; only the dummy signatures failed.
-    let unsigned = sim.return_data[..] == IWebWallet::ExecutionNotSigned::SELECTOR;
-    if !sim.status && !unsigned {
-        return Err(reverted(sim.return_data));
+impl Draft {
+    /// Quote this draft against `config` on the chain `provider` reads.
+    pub async fn quote<P: Provider>(
+        &self,
+        provider: &P,
+        config: &Config,
+    ) -> Result<Quote, Refusal> {
+        let (message, authorization, executions) =
+            decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
+        let (wallet, create) = (self.wallet, self.create);
+        let call = target(provider, config, wallet, create, &self.data, message.value);
+        let call = call.await?;
+        // After the latest block: nodes refuse a simulated block that is not.
+        let now = gas::latest_time(provider).await?;
+        let late = now + config.inclusion_window.as_secs();
+        let sim = gas::simulate(provider, &call, late).await?;
+        // Every call ran; only the dummy signatures failed.
+        let unsigned = sim.return_data[..] == IWebWallet::ExecutionNotSigned::SELECTOR;
+        if !sim.status && !unsigned {
+            return Err(reverted(sim.return_data));
+        }
+        let call_gas = sim.gas_used;
+        let below_quorum = self.below_quorum.then_some(executions.len());
+        let refunds = refunds(&executions, config.relayer);
+        if refunds.clone().next().is_none() {
+            return Err(Refusal::RefundMissing);
+        }
+        let unmeasured =
+            unmeasured(&message, &authorization, refunds, call_gas, below_quorum);
+        let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
+        let growth = config.quote_validity + config.inclusion_window;
+        let floor = gas::fee_floor(provider, config, growth).await?;
+        let max_fee_per_gas = floor + gas::tip(provider, config.tip_percentile).await?;
+        let priced = gas::price(provider, config, &call, gas_limit, max_fee_per_gas);
+        let (l1_fee_bound, min_refund) = priced.await?;
+        Ok(Quote {
+            call_gas,
+            gas_limit,
+            max_fee_per_gas,
+            l1_fee_bound,
+            min_refund,
+            valid_until: now + config.quote_validity.as_secs(),
+        })
     }
-    let call_gas = sim.gas_used;
-    let below_quorum = draft.below_quorum.then_some(executions.len());
-    let refunds = refunds(&executions, config.relayer);
-    if refunds.clone().next().is_none() {
-        return Err(Refusal::RefundMissing);
-    }
-    let unmeasured =
-        unmeasured(&message, &authorization, refunds, call_gas, below_quorum);
-    let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
-    let growth = config.quote_validity + config.inclusion_window;
-    let floor = gas::fee_floor(provider, config, growth).await?;
-    let max_fee_per_gas = floor + gas::tip(provider, config.tip_percentile).await?;
-    let priced = gas::price(provider, config, &call, gas_limit, max_fee_per_gas);
-    let (l1_fee_bound, min_refund) = priced.await?;
-    Ok(Quote {
-        call_gas,
-        gas_limit,
-        max_fee_per_gas,
-        l1_fee_bound,
-        min_refund,
-        valid_until: now + config.quote_validity.as_secs(),
-    })
 }
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft

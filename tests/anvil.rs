@@ -179,7 +179,7 @@ async fn refuses_before_sending() {
 
     let nonce = o.relayer_nonce().await;
     for (name, request, expected) in cases {
-        let refused = check(&o.relayer, &o.config(), &request).await.err();
+        let refused = request.check(&o.relayer, &o.config()).await.err();
         assert!(
             refused.as_ref().is_some_and(expected),
             "{name}: {refused:?}"
@@ -190,7 +190,7 @@ async fn refuses_before_sending() {
         o.owner.get_code_at(o.wallet).await.unwrap().is_empty(),
         "a wallet was created"
     );
-    let refused = check(&o.relayer, &o.config(), &below_bound).await.err();
+    let refused = below_bound.check(&o.relayer, &o.config()).await.err();
     let Some(Refusal::RefundTooLow { refund, required }) = refused else {
         panic!("{refused:?}")
     };
@@ -199,7 +199,7 @@ async fn refuses_before_sending() {
     let at_bound = o.request_for(&o.batch(o.repay(bound))).await;
     let at_window = o.request(sign_at(o.value, now, now + window));
     for request in [o.request(good.clone()), at_bound, at_window] {
-        check(&o.relayer, &o.config(), &request).await.unwrap();
+        request.check(&o.relayer, &o.config()).await.unwrap();
     }
     let op_stack = Config {
         l1_fee: L1Fee::OpStack,
@@ -207,7 +207,9 @@ async fn refuses_before_sending() {
     };
     // An oracle whose `getL1FeeUpperBound` is 1 ether: the refund must cover 1.3 ether more.
     o.set_code(ORACLE, "670de0b6b3a76400005f5260205ff3").await;
-    let refused = check(&o.relayer, &op_stack, &o.request(good.clone()))
+    let refused = o
+        .request(good.clone())
+        .check(&o.relayer, &op_stack)
         .await
         .err();
     let Some(Refusal::RefundTooLow { required, .. }) = refused else {
@@ -218,18 +220,21 @@ async fn refuses_before_sending() {
     let m = U256::from(o.config().max_fee_percent);
     let at_bound = U256::from(GAS_LIMIT) * U256::from(base) * m / U256::from(100);
     o.set_balance(o.relayer_address, o.value + at_bound).await;
-    check(&o.relayer, &o.config(), &o.request(good.clone()))
+    o.request(good.clone())
+        .check(&o.relayer, &o.config())
         .await
         .unwrap();
     // A node error that is not a revert is not reported as one.
     o.set_balance(o.relayer_address, U256::ZERO).await;
-    let refused = check(&o.relayer, &o.config(), &o.request(good.clone()))
+    let refused = o
+        .request(good.clone())
+        .check(&o.relayer, &o.config())
         .await
         .err();
     assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
     // The value but not the gas: only the priced call fails, and not as a revert.
     o.set_balance(o.relayer_address, o.value).await;
-    let refused = check(&o.relayer, &o.config(), &o.request(good)).await.err();
+    let refused = o.request(good).check(&o.relayer, &o.config()).await.err();
     assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
 }
 
@@ -239,7 +244,7 @@ async fn refuses_before_sending() {
 async fn an_empty_escrow_is_refused_as_nothing_held() {
     let o = Onboarding::new(false).await;
     let data = o.sign(&o.onboarding()).await;
-    let refused = check(&o.relayer, &o.config(), &o.request(data)).await.err();
+    let refused = o.request(data).check(&o.relayer, &o.config()).await.err();
     let Some(Refusal::Reverted { error: Some(e), .. }) = refused else {
         panic!("{refused:?}")
     };

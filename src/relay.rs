@@ -58,7 +58,6 @@ use rusqlite::{
 
 use crate::{
     check::{
-        check,
         decode,
         node,
         rerun,
@@ -271,7 +270,7 @@ impl<P: Provider> Relayer<P> {
         if let Some(id) = admit(&self.db(), id, wallet)? {
             return Ok(id);
         }
-        let checked = check(p, c, request).await?;
+        let checked = request.check(p, c).await?;
         self.queue(id, wallet, &checked, message.deadline.to())
     }
 
