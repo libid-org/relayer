@@ -241,6 +241,16 @@ impl<P: Provider> Relayer<P> {
             None => drop(conn.execute("INSERT INTO nonce (next) VALUES (?1)", [mined])?),
             Some(next) => explained(&provider, &conn, mined, next).await?,
         }
+        let growth = gas::window_growth(&provider, &config)
+            .await
+            .map_err(refused)?;
+        let m = config.max_fee_percent;
+        if m < growth {
+            let under = format!("max_fee_percent {m} is under the {growth}% fee growth");
+            eprintln!(
+                "{under} over inclusion_window; sends cap at that growth: raise it"
+            );
+        }
         Ok(Self {
             provider,
             config,
@@ -461,11 +471,12 @@ impl<P: Provider> Relayer<P> {
         self.cancel(id, last, head).await.map(|()| None)
     }
 
-    /// Sign the queued transaction at `nonce` with its fee cap at most M × the pinned
-    /// base fee and the tip read now, run it again at the pinned block, then commit
-    /// and broadcast it. True when it failed instead, and the next may be sent: its
-    /// cap or L1 bound no longer covered, its run failing for good, or a node error
-    /// on its run for `node_error_ticks` ticks in a row.
+    /// Sign the queued transaction at `nonce` with its fee cap at most the pinned
+    /// block's fee bound and the tip read now, run it again at the pinned block, then
+    /// commit and broadcast it. True when it failed instead, and the next may be sent:
+    /// its refund no longer covering the floor at the L1 bound read now, its run
+    /// failing for good, or a node error on its run for `node_error_ticks` ticks in a
+    /// row.
     async fn send(
         &self,
         ticking: &mut Ticking,
@@ -477,18 +488,18 @@ impl<P: Provider> Relayer<P> {
         let tx: TransactionRequest = serde_json::from_str(&tx)?;
         let (limit, value) = (tx.gas.unwrap_or_default(), tx.value.unwrap_or_default());
         let refund = net + value;
-        let cap = tx.max_fee_per_gas.unwrap_or_default();
+        // A node error here is not the request's, so it counts no strike.
+        let now = gas::l1_fee_bound(&self.provider, &self.config, &tx, limit, head.at());
+        let now = now.await.map_err(refused)?;
+        // The cap the refund covers at the bound read now and, as stored, at the bound
+        // a rebroadcast is checked against.
+        let covered = net.saturating_sub(now) / U256::from(limit);
+        let covered = u128::try_from(covered).unwrap_or(u128::MAX);
+        let cap = tx.max_fee_per_gas.unwrap_or_default().min(covered);
         let cap = cap.min(head.fee_bound(&self.config));
         if cap < head.floor {
             let gas = U256::from(limit) * U256::from(head.floor);
-            let required = value + gas + l1;
-            return self.fail(id, &Refusal::RefundTooLow { refund, required });
-        }
-        let at = head.at();
-        let now = gas::l1_fee_bound(&self.provider, &self.config, &tx, limit, at);
-        let now = now.await.map_err(refused)?;
-        if now > l1 {
-            let required = refund + now - l1;
+            let required = value + gas + now.max(l1);
             return self.fail(id, &Refusal::RefundTooLow { refund, required });
         }
         let tip = gas::tip(&self.provider, self.config.tip_percentile).await;
@@ -498,7 +509,7 @@ impl<P: Provider> Relayer<P> {
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
         let attempt = self.sign(tx, false, head).await?;
-        let required = affordable(&attempt.raw, (net, l1))?;
+        let required = affordable(&attempt.raw, (net, now))?;
         if balance < required {
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }

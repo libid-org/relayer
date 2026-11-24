@@ -408,29 +408,37 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
-/// On an OP-stack chain a balance below a send's worst cost fails it unpaused, and one
-/// of exactly `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part.
+/// On an OP-stack chain a rise of the oracle's bound since the check that the refund
+/// no longer covers fails a send for `value + limit × floor + k × U`; one it covers
+/// sends. A balance below a send's worst cost fails it unpaused, and one of exactly
+/// `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part.
 #[tokio::test]
 async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let o = Onboarding::new(true).await;
     let mut config = o.config();
     config.l1_fee = L1Fee::OpStack;
-    // An oracle whose `getL1FeeUpperBound` is 10 gwei.
-    o.set_code(ORACLE, "6402540be4005f5260205ff3").await;
-    let k_u = U256::from(13_000_000_000u64);
+    // An oracle whose `getL1FeeUpperBound` is `wei`.
+    let oracle = async |wei: u128| {
+        o.set_code(ORACLE, &format!("7f{wei:064x}5f5260205ff3"))
+            .await
+    };
+    let (gwei, ether) = (1_000_000_000u128, 1_000_000_000_000_000_000u128);
+    oracle(10 * gwei).await;
+    let k_u = U256::from(13 * gwei);
     let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
     let (r, request) = (r.unwrap(), o.request_for(&o.onboarding()).await);
     let id = r.relay(&request).await.unwrap();
-    // The oracle's bound doubled since the check: refused for k × the 10 gwei more.
-    o.set_code(ORACLE, "6404a817c8005f5260205ff3").await;
+    oracle(ether).await;
+    let pinned = o.owner.get_block_by_number(Default::default()).await;
+    let base = u128::from(pinned.unwrap().unwrap().header.base_fee_per_gas.unwrap());
     r.tick().await.unwrap();
     let status = r.status(id).await.unwrap().status;
-    let Status::Failed(Refusal::RefundTooLow { refund, required }) = status else {
+    let Status::Failed(Refusal::RefundTooLow { required, .. }) = status else {
         panic!("{status:?}")
     };
-    assert_eq!(required - refund, k_u);
-    o.set_code(ORACLE, "6402540be4005f5260205ff3").await;
+    oracle(10 * gwei).await;
     assert_eq!(r.relay(&request).await.unwrap(), id);
+    oracle(20 * gwei).await;
     o.set_balance(o.relayer_address, U256::from(1)).await;
     r.tick().await.unwrap();
     let status = r.status(id).await.unwrap().status;
@@ -442,12 +450,42 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     };
     assert!(!r.paused().await, "paused by one request");
     o.set_balance(o.relayer_address, worst).await;
+    oracle(10 * gwei).await;
     assert_eq!(r.relay(&request).await.unwrap(), id);
+    oracle(20 * gwei).await;
     let hashes = o.settle(&r, id, included).await.tx_hashes;
-    o.assert_within_refund(&hashes, k_u).await;
+    o.assert_within_refund(&hashes, k_u * U256::from(2)).await;
     let t = o.tx(hashes[0]).await.inner;
     let cap = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
-    assert_eq!(worst, cap + k_u + o.value);
+    assert_eq!(worst, cap + k_u * U256::from(2) + o.value);
+    let floor = U256::from(relayer::config::Eip1559::L1.grow(base, 5));
+    let l1 = U256::from(ether * 13 / 10);
+    assert_eq!(required, o.value + U256::from(t.gas_limit()) * floor + l1);
+}
+
+/// With M under the fee rule's growth over the window, a request sends at the floor.
+#[tokio::test]
+async fn a_max_fee_percent_under_the_window_growth_still_sends() {
+    let o = Onboarding::new(true).await;
+    let config = Config {
+        max_fee_percent: 100,
+        ..o.config()
+    };
+    let r = Relayer::start(o.relayer.clone(), config, &db("low-m")).await;
+    let (r, latest) = (r.unwrap(), o.owner.get_block_by_number(Default::default()));
+    let base = u128::from(
+        latest
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .base_fee_per_gas
+            .unwrap(),
+    );
+    let id = o.queue(&r).await;
+    let hash = o.settle(&r, id, included).await.tx_hashes[0];
+    let floor = relayer::config::Eip1559::L1.grow(base, 5);
+    assert!(o.tx(hash).await.inner.max_fee_per_gas() >= floor);
 }
 
 /// A transaction removed by `evm_revert` is sent again, the same raw transaction.

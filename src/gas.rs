@@ -124,16 +124,31 @@ pub(crate) async fn fee_floor<P: Provider>(
 /// `time`'s blocks.
 #[allow(clippy::result_large_err)] // the `Refusal` that its callers return
 fn grown(config: &Config, header: &Header, time: Duration) -> Result<u128, Refusal> {
+    let base_fee = header.base_fee_per_gas.unwrap_or_default().into();
+    Ok(rule(config, header)?.grow(base_fee, config.blocks(time)))
+}
+
+/// The latest block's base fee rule's most growth over the inclusion window, in
+/// percent.
+pub(crate) async fn window_growth<P: Provider>(
+    provider: &P,
+    config: &Config,
+) -> Result<u64, Refusal> {
+    let rule = rule(config, &latest(provider).await?)?;
+    Ok(rule.growth_percent(config.blocks(config.inclusion_window)))
+}
+
+/// The base fee rule at `header`.
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+fn rule(config: &Config, header: &Header) -> Result<Eip1559, Refusal> {
     let extra = &header.extra_data;
     let unknown = || format!("extraData {extra} is no OP-stack fee rule; set fee_params");
-    let rule = match config.fee_params {
-        FeeParams::Fixed(rule) => rule,
+    match config.fee_params {
+        FeeParams::Fixed(rule) => Ok(rule),
         FeeParams::Header => {
-            Eip1559::from_extra_data(extra).ok_or_else(|| node(unknown()))?
+            Eip1559::from_extra_data(extra).ok_or_else(|| node(unknown()))
         }
-    };
-    let base_fee = header.base_fee_per_gas.unwrap_or_default().into();
-    Ok(rule.grow(base_fee, config.blocks(time)))
+    }
 }
 
 /// The tip at `percentile` over the last [`TIP_BLOCKS`], from `eth_feeHistory`.
@@ -186,10 +201,10 @@ impl Head {
         BlockId::hash_canonical(self.hash)
     }
 
-    /// M × its base fee: the most a send's fee cap is.
+    /// M × its base fee, at least its floor: the most a send's fee cap is.
     pub(crate) fn fee_bound(&self, config: &Config) -> u128 {
         let m = config.max_fee_percent.into();
-        self.base_fee.saturating_mul(m) / 100
+        (self.base_fee.saturating_mul(m) / 100).max(self.floor)
     }
 }
 
