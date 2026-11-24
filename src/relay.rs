@@ -78,6 +78,9 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// A request's `R - value` and the L1 fee bound its refund covers.
 type Cover = (U256, U256);
 
+/// A queued request: id, transaction, cover, deadline.
+type Queued = (B256, String, Cover, u64);
+
 /// The fee-history percentile a cancel's tip is read at.
 const CANCEL_PERCENTILE: f64 = 90.0;
 
@@ -161,6 +164,13 @@ struct Attempt {
     at: u64,
 }
 
+/// What a tick leaves for the next, behind the lock that runs one tick at a time.
+#[derive(Default)]
+struct Ticking {
+    /// The balance at the last pinned block is below `min_balance`.
+    low: bool,
+}
+
 /// The relayer of one chain and one key, the only writer of the key's nonces
 /// while it holds the lock on its database.
 pub struct Relayer<P> {
@@ -168,6 +178,7 @@ pub struct Relayer<P> {
     config: Config,
     db: Mutex<Connection>,
     paused: AtomicBool,
+    ticking: tokio::sync::Mutex<Ticking>,
     _lock: File,
 }
 
@@ -213,6 +224,7 @@ impl<P: Provider> Relayer<P> {
             config,
             db: Mutex::new(conn),
             paused: AtomicBool::new(false),
+            ticking: Default::default(),
             _lock: file,
         })
     }
@@ -261,11 +273,14 @@ impl<P: Provider> Relayer<P> {
     /// Resolve or rebroadcast each request in flight, then send the oldest queued one
     /// when none is in flight and the key's count at the pinned block is the stored
     /// next nonce. Above it a foreign nonce pauses sending; below it ours is unmined.
+    /// A balance below `min_balance` pauses sending until a tick finds it funded.
     pub async fn tick(&self) -> Result<(), Error> {
+        let mut ticking = self.ticking.lock().await;
         let head = gas::head(&self.provider, &self.config)
             .await
             .map_err(refused)?;
-        let mined = self.provider.get_transaction_count(self.config.relayer);
+        let relayer = self.config.relayer;
+        let mined = self.provider.get_transaction_count(relayer);
         let mined = mined.block_id(head.at()).await?;
         for (id, deadline, cover) in self.in_flight(mined)? {
             self.watch(id, deadline, cover, &head, mined).await?;
@@ -274,15 +289,27 @@ impl<P: Provider> Relayer<P> {
         if mined > next {
             self.paused.store(true, Relaxed);
         }
+        let balance = self
+            .provider
+            .get_balance(relayer)
+            .block_id(head.at())
+            .await?;
+        let floor = self.config.min_balance;
+        ticking.low = balance < floor;
         if self.paused.load(Relaxed) || mined < next || !self.in_flight(mined)?.is_empty()
         {
             return Ok(());
         }
-        let Some((id, tx, cover, deadline)) = self.queued()? else {
-            return Ok(());
-        };
-        let tx = serde_json::from_str(&tx)?;
-        self.send(id, tx, cover, deadline, &head, next).await
+        if ticking.low {
+            let low = format!("balance {balance} below min_balance {floor}");
+            return Err(format!("{low}: sending paused until it is funded").into());
+        }
+        while let Some(queued) = self.queued()? {
+            if !self.send(queued, &head, next, balance).await? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The requests in flight at the mined count: id, deadline, cover.
@@ -295,8 +322,8 @@ impl<P: Provider> Relayer<P> {
         rows(&self.db(), &sql, [mined], row)
     }
 
-    /// The oldest queued request: id, transaction, cover, deadline.
-    fn queued(&self) -> Result<Option<(B256, String, Cover, u64)>, Error> {
+    /// The oldest queued request.
+    fn queued(&self) -> Result<Option<Queued>, Error> {
         let sql = "SELECT id, tx, net, l1, deadline FROM requests \
                    WHERE status = 'queued' ORDER BY rowid LIMIT 1";
         let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?));
@@ -352,10 +379,10 @@ impl<P: Provider> Relayer<P> {
         })
     }
 
-    /// Whether sending paused: a foreign nonce, a low balance, a refused first send or
-    /// a cancel above the max cancel fee.
+    /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a
+    /// refused first send or a cancel above the max cancel fee.
     pub async fn paused(&self) -> bool {
-        self.paused.load(Relaxed)
+        self.paused.load(Relaxed) || self.ticking.lock().await.low
     }
 
     /// Resolve `id` from a receipt of any of its attempts. With none, broadcast its send
@@ -400,17 +427,17 @@ impl<P: Provider> Relayer<P> {
         self.cancel(id, last, head, mined).await
     }
 
-    /// Sign `tx` at `nonce` with its fee cap at most M × the pinned base fee and the
-    /// tip read now, run it again at the pinned block, then commit and broadcast it.
+    /// Sign the queued transaction at `nonce` with its fee cap at most M × the pinned
+    /// base fee and the tip read now, run it again at the pinned block, then commit
+    /// and broadcast it. True when it failed instead, and the next may be sent.
     async fn send(
         &self,
-        id: B256,
-        tx: TransactionRequest,
-        cover: Cover,
-        deadline: u64,
+        (id, tx, cover, deadline): Queued,
         head: &Head,
         nonce: u64,
-    ) -> Result<(), Error> {
+        balance: U256,
+    ) -> Result<bool, Error> {
+        let tx: TransactionRequest = serde_json::from_str(&tx)?;
         let cap = tx.max_fee_per_gas.unwrap_or_default();
         let cap = cap.min(head.fee_bound(&self.config));
         let tip = gas::tip(&self.provider, self.config.tip_percentile).await;
@@ -420,22 +447,25 @@ impl<P: Provider> Relayer<P> {
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
         let attempt = self.sign(tx, false, head).await?;
-        let worst = affordable(&attempt.raw, cover)?;
-        let balance = self.provider.get_balance(self.config.relayer);
-        let balance = balance.block_id(head.at()).await?;
-        if balance < worst {
-            self.paused.store(true, Relaxed);
-            let short = format!("balance {balance} below a send's cost {worst}");
-            return Err(format!("{short}: sending paused; fund it and restart").into());
+        let required = affordable(&attempt.raw, cover)?;
+        if balance < required {
+            return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
         match run.await {
             Err(Refusal::Node(e)) => return Err(e.into()),
-            Err(refusal) => return self.set_status(id, "failed", None, Some(&refusal)),
+            Err(refusal) => return self.fail(id, &refusal),
             Ok(()) => {}
         }
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, cover, None, head, nonce).await
+        self.broadcast(&attempt, cover, None, head, nonce).await?;
+        Ok(false)
+    }
+
+    /// Mark `id` failed for `refusal`; true, as the next may be sent.
+    fn fail(&self, id: B256, refusal: &Refusal) -> Result<bool, Error> {
+        self.set_status(id, "failed", None, Some(refusal))?;
+        Ok(true)
     }
 
     /// A 0-value self-send at `last`'s nonce, both fees at least 1.1× `last`'s and its
@@ -741,17 +771,37 @@ fn affordable(raw: &[u8], (net, l1): Cover) -> Result<U256, Error> {
 
 /// A failure as stored: its name and its fields.
 fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
+    let words = |a: &U256, b: &U256| [a.to_be_bytes::<32>(), b.to_be_bytes()].concat();
     match refusal {
         Refusal::Reverted { data, .. } => ("Reverted".into(), data.to_vec()),
+        Refusal::RefundTooLow { refund, required } => {
+            ("RefundTooLow".into(), words(refund, required))
+        }
+        Refusal::RelayerUnderfunded { balance, required } => {
+            ("RelayerUnderfunded".into(), words(balance, required))
+        }
+        Refusal::Node(e) => ("Node".into(), e.as_bytes().to_vec()),
         other => (format!("{other:?}"), vec![]),
     }
 }
 
-/// The failure [`encode_failure`] stored: what a send's run refuses.
+/// The failure [`encode_failure`] stored: what a send refuses.
 fn decode_failure(name: &str, detail: Option<Vec<u8>>) -> Refusal {
     let detail = detail.unwrap_or_default();
+    let word =
+        |i: usize| U256::from_be_slice(detail.get(i * 32..i * 32 + 32).unwrap_or(&[]));
+    let (first, second) = (word(0), word(1));
     match name {
         "Reverted" => reverted(detail.into()),
+        "RefundTooLow" => Refusal::RefundTooLow {
+            refund: first,
+            required: second,
+        },
+        "RelayerUnderfunded" => Refusal::RelayerUnderfunded {
+            balance: first,
+            required: second,
+        },
+        "Node" => Refusal::Node(String::from_utf8_lossy(&detail).into()),
         _ => Refusal::Expired,
     }
 }

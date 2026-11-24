@@ -358,8 +358,8 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
-/// On an OP-stack chain a balance of exactly `gasLimit × maxFeePerGas + k × U + value`
-/// sends, within the refund's L1 part.
+/// On an OP-stack chain a balance below a send's worst cost fails it unpaused, and one
+/// of exactly `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part.
 #[tokio::test]
 async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let o = Onboarding::new(true).await;
@@ -368,19 +368,21 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     // An oracle whose `getL1FeeUpperBound` is 10 gwei.
     o.set_code(ORACLE, "6402540be4005f5260205ff3").await;
     let k_u = U256::from(13_000_000_000u64);
-    let path = db("l1");
-    let r = Relayer::start(o.relayer.clone(), config.clone(), &path).await;
-    let r = r.unwrap();
-    let id = o.onboard(&r, 1800).await.unwrap();
+    let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
+    let (r, request) = (r.unwrap(), o.request_for(&o.onboarding()).await);
+    let id = r.relay(&request).await.unwrap();
     o.set_balance(o.relayer_address, U256::from(1)).await;
-    let refused = r.tick().await.unwrap_err().to_string();
-    let worst = refused.split(' ').nth(6).unwrap().trim_end_matches(':');
-    let worst: U256 = worst.parse().unwrap();
+    r.tick().await.unwrap();
+    let status = r.status(id).await.unwrap().status;
+    let Status::Failed(Refusal::RelayerUnderfunded {
+        required: worst, ..
+    }) = status
+    else {
+        panic!("{status:?}")
+    };
+    assert!(!r.paused().await, "paused by one request");
     o.set_balance(o.relayer_address, worst).await;
-    drop(r);
-    let r = Relayer::start(o.relayer.clone(), config, &path)
-        .await
-        .unwrap();
+    assert_eq!(r.relay(&request).await.unwrap(), id);
     let hashes = o.settle(&r, id, included).await.tx_hashes;
     o.assert_within_refund(&hashes, k_u).await;
     let t = o.tx(hashes[0]).await.inner;
@@ -454,26 +456,32 @@ async fn a_landed_send_records_its_receipt_cost() {
     assert!(created > 0 && sent >= created && cost.included_at >= sent);
 }
 
-/// A balance below a send's worst cost leaves it queued with no nonce, and pauses.
+/// A balance below `min_balance` pauses sending, even one that covers the send, and
+/// leaves it queued with no nonce; funded to the floor, the next tick sends.
 #[tokio::test]
 async fn an_underfunded_relayer_pauses_before_its_send() {
-    let o = Onboarding::new(true).await;
-    let r = o.start(&db("underfunded")).await.unwrap();
+    let (o, floor) = (Onboarding::new(true).await, U256::from(CLAIMED));
+    let config = Config {
+        min_balance: floor,
+        ..o.config()
+    };
+    let r = Relayer::start(o.relayer.clone(), config, &db("underfunded")).await;
+    let r = r.unwrap();
     let id = o.onboard(&r, 3600).await.unwrap();
-    o.set_balance(o.relayer_address, o.value).await; // the value, not its gas
-    let refused = r.tick().await.expect_err("sent underfunded").to_string();
-    assert!(refused.contains("below a send's cost"), "{refused}");
-    assert!(r.paused().await, "no pause");
-    let report = r.status(id).await.unwrap();
-    assert!(
-        matches!(report.status, Status::Queued),
-        "{:?}",
-        report.status
-    );
-    assert!(
-        report.tx_hashes.is_empty() && o.relayer_nonce().await == 0,
-        "sent"
-    );
+    // The value, not its gas; then the send's cost, below the floor.
+    for balance in [o.value, floor - U256::ONE] {
+        o.set_balance(o.relayer_address, balance).await;
+        let refused = r.tick().await.expect_err("sent underfunded").to_string();
+        assert!(refused.contains("min_balance"), "{refused}");
+        assert!(r.paused().await, "no pause");
+        let report = r.status(id).await.unwrap();
+        let queued =
+            matches!(report.status, Status::Queued) && report.tx_hashes.is_empty();
+        assert!(queued && o.relayer_nonce().await == 0, "sent");
+    }
+    o.set_balance(o.relayer_address, floor).await;
+    o.settle(&r, id, included).await;
+    assert!(!r.paused().await, "paused while funded");
 }
 
 /// A first send the node refuses is uncommitted, queued again, and pauses.
@@ -488,7 +496,7 @@ async fn a_refused_first_send_is_queued_again_and_pauses() {
         .with_to(o.relayer_address)
         .with_max_fee_per_gas(1000 * gwei)
         .with_max_priority_fee_per_gas(100 * gwei);
-    let _pending = o.relayer.send_transaction(ahead).await.unwrap();
+    let pending = o.relayer.send_transaction(ahead).await.unwrap();
     let id = o.onboard(&r, 3600).await.unwrap();
     let refused = r.tick().await.expect_err("refusal unreported").to_string();
     assert!(refused.contains("refused"), "{refused}");
@@ -502,6 +510,12 @@ async fn a_refused_first_send_is_queued_again_and_pauses() {
         report.tx_hashes.is_empty() && r.paused().await,
         "sent or unpaused"
     );
+    // Its nonce free again: still paused, nothing sent.
+    let ahead = *pending.tx_hash();
+    o.owner.anvil_drop_transaction(ahead).await.unwrap();
+    r.tick().await.unwrap();
+    let report = r.status(id).await.unwrap();
+    assert!(report.tx_hashes.is_empty(), "sent while paused");
 }
 
 /// The key's nonce taken between the pinned block and the broadcast: the node answers

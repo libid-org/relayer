@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{
+    Address,
+    U256,
+};
 
 /// The send-to-inclusion window a production chain is configured with. The fee
 /// covers the base fee's growth over it and the quote's validity: ×1.49 on Base.
@@ -126,12 +129,14 @@ pub struct Config {
     pub max_fee_percent: u64,
     /// The highest fee cap a cancel is raised to, in wei per gas.
     pub max_cancel_fee: u128,
+    /// The balance below which sending pauses, in wei.
+    pub min_balance: U256,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
-    /// growth over the window, and cancels up to 10,000 gwei.
+    /// growth over the window, cancels up to 10,000 gwei, and no balance floor.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -152,6 +157,7 @@ impl Config {
             tip_percentile: TIP_PERCENTILE,
             max_fee_percent: 0,
             max_cancel_fee: 10_000_000_000_000,
+            min_balance: U256::ZERO,
         };
         let window = config.blocks(config.inclusion_window);
         config.max_fee_percent = Eip1559::L1.growth_percent(window);

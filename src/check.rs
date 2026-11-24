@@ -111,6 +111,13 @@ pub enum Refusal {
         /// The revert data.
         data: Bytes,
     },
+    /// The relayer's balance at its send does not cover its worst cost and value.
+    RelayerUnderfunded {
+        /// The balance at the pinned block.
+        balance: U256,
+        /// The send's worst cost plus its value.
+        required: U256,
+    },
     /// Another batch of the wallet is in flight.
     WalletBusy {
         /// The request in flight.
