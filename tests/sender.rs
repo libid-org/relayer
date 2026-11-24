@@ -56,12 +56,15 @@ impl Onboarding {
         self.set_code(ORACLE, &code).await;
     }
 
-    /// Sent with automine off, priced out, then past its deadline: still pending.
+    /// Sent with automine off, priced out, then at its deadline: still pending.
     async fn priced_out(&self, r: &Rel) -> (B256, Transaction, Bytes) {
         self.owner.anvil_set_auto_mine(false).await.unwrap();
+        let deadline = self.now().await + 60;
         let id = self.onboard(r, 60).await.unwrap();
         r.tick().await.unwrap();
-        let hash = r.status(id).await.unwrap().tx_hashes[0];
+        let report = r.status(id).await.unwrap();
+        assert!(matches!(report.status, Status::Sent), "{:?}", report.status);
+        let hash = report.tx_hashes[0];
         let raw = self.owner.get_raw_transaction_by_hash(hash).await.unwrap();
         let tx = self.tx(hash).await;
         self.assert_within_refund(&[hash], U256::ZERO).await;
@@ -70,7 +73,9 @@ impl Onboarding {
         r.tick().await.unwrap(); // priced out, but before its deadline
         let early = r.status(id).await.unwrap().tx_hashes;
         assert_eq!(early, [hash], "cancelled before its deadline");
-        self.owner.anvil_increase_time(120).await.unwrap();
+        // The latest block at the deadline: the next tick cancels.
+        let at = self.owner.anvil_set_next_block_timestamp(deadline);
+        at.await.unwrap();
         self.owner.evm_mine(None).await.unwrap();
         assert!(!self.mined(hash).await, "mined above its fee cap");
         (id, tx, raw.unwrap())
@@ -142,6 +147,8 @@ async fn a_send_priced_out_is_cancelled_at_its_deadline() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("cancel")).await.unwrap();
     let (id, sent, _) = o.priced_out(&r).await;
+    let latest = o.owner.get_block_by_number(Default::default()).await;
+    let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
     let cancelled = |s: &Status| matches!(s, Status::Cancelled { .. });
     let report = o.settle(&r, id, cancelled).await;
     let (first, cancel) = (report.tx_hashes[0], report.tx_hashes[1]);
@@ -151,6 +158,10 @@ async fn a_send_priced_out_is_cancelled_at_its_deadline() {
     let to_self = (Some(o.relayer_address), U256::ZERO, s.nonce());
     assert_eq!((c.to(), c.value(), c.nonce()), to_self);
     assert!(c.max_fee_per_gas() * 10 >= s.max_fee_per_gas() * 11);
+    assert!(
+        c.max_fee_per_gas() >= 2 * u128::from(base),
+        "cap below 2 × base fee"
+    );
     let tip = |t: &Transaction| t.inner.max_priority_fee_per_gas().unwrap();
     assert!(tip(&cancel) * 10 >= tip(&sent) * 11);
     o.base_fee(1_000_000_000).await;
@@ -194,6 +205,26 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     assert!(refused.contains("relayer reconcile"), "{refused}");
 }
 
+/// A foreign transaction mined at a stored send's nonce pauses its rebroadcast,
+/// and the stored send without a receipt refuses start.
+#[tokio::test]
+async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
+    let (o, db) = (Onboarding::new(true).await, db("taken"));
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let r = o.start(&db).await.unwrap();
+    let id = o.onboard(&r, 3600).await.unwrap();
+    r.tick().await.unwrap();
+    let hash = r.status(id).await.unwrap().tx_hashes[0];
+    o.owner.anvil_drop_transaction(hash).await.unwrap();
+    o.owner.anvil_set_auto_mine(true).await.unwrap();
+    o.foreign().await;
+    r.tick().await.unwrap();
+    assert!(r.paused().await, "no pause on a taken nonce");
+    drop(r);
+    let refused = o.start(&db).await.err().unwrap();
+    assert!(refused.contains("relayer reconcile"), "{refused}");
+}
+
 /// `getL1Fee(rawTx) > k × U` fails the request `L1FeeAboveBound` with nothing
 /// broadcast; at exactly `k × U` it sends, within the refund's L1 part.
 #[tokio::test]
@@ -204,7 +235,8 @@ async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
     let bound = U256::from(10_000_000_000u64);
     let k_u = bound * U256::from(config.l1_margin) / U256::from(100);
     o.oracle(bound, k_u + U256::from(1)).await;
-    let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
+    let path = db("l1");
+    let r = Relayer::start(o.relayer.clone(), config.clone(), &path).await;
     let r = r.unwrap();
     let above = |r: &Refusal| matches!(r, Refusal::L1FeeAboveBound { .. });
     // Refused at relay or failed before the first broadcast.
@@ -218,10 +250,33 @@ async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
         }
     }
     assert_eq!(o.relayer_nonce().await, 0, "broadcast above the bound");
+    // Passed at relay, refused at its send: the failure keeps its fee and bound.
     o.oracle(bound, k_u).await;
     let id = o.onboard(&r, 1800).await.unwrap();
-    o.assert_within_refund(&o.settle(&r, id, included).await.tx_hashes, k_u)
-        .await;
+    o.oracle(bound, k_u + U256::from(1)).await;
+    r.tick().await.unwrap();
+    let status = r.status(id).await.unwrap().status;
+    let fields = (k_u + U256::from(1), k_u);
+    let failed = matches!(status, Status::Failed(Refusal::L1FeeAboveBound { fee, bound })
+        if (fee, bound) == fields);
+    assert!(failed && o.relayer_nonce().await == 0, "{status:?}");
+    // A balance of exactly `gasLimit × maxFeePerGas + k × U + value` sends.
+    o.oracle(bound, k_u).await;
+    let id = o.onboard(&r, 1800).await.unwrap();
+    o.set_balance(o.relayer_address, U256::from(1)).await;
+    let refused = r.tick().await.unwrap_err().to_string();
+    let worst = refused.split(' ').nth(6).unwrap().trim_end_matches(':');
+    let worst: U256 = worst.parse().unwrap();
+    o.set_balance(o.relayer_address, worst).await;
+    drop(r);
+    let r = Relayer::start(o.relayer.clone(), config, &path)
+        .await
+        .unwrap();
+    let hashes = o.settle(&r, id, included).await.tx_hashes;
+    o.assert_within_refund(&hashes, k_u).await;
+    let t = o.tx(hashes[0]).await.inner;
+    let cap = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
+    assert_eq!(worst, cap + k_u + o.value);
 }
 
 /// A transaction removed by `evm_revert` is sent again, the same raw transaction.
@@ -234,11 +289,16 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     let hashes = o.settle(&r, id, included).await.tx_hashes;
     assert!(o.owner.anvil_revert(snapshot).await.unwrap());
     assert!(!o.mined(hashes[0]).await);
+    // Queued while the node's nonce is below ours; the resent batch then reverts it.
+    let late = o.onboard(&r, 1800).await.unwrap();
     for _ in 0..50 {
         r.tick().await.unwrap();
     }
     assert!(o.mined(hashes[0]).await, "not sent again");
     assert_eq!(r.status(id).await.unwrap().tx_hashes, hashes);
+    let late = r.status(late).await.unwrap().status;
+    let reverted = matches!(late, Status::Failed(Refusal::Reverted { .. }));
+    assert!(reverted && !r.paused().await, "{late:?}");
 }
 
 /// A request whose deadline no longer covers the window fails unsent at its send.
@@ -246,7 +306,9 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
 async fn a_request_expired_before_its_send_fails_unsent() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("stale")).await.unwrap();
-    let id = o.onboard(&r, 60).await.unwrap();
+    let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
+    let request = o.request(o.sign_until(calls, o.value, now, now + 60));
+    let id = r.relay(&request).await.unwrap();
     o.owner.anvil_increase_time(58).await.unwrap();
     o.owner.evm_mine(None).await.unwrap();
     r.tick().await.unwrap();
@@ -257,9 +319,15 @@ async fn a_request_expired_before_its_send_fails_unsent() {
         report.tx_hashes.is_empty() && o.relayer_nonce().await == 0,
         "sent"
     );
+    let again = r.relay(&request).await;
+    assert!(
+        matches!(again, Err(Refusal::Expired)),
+        "not checked again: {again:?}"
+    );
 }
 
-/// A landed send's receipt cost goes on its request row, seen after it was queued.
+/// A landed send's receipt cost goes on its request row, seen after it was queued;
+/// it is confirmed once the safe head reaches it.
 #[tokio::test]
 async fn a_landed_send_records_its_receipt_cost() {
     let o = Onboarding::new(true).await;
@@ -274,6 +342,15 @@ async fn a_landed_send_records_its_receipt_cost() {
     assert_eq!(cost.l1_fee, U256::ZERO, "an L1 fee on anvil");
     let (created, sent) = (report.created_at, report.sent_at[0]);
     assert!(created > 0 && sent >= created && cost.included_at >= sent);
+    o.owner.anvil_mine(Some(32), None).await.unwrap(); // anvil's safe head lags 32
+    r.tick().await.unwrap();
+    let status = r.status(id).await.unwrap().status;
+    let block = receipt.block_number.unwrap();
+    let confirmed = Status::Confirmed {
+        block,
+        reverted: false,
+    };
+    assert_eq!(format!("{status:?}"), format!("{confirmed:?}"));
 }
 
 /// A balance below a send's worst cost leaves it queued with no nonce, and pauses.
