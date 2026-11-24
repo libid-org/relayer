@@ -25,6 +25,9 @@ fn growth_follows_the_chains_rule() {
     assert_eq!(holocene.grow(999, 1), 1013);
     // L1: 12.5% a block.
     assert_eq!(Eip1559::L1.grow(1000, 2), 1266);
+    // M over 5 blocks: 1.125^5 = 1.802 on L1, 1.004^5 = 1.020 on Base, its floor ignored.
+    assert_eq!(Eip1559::L1.growth_percent(5), 181);
+    assert_eq!(base.growth_percent(5), 103);
     // Unrecognised: a version's wrong length, an unknown version, a zero parameter.
     let min = 1u64.to_be_bytes();
     for bad in [

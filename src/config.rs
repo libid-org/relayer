@@ -74,6 +74,16 @@ impl Eip1559 {
         let base = base_fee.max(u128::from(self.min_base_fee));
         (0..blocks).fold(base, |fee, _| fee.saturating_mul(n).div_ceil(d))
     }
+
+    /// The most the base fee grows over `blocks` without its minimum, in percent
+    /// rounded up.
+    pub fn growth_percent(&self, blocks: u128) -> u64 {
+        let rule = Self {
+            min_base_fee: 0,
+            ..*self
+        };
+        u64::try_from(rule.grow(10_000, blocks).div_ceil(100)).unwrap_or(u64::MAX)
+    }
 }
 
 /// Where the relayer reads a chain's base fee rule, at each fee it computes.
@@ -111,18 +121,24 @@ pub struct Config {
     pub fee_params: FeeParams,
     /// The fee-history percentile a send's tip is read at.
     pub tip_percentile: f64,
+    /// M: a send's fee cap is at most M percent of the pinned block's base fee, at
+    /// least the base fee rule's growth over the inclusion window.
+    pub max_fee_percent: u64,
+    /// The highest fee cap a cancel is raised to, in wei per gas.
+    pub max_cancel_fee: u128,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
-    /// as anvil mines each send at once; 1 s blocks and L1's base fee rule.
+    /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
+    /// growth over the window, and cancels up to 10,000 gwei.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
         forwarder: Address,
         relayer: Address,
     ) -> Self {
-        Self {
+        let mut config = Self {
             chain_id,
             factory,
             forwarder,
@@ -134,6 +150,16 @@ impl Config {
             block_time: Duration::from_secs(1),
             fee_params: FeeParams::Fixed(Eip1559::L1),
             tip_percentile: TIP_PERCENTILE,
-        }
+            max_fee_percent: 0,
+            max_cancel_fee: 10_000_000_000_000,
+        };
+        let window = config.blocks(config.inclusion_window);
+        config.max_fee_percent = Eip1559::L1.growth_percent(window);
+        config
+    }
+
+    /// The blocks in `time`, at the chain's block time.
+    pub fn blocks(&self, time: Duration) -> u128 {
+        time.as_millis() / self.block_time.as_millis().max(1)
     }
 }

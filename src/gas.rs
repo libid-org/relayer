@@ -121,8 +121,8 @@ pub(crate) async fn fee_floor<P: Provider>(
             Eip1559::from_extra_data(extra).ok_or_else(|| node(unknown()))?
         }
     };
-    let blocks = time.as_millis() / config.block_time.as_millis().max(1);
-    Ok(rule.grow(latest.base_fee_per_gas.unwrap_or_default().into(), blocks))
+    let base_fee = latest.base_fee_per_gas.unwrap_or_default().into();
+    Ok(rule.grow(base_fee, config.blocks(time)))
 }
 
 /// The tip at `percentile` of the latest block's, from `eth_feeHistory`.
