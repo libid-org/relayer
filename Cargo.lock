@@ -2653,7 +2653,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "libid-contracts"
 version = "0.23.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=7bb160f37e71e1d8943979f7608577d9c94e1634#7bb160f37e71e1d8943979f7608577d9c94e1634"
+source = "git+https://github.com/libid-org/libID-contracts?rev=dbe6ceb4f7521ced42eaec8deacf2082b8600ea5#dbe6ceb4f7521ced42eaec8deacf2082b8600ea5"
 dependencies = [
  "alloy",
  "include_dir",

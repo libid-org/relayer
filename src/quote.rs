@@ -30,11 +30,8 @@ use crate::{
     gas,
 };
 
-/// What `wallet-verify.json` leaves out, measured on anvil and padded: `_verify`'s
-/// loop around each further signer's check (382 gas), and the run after a valid
-/// `_verify` with the signed `callGas` (463).
-const SIGNER_LOOP: u64 = 450;
-const SIGNED_TAIL: u64 = 600;
+/// Calldata gas per byte above a zero byte's (EIP-2028).
+const NONZERO_BYTE: u64 = 12;
 
 /// A batch to quote: its data carries a well-formed dummy signature for every signer.
 #[derive(Clone, Debug)]
@@ -95,17 +92,20 @@ pub async fn quote<P: Provider>(
         } else {
             KeyKind::WebAuthn
         };
-        match i {
-            0 if ecdsa => 0,
-            0 => costs.verify(kind),
-            _ => costs.verify(kind) + SIGNER_LOOP,
+        if i == 0 && ecdsa {
+            0
+        } else {
+            costs.verify(kind)
         }
     });
-    let mut unmeasured: u64 = SIGNED_TAIL + unchecked.sum::<u64>();
+    let call_gas = sim.gas_used;
+    // The draft signs `callGas = 0`; the signed data carries `call_gas`.
+    let call_gas_bytes = u64::from(u64::BITS - call_gas.leading_zeros()).div_ceil(8);
+    let mut unmeasured =
+        costs.verify_tail() + NONZERO_BYTE * call_gas_bytes + unchecked.sum::<u64>();
     if draft.below_quorum {
         unmeasured += costs.rules(executions.len() as u64);
     }
-    let call_gas = sim.gas_used;
     let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
     let fees = provider.estimate_eip1559_fees().await.map_err(node)?;
     let tx = gas::priced(call, gas_limit, &fees, config.chain_id);
