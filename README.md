@@ -29,3 +29,6 @@ cargo test
 ```
 
 `tests/anvil.rs` starts its own `anvil` (Foundry), which must be on `PATH`.
+
+CI (`.github/workflows/ci.yml`) runs the vendor script, then formatting,
+clippy and the tests, on the Foundry and Rust versions it pins.
