@@ -12,6 +12,7 @@ use alloy::{
 use libid_contracts::{
     bindings::wallet::{
         ExecuteAuthorization,
+        ExecuteMessage,
         IWebWallet,
     },
     gas::{
@@ -93,7 +94,8 @@ pub async fn quote<P: Provider>(
     if refunds.clone().next().is_none() {
         return Err(Refusal::RefundMissing);
     }
-    let unmeasured = unmeasured(&authorization, refunds, call_gas, below_quorum);
+    let unmeasured =
+        unmeasured(&message, &authorization, refunds, call_gas, below_quorum);
     let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
     let (tx, l1_fee_bound, min_refund) =
         gas::price(provider, config, call, gas_limit).await?;
@@ -108,9 +110,10 @@ pub async fn quote<P: Provider>(
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
 /// did not check, the rest of a valid `_verify`, the signed `call_gas` word, the
-/// zero bytes of its signatures and `refunds` as nonzero, a value transfer for a
-/// refund drafted at 0, and, below quorum, the rules check of that many calls.
+/// zero bytes the client fills as nonzero ([`gas::fillable`]), a value transfer for
+/// a refund drafted at 0, and, below quorum, the rules check of that many calls.
 fn unmeasured(
+    message: &ExecuteMessage,
     authorization: &ExecuteAuthorization,
     refunds: impl Iterator<Item = U256> + Clone,
     call_gas: u64,
@@ -132,7 +135,7 @@ fn unmeasured(
     let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
     costs.verify_tail()
         + NONZERO_BYTE * call_gas_bytes
-        + gas::fillable(authorization, refunds)
+        + gas::fillable(message, authorization, refunds)
         + unchecked.sum::<u64>()
         + rules
         + transfers

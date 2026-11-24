@@ -311,14 +311,12 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         "{estimate} for {used}"
     );
     // Signed with a refund of fewer zero bytes than quoted: the quote overshoots the
-    // run by exactly the zero bytes left in R and the signatures, at 12 gas × 1.25.
+    // run by exactly the zero bytes left in R, the signatures, `at` and the deadline,
+    // at 12 gas × 1.25.
     let signed_r = r + U256::from(0x0101_0101_0101u64);
     let signed = Batch(vec![o.repay(signed_r)], U256::ZERO, vec![&o.k, &k2], None);
     let data = o.authorize(&signed, Some(q.call_gas)).await;
-    let (_, authorization) = ExecuteMessage::from_authorized_data(&data).unwrap();
-    let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
-    let sigs = authorization.signatures.iter().map(|s| zeros(&s.signature));
-    let filled = zeros(&signed_r.to_be_bytes::<32>()) + sigs.sum::<u64>();
+    let filled = fillable(&data, &[signed_r]);
     let run = o.limit(&data, U256::ZERO, q.call_gas).await;
     let overshoot = q.gas_limit.saturating_sub(run);
     // 1 for rounding, 15 for a zero byte inside `call_gas`.
@@ -330,6 +328,19 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     let q2 = o.quote_with(&o.config(), &signed).await;
     let unreserved = |q: &Quote| q.gas_limit - reserve(q.call_gas, false);
     assert_eq!(unreserved(&q2), unreserved(&q));
+    // So do the deadline's: one of no zero bytes is quoted as the draft's.
+    let draft = o.authorize(&b, None).await;
+    let (mut message, authorization) =
+        ExecuteMessage::from_authorized_data(&draft).unwrap();
+    message.deadline = U48::from(0x0101_0101_0101u64);
+    let draft = Draft {
+        wallet: o.wallet,
+        create: None,
+        data: message.authorized_data(authorization),
+        below_quorum: false,
+    };
+    let q3 = quote(&o.relayer, &o.config(), &draft).await.unwrap();
+    assert_eq!(unreserved(&q3), unreserved(&q));
     let checked = o.relay(&data, q.gas_limit).await.unwrap();
     chain::send(&o.relayer, checked).await.unwrap();
 
@@ -412,13 +423,15 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     }
 }
 
-/// The zero bytes a client may fill when it signs `data` with `refunds`.
+/// The zero bytes a client may fill when it signs `data` with `refunds`: in them, the
+/// signatures, and the six bytes of `at` and of the deadline.
 fn fillable(data: &Bytes, refunds: &[U256]) -> u64 {
-    let (_, authorization) = ExecuteMessage::from_authorized_data(data).unwrap();
+    let (message, authorization) = ExecuteMessage::from_authorized_data(data).unwrap();
     let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
     let signatures = authorization.signatures.iter().map(|s| zeros(&s.signature));
     let refunds = refunds.iter().map(|r| zeros(&r.to_be_bytes::<32>()));
-    signatures.sum::<u64>() + refunds.sum::<u64>()
+    let stamps = [message.at, message.deadline].map(|t| zeros(&t.to_be_bytes::<6>()));
+    signatures.sum::<u64>() + refunds.sum::<u64>() + stamps.iter().sum::<u64>()
 }
 
 #[tokio::test]

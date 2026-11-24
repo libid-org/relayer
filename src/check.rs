@@ -143,7 +143,8 @@ pub async fn check<P: Provider>(
     }
     let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
     let (create, priced_for) = (create.is_some(), request.gas_limit);
-    let fillable = gas::fillable(&authorization, refunds(&executions, config.relayer));
+    let refunds = refunds(&executions, config.relayer);
+    let fillable = gas::fillable(&message, &authorization, refunds);
     let limit = relay_limit(
         provider, &call, late, call_gas, create, priced_for, fillable,
     );

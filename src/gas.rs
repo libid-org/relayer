@@ -21,7 +21,10 @@ use alloy::{
     },
 };
 use libid_contracts::{
-    bindings::wallet::ExecuteAuthorization,
+    bindings::wallet::{
+        ExecuteAuthorization,
+        ExecuteMessage,
+    },
     gas::CALL_OVERHEAD,
 };
 
@@ -63,15 +66,18 @@ pub(crate) fn limit(gas: u64, call_gas: u64, create: bool) -> u64 {
 }
 
 /// The gas of the zero bytes a client fills when it signs, priced as nonzero: the
-/// signatures and `refunds`.
+/// signatures, `refunds`, and the six bytes of `at` and of the deadline.
 pub(crate) fn fillable(
+    message: &ExecuteMessage,
     authorization: &ExecuteAuthorization,
     refunds: impl Iterator<Item = U256>,
 ) -> u64 {
     let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
     let signed = authorization.signatures.iter().map(|s| zeros(&s.signature));
     let refunds = refunds.map(|r| zeros(&r.to_be_bytes::<32>()));
-    NONZERO_BYTE * (signed.sum::<u64>() + refunds.sum::<u64>())
+    let stamps = [message.at, message.deadline].map(|t| zeros(&t.to_be_bytes::<6>()));
+    let stamps = stamps.iter().sum::<u64>();
+    NONZERO_BYTE * (signed.sum::<u64>() + refunds.sum::<u64>() + stamps)
 }
 
 /// `call` priced at `gas_limit` and the node's fees, the tip at most the fee cap; its
