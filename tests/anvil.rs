@@ -149,6 +149,12 @@ async fn refuses_before_sending() {
     o.owner.anvil_set_code(clock, code.into()).await.unwrap();
     let mut late = o.onboarding();
     late.insert(0, call(clock, U256::ZERO, vec![]));
+    // Reverts with under 2.5M gas left: it runs unbounded, not at the limit sent.
+    let gauge = Address::repeat_byte(0x9a);
+    let code = alloy::hex::decode("622625a05a10600a57005b5f80fd").unwrap();
+    o.owner.anvil_set_code(gauge, code.into()).await.unwrap();
+    let mut starved = o.onboarding();
+    starved.insert(0, call(gauge, U256::ZERO, vec![]));
 
     #[rustfmt::skip]
     let cases: Vec<Case> = vec![
@@ -170,6 +176,7 @@ async fn refuses_before_sending() {
         ("deadline = now", o.request(sign_at(o.value, now, now)), expired),
         ("deadline inside the window", o.request(sign_at(o.value, now, now + window - 1)), expired),
         ("fails by the window's end", o.request_for(&late).await, failed_call),
+        ("fails at the limit sent", o.request_for(&starved).await, failed_call),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
         ("account with value", on(account, good.clone()), unknown),
