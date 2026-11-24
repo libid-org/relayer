@@ -75,6 +75,10 @@ pub struct Checked {
     pub(crate) tx: TransactionRequest,
     /// How long [`crate::chain::send`] waits for its receipt.
     pub(crate) timeout: Duration,
+    /// `R - value`: the most a send may cost the relayer.
+    pub(crate) net: U256,
+    /// The L1 fee bound with its margin, which the refund covers.
+    pub(crate) l1_fee_bound: U256,
 }
 
 /// Why a request is not sent.
@@ -107,6 +111,18 @@ pub enum Refusal {
         error: Option<WalletRegistryError>,
         /// The revert data.
         data: Bytes,
+    },
+    /// The transaction's L1 fee exceeds the bound its refund covers; retriable.
+    L1FeeAboveBound {
+        /// `getL1Fee` of the transaction.
+        fee: U256,
+        /// The L1 fee bound with its margin.
+        bound: U256,
+    },
+    /// Another batch of the wallet is in flight.
+    WalletBusy {
+        /// The request in flight.
+        id: B256,
     },
     /// The node could not answer.
     Node(String),
@@ -161,7 +177,12 @@ pub async fn check<P: Provider>(
         .with_chain_id(config.chain_id);
     simulate(provider, &tx, late).await?;
     let timeout = config.inclusion_window;
-    Ok(Checked { tx, timeout })
+    Ok(Checked {
+        tx,
+        timeout,
+        net,
+        l1_fee_bound,
+    })
 }
 
 /// The message `data` carries, its authorization and its batch, all canonical.

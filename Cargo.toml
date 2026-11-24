@@ -16,6 +16,8 @@ publish = false
 [dependencies]
 alloy = { version = "2", features = ["contract", "network", "providers", "rpc-types", "transport-http"] }
 libid-contracts.workspace = true
+rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
+serde_json = "1"
 
 [dev-dependencies]
 alloy = { version = "2", features = ["node-bindings", "provider-anvil-api", "signer-local"] }
