@@ -8,7 +8,6 @@ use alloy::{
         AnvilInstance,
     },
     primitives::{
-        address,
         aliases::U48,
         Address,
         Bytes,
@@ -55,8 +54,6 @@ use relayer::{
     config::Config,
 };
 
-/// EIP-7528's native-ETH address, `HandleEscrow.NATIVE`.
-const NATIVE: Address = address!("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 const CLAIMED: u128 = 1_000_000_000_000_000_000;
 /// The paid stub's Notary Fee: the link pays it, from the value the relayer fronts.
 const LINK_FEE: u128 = CLAIMED / 1000;
@@ -92,6 +89,8 @@ struct Onboarding {
     create: Create,
     wallet: Address,
     handle: B256,
+    /// `HandleEscrow.NATIVE`, the escrowed token.
+    native: Address,
     list: Bytes,
     /// `WalletRegistry.quote(X, 2)`: the link fee, which the batch's `value` fronts.
     value: U256,
@@ -122,11 +121,12 @@ impl Onboarding {
         mined!(verifiers.setVerifier(stack.platform, 2, paid));
         let (id_node, handle) = (B256::repeat_byte(0xa1), B256::repeat_byte(0xb2));
         mined!(StubPlatformVerifier::new(paid, &owner).setNodes(id_node, handle));
+        let escrow = HandleEscrow::new(stack.escrow, &depositor);
+        let native = escrow.NATIVE().call().await.unwrap();
         if escrowed {
-            let escrow = HandleEscrow::new(stack.escrow, &depositor);
             let amount = U256::from(CLAIMED);
             mined!(escrow
-                .deposit(stack.platform, handle, NATIVE, amount)
+                .deposit(stack.platform, handle, native, amount)
                 .value(amount));
         }
         let create = Create {
@@ -166,6 +166,7 @@ impl Onboarding {
             create,
             wallet,
             handle,
+            native,
             list,
             value,
         }
@@ -188,7 +189,7 @@ impl Onboarding {
         let bind = (platform, 2, list, U256::ZERO, Address::ZERO);
         let bind = IdentityRegistry::bindPrivatelyCall::new(bind);
         let claim =
-            HandleEscrow::claimCall::new((self.handle, vec![NATIVE], self.wallet));
+            HandleEscrow::claimCall::new((self.handle, vec![self.native], self.wallet));
         vec![
             call(self.wallet, self.value, link.abi_encode()),
             call(self.stack.identities, U256::ZERO, bind.abi_encode()),
@@ -200,6 +201,11 @@ impl Onboarding {
     /// The refund a well-priced batch carries: the fronted value plus the gas budget.
     fn refund(&self) -> U256 {
         self.value + U256::from(GAS_BUDGET)
+    }
+
+    /// The batch that onboards: link, bind, claim, then the well-priced refund.
+    fn onboarding(&self) -> Vec<Execution> {
+        self.batch(self.repay(self.refund()))
     }
 
     fn repay(&self, amount: U256) -> Execution {
@@ -216,7 +222,7 @@ impl Onboarding {
             .timestamp
     }
 
-    /// K signs `calls` and `value` for nonce 0, valid until `deadline`.
+    /// K signs `execution_calldata` and `value`, nonce 0, from `at` until `deadline`.
     fn sign_until(
         &self,
         execution_calldata: Bytes,
@@ -260,6 +266,33 @@ impl Onboarding {
         }
     }
 
+    /// The create-path request for `calls`, signed by K.
+    async fn request_for(&self, calls: &[Execution]) -> Request {
+        self.request(self.sign(calls).await)
+    }
+
+    async fn relayer_nonce(&self) -> u64 {
+        let nonce = self.relayer.get_transaction_count(self.relayer_address);
+        nonce.await.unwrap()
+    }
+
+    /// A contract answering `genesisIdentity()` with the wallet's genesis identity.
+    async fn impostor(&self) -> Address {
+        let fake = Address::repeat_byte(0xfa);
+        let (platform, id) = (self.create.platform_id, self.create.id_node);
+        let code =
+            alloy::hex::decode(format!("7f{platform:x}6000527f{id:x}60205260606000f3"))
+                .unwrap();
+        self.owner.anvil_set_code(fake, code.into()).await.unwrap();
+        let g = IWebWallet::new(fake, &self.owner)
+            .genesisIdentity()
+            .call()
+            .await
+            .unwrap();
+        assert_eq!((g.platformId, g.idNode, g.salt), (platform, id, U256::ZERO));
+        fake
+    }
+
     /// K is the wallet's admin session and the escrow paid the wallet.
     async fn assert_onboarded(&self, refund: U256) {
         let wallet = IWebWallet::new(self.wallet, &self.owner);
@@ -274,7 +307,11 @@ impl Onboarding {
             "K not admin"
         );
         let escrow = HandleEscrow::new(self.stack.escrow, &self.owner);
-        let left = escrow.escrowed(self.handle, NATIVE).call().await.unwrap();
+        let left = escrow
+            .escrowed(self.handle, self.native)
+            .call()
+            .await
+            .unwrap();
         assert_eq!(left, U256::ZERO, "left in escrow");
         let expected = U256::from(CLAIMED) - refund;
         assert_eq!(
@@ -308,7 +345,7 @@ fn call(target: Address, value: U256, data: Vec<u8>) -> Execution {
 #[tokio::test]
 async fn the_onboarding_batch_lands_when_sent_directly() {
     let o = Onboarding::new(true).await;
-    let data = o.sign(&o.batch(o.repay(o.refund()))).await;
+    let data = o.sign(&o.onboarding()).await;
     let factory = WalletFactory::new(o.stack.factory, &o.relayer);
     let (c, value) = (o.create, o.value);
     let send =
@@ -322,7 +359,7 @@ async fn the_onboarding_batch_lands_when_sent_directly() {
 #[tokio::test]
 async fn the_relayer_checks_and_lands_the_onboarding() {
     let o = Onboarding::new(true).await;
-    let data = o.sign(&o.batch(o.repay(o.refund()))).await;
+    let data = o.sign(&o.onboarding()).await;
     let before = o.owner.get_balance(o.relayer_address).await.unwrap();
     let checked = check(&o.relayer, &o.config(), &o.request(data.clone()))
         .await
@@ -363,107 +400,65 @@ async fn the_relayer_checks_and_lands_the_onboarding() {
 async fn refuses_before_sending() {
     let o = Onboarding::new(true).await;
     let (r, now) = (o.refund(), o.now().await);
-    let good = o.sign(&o.batch(o.repay(r))).await;
-
-    let mut cases: Vec<Case> = vec![];
+    let good = o.sign(&o.onboarding()).await;
+    let calldata = encode_executions(&o.onboarding());
     let missing = |r: &Refusal| matches!(r, Refusal::RefundMissing);
-    let no_refund = &o.batch(o.repay(r))[..3];
-    cases.push(("no refund", o.request(o.sign(no_refund).await), missing));
-    let elsewhere = call(o.stack.escrow, r, vec![]);
-    cases.push((
-        "refund to another",
-        o.request(o.sign(&o.batch(elsewhere)).await),
-        missing,
-    ));
-    let with_data = call(o.relayer_address, r, vec![0]);
-    cases.push((
-        "refund with data",
-        o.request(o.sign(&o.batch(with_data)).await),
-        missing,
-    ));
-    let inner = encode_executions(&[o.repay(r)]);
+    let low = |r: &Refusal| matches!(r, Refusal::RefundTooLow { .. });
+    let noncanonical = |r: &Refusal| matches!(r, Refusal::NoncanonicalData);
+    let expired = |r: &Refusal| matches!(r, Refusal::Expired);
+    let unknown = |r: &Refusal| matches!(r, Refusal::UnknownWallet);
+
     let nested = IWebWallet::executeCall {
         mode: AUTHORIZED_MODE,
-        executionCalldata: inner,
+        executionCalldata: encode_executions(&[o.repay(r)]),
     };
     let nested = call(o.wallet, U256::ZERO, nested.abi_encode());
-    cases.push((
-        "nested refund",
-        o.request(o.sign(&o.batch(nested)).await),
-        missing,
-    ));
-
-    let low = |r: &Refusal| matches!(r, Refusal::RefundTooLow { .. });
-    let bare = o.repay(o.value); // repays the fronted value, nothing for gas
-    cases.push((
-        "refund = value",
-        o.request(o.sign(&o.batch(bare)).await),
-        low,
-    ));
-    // Signed with `value` R, so R - value is 0.
-    let data = o.sign_until(encode_executions(&o.batch(o.repay(r))), r, now, now + 3600);
-    cases.push(("value = refund", o.request(data), low));
-    let noncanonical = |r: &Refusal| matches!(r, Refusal::NoncanonicalData);
     let mut moved = good.to_vec(); // a pad word after the head, both offsets moved past it
     moved.splice(160..160, [0; 32]);
     for at in [0..32, 128..160] {
         let offset = U256::from_be_slice(&moved[at.clone()]) + U256::from(32);
         moved[at].copy_from_slice(&offset.to_be_bytes::<32>());
     }
-    cases.push(("moved offsets", o.request(moved.into()), noncanonical));
     let mut trailing = good.to_vec();
     trailing.extend([0; 32]);
-    cases.push(("trailing word", o.request(trailing.into()), noncanonical));
-    cases.push(("cut", o.request(good.slice(..good.len() - 1)), noncanonical));
-    cases.push((
-        "not abi",
-        o.request(Bytes::from_static(&[0xde, 0xad])),
-        noncanonical,
-    ));
-    let mut inner = encode_executions(&o.batch(o.repay(r))).to_vec();
-    inner.extend([0; 32]); // signed, but the wallet would refuse it NoncanonicalBatch
-    let data = o.sign_until(inner.into(), o.value, now, now + 3600);
-    cases.push(("noncanonical batch", o.request(data), noncanonical));
-
-    let expired = o.sign_until(
-        encode_executions(&o.batch(o.repay(r))),
-        o.value,
-        now - 10,
-        now - 1,
-    );
-    cases.push(("expired", o.request(expired), |r| {
-        matches!(r, Refusal::Expired)
-    }));
-    let unknown = |r: &Refusal| matches!(r, Refusal::UnknownWallet);
-    let mut other = o.request(good.clone()); // the create path names another wallet
-    other.wallet = Address::repeat_byte(0x0f);
-    cases.push(("create for another wallet", other, unknown));
-    // A contract answering `genesisIdentity()` with the wallet's genesis identity.
-    let fake = Address::repeat_byte(0xfa);
-    let (platform, id) = (o.create.platform_id, o.create.id_node);
-    let code =
-        alloy::hex::decode(format!("7f{platform:x}6000527f{id:x}60205260606000f3"))
-            .unwrap();
-    o.owner.anvil_set_code(fake, code.into()).await.unwrap();
-    let g = IWebWallet::new(fake, &o.owner)
-        .genesisIdentity()
-        .call()
-        .await
-        .unwrap();
-    assert_eq!((g.platformId, g.idNode, g.salt), (platform, id, U256::ZERO));
-    let impostor = Request {
-        wallet: fake,
-        create: None,
-        data: good.clone(),
-        gas_limit: GAS_LIMIT,
+    let mut padded = calldata.to_vec();
+    padded.extend([0; 32]); // signed, but the wallet would refuse it NoncanonicalBatch
+    let padded = o.sign_until(padded.into(), o.value, now, now + 3600);
+    let another = Request {
+        wallet: Address::repeat_byte(0x0f), // the create path names another wallet
+        ..o.request(good.clone())
     };
-    cases.push(("fake genesisIdentity", impostor, unknown));
+    let impostor = Request {
+        wallet: o.impostor().await,
+        create: None,
+        ..o.request(good.clone())
+    };
+    let elsewhere = call(o.stack.escrow, r, vec![]);
+    let with_data = call(o.relayer_address, r, vec![0]);
+    let bare = o.repay(o.value); // repays the fronted value, nothing for gas
+    let sign_at =
+        |value, at, deadline| o.sign_until(calldata.clone(), value, at, deadline);
 
-    let nonce = o
-        .relayer
-        .get_transaction_count(o.relayer_address)
-        .await
-        .unwrap();
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("no refund", o.request_for(&o.onboarding()[..3]).await, missing),
+        ("refund to another", o.request_for(&o.batch(elsewhere)).await, missing),
+        ("refund with data", o.request_for(&o.batch(with_data)).await, missing),
+        ("nested refund", o.request_for(&o.batch(nested)).await, missing),
+        ("refund = value", o.request_for(&o.batch(bare)).await, low),
+        // Signed with `value` R, so R - value is 0.
+        ("value = refund", o.request(sign_at(r, now, now + 3600)), low),
+        ("moved offsets", o.request(moved.into()), noncanonical),
+        ("trailing word", o.request(trailing.into()), noncanonical),
+        ("cut", o.request(good.slice(..good.len() - 1)), noncanonical),
+        ("not abi", o.request(Bytes::from_static(&[0xde, 0xad])), noncanonical),
+        ("noncanonical batch", o.request(padded), noncanonical),
+        ("expired", o.request(sign_at(o.value, now - 10, now - 1)), expired),
+        ("create for another wallet", another, unknown),
+        ("fake genesisIdentity", impostor, unknown),
+    ];
+
+    let nonce = o.relayer_nonce().await;
     for (name, request, expected) in cases {
         let refused = check(&o.relayer, &o.config(), &request).await.err();
         assert!(
@@ -471,12 +466,7 @@ async fn refuses_before_sending() {
             "{name}: {refused:?}"
         );
     }
-    let after = o
-        .relayer
-        .get_transaction_count(o.relayer_address)
-        .await
-        .unwrap();
-    assert_eq!(after, nonce, "the relayer sent");
+    assert_eq!(o.relayer_nonce().await, nonce, "the relayer sent");
     assert!(
         o.owner.get_code_at(o.wallet).await.unwrap().is_empty(),
         "a wallet was created"
@@ -492,7 +482,7 @@ async fn refuses_before_sending() {
 #[tokio::test]
 async fn an_empty_escrow_is_refused_as_nothing_held() {
     let o = Onboarding::new(false).await;
-    let data = o.sign(&o.batch(o.repay(o.refund()))).await;
+    let data = o.sign(&o.onboarding()).await;
     let refused = check(&o.relayer, &o.config(), &o.request(data)).await.err();
     let Some(Refusal::Reverted { error: Some(e), .. }) = refused else {
         panic!("{refused:?}")
