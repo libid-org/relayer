@@ -325,9 +325,12 @@ impl<P: Provider> Relayer<P> {
         affordable(&attempt.raw, cover)?;
         let gate =
             gas::l1_gate(&self.provider, &self.config, attempt.raw.clone(), cover.1);
-        if let Err(Refusal::L1FeeAboveBound { fee, bound }) = gate.await {
-            let detail = [fee.to_be_bytes::<32>(), bound.to_be_bytes::<32>()].concat();
-            return self.set(id, "failed", None, Some(detail));
+        match gate.await {
+            Err(Refusal::L1FeeAboveBound { fee, bound }) => {
+                let detail = [fee.to_be_bytes::<32>(), bound.to_be_bytes::<32>()];
+                return self.set(id, "failed", None, Some(detail.concat()));
+            }
+            gate => gate.map_err(refused)?,
         }
         self.commit(id, &attempt)?;
         self.broadcast(&attempt, cover, mined).await
@@ -446,8 +449,8 @@ impl<P: Provider> Relayer<P> {
     }
 }
 
-/// `mined` lies between the lowest nonce of a sent request and the next nonce, and
-/// each stored nonce below it has a receipt for one of its attempts.
+/// `mined` lies between the lowest nonce of an unconfirmed send and the next nonce,
+/// and each stored nonce below it has a receipt for one of its attempts.
 async fn explained<P: Provider>(
     provider: &P,
     db: &Connection,
@@ -455,7 +458,7 @@ async fn explained<P: Provider>(
     next: u64,
 ) -> Result<(), Error> {
     let sql = "SELECT a.nonce, a.hash FROM attempts a JOIN requests r ON a.id = r.id \
-               WHERE r.status = 'sent'";
+               WHERE r.status IN ('sent', 'included')";
     let in_flight = rows(db, sql, [], |r| Ok((r.get::<_, u64>(0)?, b256(r, 1)?)))?;
     let below = in_flight.iter().filter(|a| a.0 < mined);
     let mut unexplained: BTreeSet<_> = below.clone().map(|a| a.0).collect();
