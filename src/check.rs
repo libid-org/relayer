@@ -116,15 +116,7 @@ pub async fn check<P: Provider>(
         let required = message.value.saturating_add(gas_cost);
         return Err(Refusal::RefundTooLow { refund, required });
     }
-    let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
-    let latest = latest.await.map_err(node)?;
-    let now = latest
-        .ok_or_else(|| node("no latest block"))?
-        .header
-        .timestamp;
-    if now > message.deadline.to::<u64>() {
-        return Err(Refusal::Expired);
-    }
+    unexpired(provider, message.deadline.to()).await?;
     let (to, input) = target(provider, config, request, message.value).await?;
     let tx = TransactionRequest::default()
         .with_from(config.relayer)
@@ -168,6 +160,20 @@ fn l1_fee_bound(config: &Config) -> Result<U256, &'static str> {
     }
 }
 
+/// `deadline` is not before the latest block.
+async fn unexpired<P: Provider>(provider: &P, deadline: u64) -> Result<(), Refusal> {
+    let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
+    let latest = latest.await.map_err(node)?;
+    let now = latest
+        .ok_or_else(|| node("no latest block"))?
+        .header
+        .timestamp;
+    if now > deadline {
+        return Err(Refusal::Expired);
+    }
+    Ok(())
+}
+
 /// The address to send to and its calldata, when the contracts vouch for
 /// the wallet (D9); a 7702 account only with no value (D5a).
 async fn target<P: Provider>(
@@ -198,7 +204,7 @@ async fn target<P: Provider>(
     Ok((request.wallet, call.abi_encode().into()))
 }
 
-/// `tx` runs without reverting on the pending block.
+/// `tx` runs without reverting on the latest block.
 async fn simulate<P: Provider>(
     provider: &P,
     tx: &TransactionRequest,
