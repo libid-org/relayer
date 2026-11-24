@@ -524,7 +524,8 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
 /// On an OP-stack chain a rise of the oracle's bound since the check that the refund
 /// no longer covers fails a send for `value + limit × floor + k × U`; one it covers
 /// sends. A balance below a send's worst cost fails it unpaused, and one of exactly
-/// `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part.
+/// `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part, and
+/// is the charge when its receipt does not parse.
 #[tokio::test]
 async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let o = Onboarding::new(true).await;
@@ -540,7 +541,9 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let short = (u128::try_from(o.refund() - o.value).unwrap() - gwei) * 10 / 13;
     oracle(10 * gwei).await;
     let k_u = U256::from(13 * gwei);
-    let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
+    let mode = std::sync::Arc::new(AtomicU8::new(0));
+    let racing = Racing(o.relayer.clone(), mode.clone());
+    let r = Relayer::start(racing, config, &db("l1")).await;
     let (r, request) = (r.unwrap(), o.request_for(&o.onboarding()).await);
     let id = r.relay(&request).await.unwrap();
     oracle(short).await;
@@ -569,7 +572,19 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     oracle(10 * gwei).await;
     assert_eq!(r.relay(&request).await.unwrap(), id);
     oracle(20 * gwei).await;
-    let hashes = o.settle(&r, id, included).await.tx_hashes;
+    let left = r.budget_left().unwrap();
+    r.tick().await.unwrap();
+    mode.store(GARBLED, Ordering::Relaxed);
+    for _ in 1..o.config().node_error_ticks {
+        r.tick().await.expect_err("no parse error");
+    }
+    r.tick().await.unwrap();
+    let hashes = r.status(id).await.unwrap().tx_hashes;
+    assert_eq!(
+        left - r.budget_left().unwrap(),
+        worst,
+        "not the send's L1 bound"
+    );
     o.assert_within_refund(&hashes, k_u * U256::from(2)).await;
     let t = o.tx(hashes[0]).await.inner;
     let cap = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
