@@ -478,6 +478,14 @@ async fn refuses_before_sending() {
         ..o.request(data)
     };
     let below_bound = o.request_for(&o.batch(o.repay(bound - U256::ONE))).await;
+    let window = o.config().inclusion_window.as_secs();
+    // Reverts once the timestamp passes now + window - 1: the window's end is simulated.
+    let clock = Address::repeat_byte(0x7e);
+    let code = format!("67{:016x}4211600f57005b5f80fd", now + window - 1);
+    let code = alloy::hex::decode(code).unwrap();
+    o.owner.anvil_set_code(clock, code.into()).await.unwrap();
+    let mut late = o.onboarding();
+    late.insert(0, call(clock, U256::ZERO, vec![]));
 
     #[rustfmt::skip]
     let cases: Vec<Case> = vec![
@@ -496,6 +504,9 @@ async fn refuses_before_sending() {
         ("not abi", o.request(Bytes::from_static(&[0xde, 0xad])), noncanonical),
         ("noncanonical batch", o.request(padded), noncanonical),
         ("expired", o.request(sign_at(o.value, now - 10, now - 1)), expired),
+        ("deadline = now", o.request(sign_at(o.value, now, now)), expired),
+        ("deadline inside the window", o.request(sign_at(o.value, now, now + window - 1)), expired),
+        ("fails by the window's end", o.request_for(&late).await, failed_call),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
         ("account with value", on(account, good.clone()), unknown),
@@ -523,7 +534,8 @@ async fn refuses_before_sending() {
     assert_eq!((refund, required), (bound - U256::ONE, bound));
     // The good request still passes: every refusal above is the change's.
     let at_bound = o.request_for(&o.batch(o.repay(bound))).await;
-    for request in [o.request(good.clone()), at_bound] {
+    let at_window = o.request(sign_at(o.value, now, now + window));
+    for request in [o.request(good.clone()), at_bound, at_window] {
         check(&o.relayer, &o.config(), &request).await.unwrap();
     }
     // A node error that is not a revert is not reported as one.

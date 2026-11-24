@@ -1,7 +1,10 @@
 //! The relayer's own preconditions on a request, checked before it sends:
 //! canonical data (D4), the refund (D5), the target (D9) and the deadline.
 
-use std::fmt::Display;
+use std::{
+    fmt::Display,
+    time::Duration,
+};
 
 use alloy::{
     eips::BlockNumberOrTag,
@@ -13,8 +16,12 @@ use alloy::{
         U256,
     },
     providers::Provider,
-    rpc::types::TransactionRequest,
+    rpc::types::{
+        BlockOverrides,
+        TransactionRequest,
+    },
     sol_types::SolCall,
+    transports::TransportError,
 };
 use libid_contracts::{
     bindings::wallet::{
@@ -84,7 +91,7 @@ pub enum Refusal {
     },
     /// The contracts do not vouch for the target.
     UnknownWallet,
-    /// The batch's deadline is past.
+    /// The batch's deadline falls before the inclusion window ends.
     Expired,
     /// The simulation reverted, decoded on the wallet route where it can be.
     Reverted {
@@ -116,7 +123,8 @@ pub async fn check<P: Provider>(
         let required = message.value.saturating_add(gas_cost);
         return Err(Refusal::RefundTooLow { refund, required });
     }
-    unexpired(provider, message.deadline.to()).await?;
+    let late =
+        unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
     let (to, input) = target(provider, config, request, message.value).await?;
     let tx = TransactionRequest::default()
         .with_from(config.relayer)
@@ -129,7 +137,7 @@ pub async fn check<P: Provider>(
             fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas),
         )
         .with_chain_id(config.chain_id);
-    simulate(provider, &tx).await?;
+    simulate(provider, &tx, late).await?;
     Ok(Checked { tx })
 }
 
@@ -160,18 +168,23 @@ fn l1_fee_bound(config: &Config) -> Result<U256, &'static str> {
     }
 }
 
-/// `deadline` is not before the latest block.
-async fn unexpired<P: Provider>(provider: &P, deadline: u64) -> Result<(), Refusal> {
+/// The end of the inclusion window after the latest block, which `deadline` is not before.
+async fn unexpired<P: Provider>(
+    provider: &P,
+    deadline: u64,
+    window: Duration,
+) -> Result<u64, Refusal> {
     let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
     let latest = latest.await.map_err(node)?;
     let now = latest
         .ok_or_else(|| node("no latest block"))?
         .header
         .timestamp;
-    if now > deadline {
+    let late = now.saturating_add(window.as_secs());
+    if deadline < late {
         return Err(Refusal::Expired);
     }
-    Ok(())
+    Ok(late)
 }
 
 /// The address to send to and its calldata, when the contracts vouch for
@@ -204,21 +217,33 @@ async fn target<P: Provider>(
     Ok((request.wallet, call.abi_encode().into()))
 }
 
-/// `tx` runs without reverting on the latest block.
+/// `tx` runs without reverting on the latest block, and with its timestamp at `late`.
 async fn simulate<P: Provider>(
     provider: &P,
     tx: &TransactionRequest,
+    late: u64,
 ) -> Result<(), Refusal> {
-    let Err(e) = provider.call(tx.clone()).await else {
-        return Ok(());
+    let at_late = BlockOverrides {
+        time: Some(late),
+        ..Default::default()
     };
+    for overrides in [None, Some(at_late)] {
+        let call = provider
+            .call(tx.clone())
+            .with_block_overrides_opt(overrides);
+        call.await.map_err(refusal)?;
+    }
+    Ok(())
+}
+
+fn refusal(e: TransportError) -> Refusal {
     match e.as_error_resp() {
         Some(resp) if resp.code == 3 => {
             let data = resp.as_revert_data().unwrap_or_default();
             let error = WalletRegistryError::decode(&data);
-            Err(Refusal::Reverted { error, data })
+            Refusal::Reverted { error, data }
         }
-        _ => Err(node(e)),
+        _ => node(e),
     }
 }
 
