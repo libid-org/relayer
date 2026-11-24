@@ -380,13 +380,13 @@ impl<P: Provider> Relayer<P> {
         let mut missing = BTreeMap::new();
         for (id, deadline, cover) in self.in_flight(mined)? {
             let watched = self.watch(id, deadline, cover, &head, mined).await;
-            if let Some(Some(n)) = self.read(&mut ticking.receipt, id, watched)? {
+            if let Some(Some(n)) = self.read(&mut ticking.receipt, id, watched, mined)? {
                 missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number));
             }
         }
         for (id, net) in self.uncharged()? {
             let resolved = self.resolve(id, net, &head).await;
-            self.read(&mut ticking.receipt, id, resolved)?;
+            self.read(&mut ticking.receipt, id, resolved, mined)?;
         }
         let lag = self.config.receipt_lag_blocks;
         let unexplained = missing.values().any(|at| head.number >= at + lag);
@@ -419,10 +419,12 @@ impl<P: Provider> Relayer<P> {
             .into());
         }
         while let Some(queued) = self.queued()? {
-            if !self
+            let id = queued.0;
+            let failed = self
                 .send(&mut ticking, queued, &head, next, balance)
-                .await?
-            {
+                .await?;
+            ticking.send.clear(id); // out of the queue
+            if !failed {
                 break;
             }
         }
@@ -646,26 +648,32 @@ impl<P: Provider> Relayer<P> {
         head: &Head,
         mined: u64,
     ) -> Result<Option<u64>, Error> {
-        if self.resolve(id, cover.0, head).await? {
-            return Ok(None);
-        }
+        // A receipt that does not parse is returned, to be struck, after the watch.
+        let unread = match self.resolve(id, cover.0, head).await {
+            Ok(true) => return Ok(None),
+            Ok(false) => None,
+            Err(e) if e.is::<Unreadable>() => Some(e),
+            Err(e) => return Err(e),
+        };
         let attempts = self.attempts(id)?;
-        self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
+        if unread.is_none() {
+            self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
+        }
         let (Some(send), Some(last)) = (attempts.first(), attempts.last()) else {
             return Ok(None);
         };
         if mined > last.nonce {
-            return Ok(Some(last.nonce));
+            return unread.map_or(Ok(Some(last.nonce)), Err);
         }
         let late = self.late(send.at);
         let run = Some((deadline, late));
-        if !last.cancel
-            && head.time < late
-            && self.broadcast(last, cover, run, head).await?
+        if last.cancel
+            || head.time >= late
+            || !self.broadcast(last, cover, run, head).await?
         {
-            return Ok(None);
+            self.cancel(id, last, head).await?;
         }
-        self.cancel(id, last, head).await.map(|()| None)
+        unread.map_or(Ok(None), Err)
     }
 
     /// Sign the queued transaction at `nonce` with its fee cap at most the pinned
@@ -719,11 +727,8 @@ impl<P: Provider> Relayer<P> {
             {
                 return Err(e.into());
             }
-            Err(refusal) => {
-                ticking.send.clear(id);
-                return self.fail(id, &refusal);
-            }
-            Ok(()) => ticking.send.clear(id),
+            Err(refusal) => return self.fail(id, &refusal),
+            Ok(()) => {}
         }
         self.commit(id, &attempt)?;
         self.broadcast(&attempt, (net, l1), None, head).await?;
@@ -731,28 +736,32 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// `result`, of reading `id`'s receipt: a success clears its strikes; a receipt that
-    /// does not parse is struck, and charged at its worst after `node_error_ticks`.
+    /// does not parse is struck, and charged at its worst after `node_error_ticks` once
+    /// the mined count is past its nonce.
     fn read<T>(
         &self,
         strikes: &mut Strikes,
         id: B256,
         result: Result<T, Error>,
+        mined: u64,
     ) -> Result<Option<T>, Error> {
-        match result {
+        let e = match result {
             Ok(t) => {
                 strikes.clear(id);
-                Ok(Some(t))
+                return Ok(Some(t));
             }
-            Err(e)
-                if e.is::<Unreadable>()
-                    && strikes.strike(id) >= self.config.node_error_ticks =>
-            {
-                tracing::warn!("{id} charged at its worst: its receipt: {e}");
-                strikes.clear(id);
-                self.charge_worst(id, &e).map(|()| None)
-            }
-            Err(e) => Err(e),
+            Err(e) if e.is::<Unreadable>() => e,
+            Err(e) => return Err(e),
+        };
+        let sql = "SELECT max(nonce) FROM attempts WHERE id = ?1";
+        let nonce: Option<u64> = self.db().query_row(sql, [&id[..]], first)?;
+        let landed = nonce.is_some_and(|nonce| mined > nonce);
+        if strikes.strike(id) < self.config.node_error_ticks || !landed {
+            return Err(e);
         }
+        tracing::warn!("{id} charged at its worst: its receipt: {e}");
+        strikes.clear(id);
+        self.charge_worst(id, &e).map(|()| None)
     }
 
     /// Charge `id` with no refund at its attempts' stored worst; with no receipt

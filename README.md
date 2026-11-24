@@ -76,8 +76,9 @@ On `[http] port`:
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
 signatures. A status is `queued`, `sent`, `included`, `cancelled` or `failed`.
 Relaying the same request again answers its current status; a failed one is
-queued again. A receipt that does not parse for `node_error_ticks` ticks is
-charged at its send's worst cost, and its request fails as `Node`.
+queued again. A receipt that does not parse for `node_error_ticks` ticks, once
+its nonce is mined, is charged at its send's worst cost, and its request fails
+as `Node`; until then the send is watched, sent again and cancelled as usual.
 
 A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 

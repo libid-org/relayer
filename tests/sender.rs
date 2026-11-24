@@ -574,6 +574,7 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     oracle(20 * gwei).await;
     let left = r.budget_left().unwrap();
     r.tick().await.unwrap();
+    o.owner.evm_mine(None).await.unwrap(); // the send mined
     mode.store(GARBLED, Ordering::Relaxed);
     for _ in 1..o.config().node_error_ticks {
         r.tick().await.expect_err("no parse error");
@@ -894,10 +895,10 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
     }
 }
 
-/// A receipt that does not parse holds the queue for `node_error_ticks` ticks, then
-/// its request fails as `Node`, charged at its send's worst cost from the ledger alone,
-/// in the budgets and the stats. A retry keeps the charge, and fails in its run once the
-/// batch landed.
+/// A receipt that does not parse of a mined send holds the queue for `node_error_ticks`
+/// ticks, then its request fails as `Node`, charged at its send's worst cost from the
+/// ledger alone, in the budgets and the stats. A retry of the landed batch is refused
+/// and keeps the charge.
 #[tokio::test]
 async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("garbled"));
@@ -906,10 +907,10 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
         let left = r.budget_left().unwrap();
         move |r: &Relayer<Racing>| left - r.budget_left().unwrap()
     };
-    o.owner.anvil_set_auto_mine(false).await.unwrap();
     let request = o.request_for(&o.onboarding()).await;
     let id = r.relay(&request).await.unwrap();
     r.tick().await.unwrap();
+    o.owner.evm_mine(None).await.unwrap(); // the send mined
     let hash = r.status(id).await.unwrap().tx_hashes[0];
     mode.store(GARBLED, Ordering::Relaxed);
     let ledger = rusqlite::Connection::open(&path).unwrap();
@@ -928,16 +929,6 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     assert_eq!(lost(&r), worst, "not charged at its worst");
     let profit = relayer::stats::stats(&path).unwrap().profit;
     assert_eq!(profit, -alloy::primitives::I256::try_from(worst).unwrap());
-    r.relay(&request).await.unwrap();
-    assert!(matches!(r.status(id).await.unwrap().status, Status::Queued));
-    assert_eq!(lost(&r), worst, "a retry dropped the charge");
-    mode.store(0, Ordering::Relaxed);
-    o.owner.evm_mine(None).await.unwrap();
-    assert!(o.mined(hash).await);
-    r.tick().await.unwrap();
-    let report = r.status(id).await.unwrap();
-    let failed = matches!(report.status, Status::Failed(ref f) if f.name() != "Node");
-    assert!(failed && report.tx_hashes.is_empty(), "{:?}", report.status);
     assert!(
         r.relay(&request).await.is_err(),
         "a landed batch relayed again"
@@ -945,16 +936,17 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     assert_eq!(lost(&r), worst, "a failed retry is charged");
 }
 
-/// Strikes count in a row per request, apart for its run and its receipt: a send
-/// struck short of `node_error_ticks` and an unparsed receipt between readable ones
-/// charge nothing.
+/// Strikes count in a row per request, apart for its run and its receipt, and from
+/// zero for a request queued again: a send struck short of `node_error_ticks` and an
+/// unparsed receipt between readable ones charge nothing.
 #[tokio::test]
 async fn strikes_reset_and_count_apart() {
     let (o, path) = (Onboarding::new(true).await, db("strikes"));
     let (r, mode) = o.armable(&path).await;
     let n = o.config().node_error_ticks;
     o.owner.anvil_set_auto_mine(false).await.unwrap();
-    let id = o.queue(&r).await;
+    let request = o.request_for(&o.onboarding()).await;
+    let id = r.relay(&request).await.unwrap();
     let ticks = async |m: u8, k: u32| {
         mode.store(m, Ordering::Relaxed);
         for _ in 0..k {
@@ -963,6 +955,20 @@ async fn strikes_reset_and_count_apart() {
         mode.store(0, Ordering::Relaxed);
         r.tick().await.unwrap();
     };
+    let funded = o.relayer.get_balance(o.relayer_address).await.unwrap();
+    mode.store(STALL, Ordering::Relaxed);
+    for _ in 1..n {
+        r.tick().await.expect_err("no strike");
+    }
+    o.set_balance(o.relayer_address, U256::ONE).await;
+    ticks(0, 0).await;
+    let status = r.status(id).await.unwrap().status;
+    assert!(matches!(
+        status,
+        Status::Failed(Refusal::RelayerUnderfunded { .. })
+    ));
+    o.set_balance(o.relayer_address, funded).await;
+    r.relay(&request).await.unwrap();
     ticks(STALL, n - 1).await;
     ticks(GARBLED, n - 1).await;
     ticks(GARBLED, 1).await;
@@ -971,6 +977,52 @@ async fn strikes_reset_and_count_apart() {
     assert_eq!(
         relayer::stats::stats(&path).unwrap().profit,
         Default::default()
+    );
+}
+
+/// A receipt that does not parse for a send not yet mined holds no charge: the send
+/// stays watched, struck past `node_error_ticks`, and is cancelled when its window ends.
+/// Once its cancel is mined it is charged, and a retry, whose batch never landed, is
+/// queued again with the charge kept.
+#[tokio::test]
+async fn an_unparsed_receipt_of_an_unmined_send_is_watched_and_cancelled() {
+    let (o, path) = (Onboarding::new(true).await, db("unmined-garbled"));
+    let (r, mode) = o.armable(&path).await;
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let request = o.request_for(&o.onboarding()).await;
+    let id = r.relay(&request).await.unwrap();
+    let left = r.budget_left().unwrap();
+    r.tick().await.unwrap();
+    let send = o.tx(r.status(id).await.unwrap().tx_hashes[0]).await.inner;
+    let late = o.now().await + o.config().inclusion_window.as_secs();
+    mode.store(GARBLED, Ordering::Relaxed);
+    for _ in 0..=o.config().node_error_ticks {
+        r.tick().await.expect_err("no parse error");
+    }
+    assert!(matches!(r.status(id).await.unwrap().status, Status::Sent));
+    o.base_fee(send.max_fee_per_gas() * 100).await;
+    o.owner.anvil_set_next_block_timestamp(late).await.unwrap();
+    o.owner.evm_mine(None).await.unwrap();
+    r.tick().await.expect_err("no parse error"); // its cancel's broadcast disarms
+    let hashes = r.status(id).await.unwrap().tx_hashes;
+    assert_eq!(hashes.len(), 2, "not cancelled");
+    mode.store(GARBLED, Ordering::Relaxed);
+    o.owner.evm_mine(None).await.unwrap();
+    assert!(o.mined(hashes[1]).await && !o.mined(hashes[0]).await);
+    r.tick().await.unwrap();
+    let status = r.status(id).await.unwrap().status;
+    assert!(
+        matches!(status, Status::Failed(Refusal::Node(_))),
+        "{status:?}"
+    );
+    let lost = left - r.budget_left().unwrap();
+    assert!(lost > U256::ZERO, "uncharged");
+    r.relay(&request).await.unwrap();
+    assert!(matches!(r.status(id).await.unwrap().status, Status::Queued));
+    assert_eq!(
+        left - r.budget_left().unwrap(),
+        lost,
+        "a retry dropped the charge"
     );
 }
 
