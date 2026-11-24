@@ -373,8 +373,9 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
-/// A foreign transaction mined at a stored send's nonce pauses its rebroadcast,
-/// and the stored send without a receipt refuses start.
+/// A foreign transaction mined at a stored send's nonce after its window pauses sending
+/// once our receipt is still missing `receipt_lag_blocks` later, with no cancel signed,
+/// and stays paused; the stored send without a receipt refuses start.
 #[tokio::test]
 async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     let (o, db) = (Onboarding::new(true).await, db("taken"));
@@ -384,10 +385,21 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     r.tick().await.unwrap();
     let hash = r.status(id).await.unwrap().tx_hashes[0];
     o.owner.anvil_drop_transaction(hash).await.unwrap();
+    let late = o.now().await + o.config().inclusion_window.as_secs();
+    o.owner.anvil_set_next_block_timestamp(late).await.unwrap();
     o.owner.anvil_set_auto_mine(true).await.unwrap();
     o.foreign().await;
+    for lag in 0..=o.config().receipt_lag_blocks {
+        assert!(
+            !r.paused().await,
+            "paused {lag} blocks after a missing receipt"
+        );
+        r.tick().await.unwrap();
+        o.owner.evm_mine(None).await.unwrap();
+    }
     r.tick().await.unwrap();
     assert!(r.paused().await, "no pause on a taken nonce");
+    assert_eq!(r.status(id).await.unwrap().tx_hashes, [hash], "cancelled");
     drop(r);
     let refused = o.start(&db).await.err().unwrap();
     assert!(refused.contains("inspect the key's nonce"), "{refused}");

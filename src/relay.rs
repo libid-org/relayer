@@ -3,7 +3,10 @@
 //! receipt, and cancelled when their inclusion window ends.
 
 use std::{
-    collections::BTreeSet,
+    collections::{
+        BTreeMap,
+        BTreeSet,
+    },
     fs::File,
     path::{
         Path,
@@ -171,6 +174,10 @@ struct Ticking {
     low: bool,
     /// The last request whose run met a node error, and the ticks in a row it did.
     errors: (B256, u32),
+    /// Our nonces mined with no receipt of ours, and the block each was first seen at.
+    missing: BTreeMap<u64, u64>,
+    /// One of them still had none `receipt_lag_blocks` later.
+    unexplained: bool,
 }
 
 impl Ticking {
@@ -297,9 +304,15 @@ impl<P: Provider> Relayer<P> {
         let relayer = self.config.relayer;
         let mined = self.provider.get_transaction_count(relayer);
         let mined = mined.block_id(head.at()).await?;
+        let mut missing = BTreeMap::new();
         for (id, deadline, cover) in self.in_flight(mined)? {
-            self.watch(id, deadline, cover, &head, mined).await?;
+            if let Some(n) = self.watch(id, deadline, cover, &head, mined).await? {
+                missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number));
+            }
         }
+        let lag = self.config.receipt_lag_blocks;
+        ticking.unexplained = missing.values().any(|at| head.number >= at + lag);
+        ticking.missing = missing;
         let next = self.db().query_row("SELECT next FROM nonce", [], first)?;
         if mined > next {
             self.paused.store(true, Relaxed);
@@ -397,14 +410,17 @@ impl<P: Provider> Relayer<P> {
         })
     }
 
-    /// Whether sending paused: a foreign nonce, a balance below `min_balance` or a
-    /// refused first send.
+    /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a
+    /// refused first send, or our nonce mined with no receipt of ours for
+    /// `receipt_lag_blocks`.
     pub async fn paused(&self) -> bool {
-        self.paused.load(Relaxed) || self.ticking.lock().await.low
+        let ticking = self.ticking.lock().await;
+        self.paused.load(Relaxed) || ticking.low || ticking.unexplained
     }
 
     /// Resolve `id` from a receipt of any of its attempts. With none, broadcast its send
-    /// again until its window ends or it no longer runs, then cancel it.
+    /// again until its window ends or it no longer runs, then cancel it. Its nonce
+    /// when mined with no receipt of ours: another sender's, or a lagging node's.
     async fn watch(
         &self,
         id: B256,
@@ -412,7 +428,7 @@ impl<P: Provider> Relayer<P> {
         cover: Cover,
         head: &Head,
         mined: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<u64>, Error> {
         let attempts = self.attempts(id)?;
         for a in &attempts {
             // Read as any receipt, which keeps an OP-stack `l1Fee`.
@@ -424,25 +440,25 @@ impl<P: Provider> Relayer<P> {
             };
             let block = receipt.block_number.unwrap_or_default();
             let status = if a.cancel { "cancelled" } else { "included" };
-            return self.set_status(id, status, Some((block, &receipt)), None);
+            self.set_status(id, status, Some((block, &receipt)), None)?;
+            return Ok(None);
         }
         self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
         let (Some(send), Some(last)) = (attempts.first(), attempts.last()) else {
-            return Ok(());
+            return Ok(None);
         };
+        if mined > last.nonce {
+            return Ok(Some(last.nonce));
+        }
         let late = self.late(send.at);
         let run = Some((deadline, late));
         if !last.cancel
             && head.time < late
-            && self.broadcast(last, cover, run, head, mined).await?
+            && self.broadcast(last, cover, run, head).await?
         {
-            return Ok(());
+            return Ok(None);
         }
-        if mined > last.nonce {
-            self.paused.store(true, Relaxed); // another sender's at our nonce
-            return Ok(());
-        }
-        self.cancel(id, last, head, mined).await
+        self.cancel(id, last, head).await.map(|()| None)
     }
 
     /// Sign the queued transaction at `nonce` with its fee cap at most M × the pinned
@@ -496,8 +512,7 @@ impl<P: Provider> Relayer<P> {
             Ok(()) => {}
         }
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, (net, l1), None, head, nonce)
-            .await?;
+        self.broadcast(&attempt, (net, l1), None, head).await?;
         Ok(false)
     }
 
@@ -511,15 +526,9 @@ impl<P: Provider> Relayer<P> {
     /// pinned base fee is at most its cap; past it, a new one is signed with its cap
     /// `max(1.1× last's, 2× base fee)` and the market's tip, at least 1.1× last's, up to
     /// the max cancel fee. Above that the last cancel is sent again, the queue held.
-    async fn cancel(
-        &self,
-        id: B256,
-        last: &Attempt,
-        head: &Head,
-        mined: u64,
-    ) -> Result<(), Error> {
+    async fn cancel(&self, id: B256, last: &Attempt, head: &Head) -> Result<(), Error> {
         let tx = TxEnvelope::decode_2718(&mut &last.raw[..])?;
-        let again = || self.broadcast(last, Default::default(), None, head, mined);
+        let again = || self.broadcast(last, Default::default(), None, head);
         if last.cancel && head.base_fee <= tx.max_fee_per_gas() {
             return again().await.map(drop);
         }
@@ -553,7 +562,7 @@ impl<P: Provider> Relayer<P> {
             .with_chain_id(self.config.chain_id);
         let attempt = self.sign(cancel, true, head).await?;
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, Default::default(), None, head, mined)
+        self.broadcast(&attempt, Default::default(), None, head)
             .await
             .map(drop)
     }
@@ -597,26 +606,20 @@ impl<P: Provider> Relayer<P> {
         rerun(&self.provider, &tx, deadline, head.at(), late).await
     }
 
-    /// Broadcast `a` unless the node has it. Its nonce mined with no receipt of ours
-    /// is another sender's, and sending pauses. With `run`, a send's deadline and
-    /// window end, false when a send no longer runs at `head`, to cancel at once.
+    /// Broadcast `a` unless the node has it. With `run`, a send's deadline and window
+    /// end, false when a send no longer runs at `head`, to cancel at once.
     async fn broadcast(
         &self,
         a: &Attempt,
         cover: Cover,
         run: Option<(u64, u64)>,
         head: &Head,
-        mined: u64,
     ) -> Result<bool, Error> {
         if !a.cancel {
             affordable(&a.raw, cover)?;
         }
         let known = self.provider.get_transaction_by_hash(a.hash).await?;
         if known.is_some() {
-            return Ok(true);
-        }
-        if mined > a.nonce {
-            self.paused.store(true, Relaxed);
             return Ok(true);
         }
         if let Some((deadline, late)) = run {

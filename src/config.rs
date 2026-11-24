@@ -135,13 +135,16 @@ pub struct Config {
     /// The ticks in a row a node error on the oldest queued request's run holds the
     /// queue before the request fails as `Node`.
     pub node_error_ticks: u32,
+    /// The blocks our nonce may stay mined with no receipt of ours, as from a lagging
+    /// node, before sending pauses.
+    pub receipt_lag_blocks: u64,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
-    /// growth over the window, cancels up to 10× the base fee, no balance floor, and 5
-    /// ticks of node errors on a request.
+    /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
+    /// ticks of node errors on a request, and receipts up to 10 blocks behind.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -164,6 +167,7 @@ impl Config {
             max_cancel_fee_percent: 1000,
             min_balance: U256::ZERO,
             node_error_ticks: 5,
+            receipt_lag_blocks: 10,
         };
         let window = config.blocks(config.inclusion_window);
         config.max_fee_percent = Eip1559::L1.growth_percent(window);
