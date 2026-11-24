@@ -26,6 +26,7 @@ use alloy::{
 use libid_contracts::{
     bindings::wallet::{
         decode_executions,
+        ExecuteAuthorization,
         ExecuteMessage,
         Execution,
         IWebWallet,
@@ -39,9 +40,9 @@ use libid_contracts::{
     WalletRegistryError,
 };
 
-use crate::config::{
-    Config,
-    L1Fee,
+use crate::{
+    config::Config,
+    gas,
 };
 
 /// The create path's wallet: `WalletFactory.createAndExecute(platformId, idNode, salt, …)`.
@@ -64,7 +65,7 @@ pub struct Request {
     pub create: Option<Create>,
     /// `execute(AUTHORIZED_MODE, data)`'s `data`, signed.
     pub data: Bytes,
-    /// The gas limit the client's refund was priced for.
+    /// The gas limit the client's refund was priced for; the send uses D8's, at most this.
     pub gas_limit: u64,
 }
 
@@ -91,6 +92,11 @@ pub enum Refusal {
         /// The least refund the relayer accepts.
         required: U256,
     },
+    /// The signed batch needs a higher gas limit than the one its refund was priced for.
+    GasLimitTooLow {
+        /// D8's limit for the batch.
+        required: u64,
+    },
     /// The contracts do not vouch for the target.
     UnknownWallet,
     /// The batch's deadline falls before the inclusion window ends.
@@ -106,18 +112,33 @@ pub enum Refusal {
     Node(String),
 }
 
-/// Check `request` against `config` on the chain `provider` reads.
+/// Check `request` against `config` on the chain `provider` reads, and set its
+/// gas limit from its simulation (D8).
 pub async fn check<P: Provider>(
     provider: &P,
     config: &Config,
     request: &Request,
 ) -> Result<Checked, Refusal> {
-    let (message, executions) = decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
+    let (message, _, executions) =
+        decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
     let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
+    let late =
+        unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
+    let (wallet, create) = (request.wallet, request.create);
+    let call = target(
+        provider,
+        config,
+        wallet,
+        create,
+        &request.data,
+        message.value,
+    );
+    let call = call.await?;
     let fees = provider.estimate_eip1559_fees().await.map_err(node)?;
+    let mut tx = gas::priced(call.clone(), request.gas_limit, &fees, config.chain_id);
     let gas_cost = U256::from(request.gas_limit)
         .saturating_mul(U256::from(fees.max_fee_per_gas))
-        .saturating_add(l1_fee_bound(config).map_err(node)?);
+        .saturating_add(gas::l1_fee_bound(provider, config, &tx).await?);
     if refund
         .checked_sub(message.value)
         .is_none_or(|net| net < gas_cost)
@@ -125,33 +146,31 @@ pub async fn check<P: Provider>(
         let required = message.value.saturating_add(gas_cost);
         return Err(Refusal::RefundTooLow { refund, required });
     }
-    let late =
-        unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
-    let (to, input) = target(provider, config, request, message.value).await?;
-    let tx = TransactionRequest::default()
-        .with_from(config.relayer)
-        .with_to(to)
-        .with_value(message.value)
-        .with_input(input)
-        .with_gas_limit(request.gas_limit)
-        .with_max_fee_per_gas(fees.max_fee_per_gas)
-        .with_max_priority_fee_per_gas(
-            fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas),
-        )
-        .with_chain_id(config.chain_id);
+    let sim = gas::simulate(provider, &call).await?;
+    if !sim.status {
+        return Err(reverted(sim.return_data));
+    }
+    let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
+    let required = gas::limit(sim.gas_used, call_gas, create.is_some());
+    if required > request.gas_limit {
+        return Err(Refusal::GasLimitTooLow { required });
+    }
+    tx.set_gas_limit(required);
     simulate(provider, &tx, late).await?;
     let timeout = config.inclusion_window;
     Ok(Checked { tx, timeout })
 }
 
-/// The message `data` carries and its batch, both canonical (D4).
-fn decode(data: &Bytes) -> Option<(ExecuteMessage, Vec<Execution>)> {
+/// The message `data` carries, its authorization and its batch, all canonical (D4).
+pub(crate) fn decode(
+    data: &Bytes,
+) -> Option<(ExecuteMessage, ExecuteAuthorization, Vec<Execution>)> {
     let (message, authorization) = ExecuteMessage::from_authorized_data(data).ok()?;
-    if message.authorized_data(authorization) != *data {
+    if message.authorized_data(authorization.clone()) != *data {
         return None;
     }
     let executions = decode_executions(&message.execution_calldata).ok()?;
-    Some((message, executions))
+    Some((message, authorization, executions))
 }
 
 /// R: what the batch's top-level `Execution(relayer, R, "")` calls pay.
@@ -161,14 +180,6 @@ fn refund(executions: &[Execution], relayer: Address) -> Option<U256> {
         .filter(|e| e.target == relayer && e.callData.is_empty())
         .map(|e| e.value)
         .reduce(U256::saturating_add)
-}
-
-/// The L1 data fee bound a refund must cover (D5).
-fn l1_fee_bound(config: &Config) -> Result<U256, &'static str> {
-    match config.l1_fee {
-        L1Fee::None => Ok(U256::ZERO),
-        L1Fee::OpStack => Err("the OP-stack L1 fee bound is not implemented"),
-    }
 }
 
 /// The end of the inclusion window after the latest block, which `deadline` is not before.
@@ -190,34 +201,38 @@ async fn unexpired<P: Provider>(
     Ok(late)
 }
 
-/// The address to send to and its calldata, when the contracts vouch for
-/// the wallet (D9); a 7702 account only with no value (D5a).
-async fn target<P: Provider>(
+/// The relayer's call of `wallet`'s batch `data` with `value`, when the contracts
+/// vouch for the wallet (D9); a 7702 account only with no value (D5a).
+pub(crate) async fn target<P: Provider>(
     provider: &P,
     config: &Config,
-    request: &Request,
+    wallet: Address,
+    create: Option<Create>,
+    data: &Bytes,
     value: U256,
-) -> Result<(Address, Bytes), Refusal> {
-    let data = request.data.clone();
-    if let Some(c) = request.create {
+) -> Result<TransactionRequest, Refusal> {
+    let call = TransactionRequest::default()
+        .with_from(config.relayer)
+        .with_value(value);
+    let data = data.clone();
+    if let Some(c) = create {
         let factory = WalletFactory::new(config.factory, provider);
-        let wallet = factory.walletAddress(c.platform_id, c.id_node, c.salt);
-        if wallet.call().await.map_err(node)? != request.wallet {
+        let address = factory.walletAddress(c.platform_id, c.id_node, c.salt);
+        if address.call().await.map_err(node)? != wallet {
             return Err(Refusal::UnknownWallet);
         }
-        let call = (c.platform_id, c.id_node, c.salt, AUTHORIZED_MODE, data);
-        let call = WalletFactory::createAndExecuteCall::new(call);
-        return Ok((config.factory, call.abi_encode().into()));
+        let input = (c.platform_id, c.id_node, c.salt, AUTHORIZED_MODE, data);
+        let input = WalletFactory::createAndExecuteCall::new(input).abi_encode();
+        return Ok(call.with_to(config.factory).with_input(input));
     }
-    let vouched =
-        check_target(provider, config.factory, config.forwarder, request.wallet);
+    let vouched = check_target(provider, config.factory, config.forwarder, wallet);
     match vouched.await.map_err(node)? {
         Some(Target::FactoryWallet(_)) => {}
         Some(Target::Account(_)) if value.is_zero() => {}
         _ => return Err(Refusal::UnknownWallet),
     }
-    let call = IWebWallet::executeCall::new((AUTHORIZED_MODE, data));
-    Ok((request.wallet, call.abi_encode().into()))
+    let input = IWebWallet::executeCall::new((AUTHORIZED_MODE, data)).abi_encode();
+    Ok(call.with_to(wallet).with_input(input))
 }
 
 /// `tx` runs without reverting on the latest block, and with its timestamp at `late`.
@@ -242,14 +257,18 @@ async fn simulate<P: Provider>(
 fn refusal(e: TransportError) -> Refusal {
     match e.as_error_resp() {
         Some(resp) if resp.code == 3 => {
-            let data = resp.as_revert_data().unwrap_or_default();
-            let error = WalletRegistryError::decode(&data);
-            Refusal::Reverted { error, data }
+            reverted(resp.as_revert_data().unwrap_or_default())
         }
         _ => node(e),
     }
 }
 
-fn node(e: impl Display) -> Refusal {
+/// A revert with `data`, decoded on the wallet route where it can be.
+pub(crate) fn reverted(data: Bytes) -> Refusal {
+    let error = WalletRegistryError::decode(&data);
+    Refusal::Reverted { error, data }
+}
+
+pub(crate) fn node(e: impl Display) -> Refusal {
     Refusal::Node(e.to_string())
 }

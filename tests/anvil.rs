@@ -3,6 +3,8 @@
 
 include!("common/onboarding.rs");
 
+use libid_contracts::gas::CALL_OVERHEAD;
+
 type Case = (&'static str, Request, fn(&Refusal) -> bool);
 
 /// The fixture, without the relayer: the batch lands when sent directly.
@@ -50,10 +52,13 @@ async fn the_relayer_checks_and_lands_the_onboarding() {
     );
     assert_eq!((sent.mode, sent.data), (AUTHORIZED_MODE, data), "I7, D4");
     assert_eq!(tx.inner.value(), o.value);
-    assert_eq!(
-        tx.inner.gas_limit(),
-        GAS_LIMIT,
-        "the limit R was priced for"
+    // D8: `ceil(1.25 × gasUsed) + (callGas + CALL_OVERHEAD) × (64/63)²` on the create path.
+    let reserve = ((CALL_GAS + CALL_OVERHEAD) * 64 * 64).div_ceil(63 * 63);
+    let d8 = (receipt.gas_used * 5).div_ceil(4) + reserve;
+    assert!(
+        tx.inner.gas_limit().abs_diff(d8) <= 2,
+        "sent at {}, D8 {d8}",
+        tx.inner.gas_limit()
     );
     let worst = U256::from(tx.inner.gas_limit()) * U256::from(tx.inner.max_fee_per_gas());
     assert!(
@@ -200,10 +205,19 @@ async fn refuses_before_sending() {
         l1_fee: L1Fee::OpStack,
         ..o.config()
     };
+    // An oracle whose `getL1FeeUpperBound` is 1 ether: the refund must cover 1.3 ether more.
+    let oracle = "0x420000000000000000000000000000000000000F"
+        .parse()
+        .unwrap();
+    let code = alloy::hex::decode("670de0b6b3a76400005f5260205ff3").unwrap();
+    o.owner.anvil_set_code(oracle, code.into()).await.unwrap();
     let refused = check(&o.relayer, &op_stack, &o.request(good.clone()))
         .await
         .err();
-    assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
+    let Some(Refusal::RefundTooLow { required, .. }) = refused else {
+        panic!("{refused:?}")
+    };
+    assert_eq!(required, bound + U256::from(CLAIMED * 13 / 10));
     // A node error that is not a revert is not reported as one.
     o.owner
         .anvil_set_balance(o.relayer_address, U256::ZERO)

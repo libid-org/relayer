@@ -7,6 +7,10 @@ use alloy::primitives::Address;
 /// The send-to-inclusion window a production chain is configured with.
 pub const INCLUSION_WINDOW: Duration = Duration::from_secs(120);
 
+/// The L1 margin `k` of a production chain, in percent: the L1 fee bound a
+/// refund covers is `k × getL1FeeUpperBound`, sized to the inclusion window.
+pub const L1_MARGIN: u64 = 130;
+
 /// How the relayer bounds the L1 data fee of a send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L1Fee {
@@ -29,6 +33,8 @@ pub struct Config {
     pub relayer: Address,
     /// The L1 fee model.
     pub l1_fee: L1Fee,
+    /// The L1 margin `k`, in percent.
+    pub l1_margin: u64,
     /// How long a send may take to be included: a batch must still run that
     /// long after the latest block, and a send waits that long for its receipt.
     pub inclusion_window: Duration,
@@ -49,6 +55,7 @@ impl Config {
             forwarder,
             relayer,
             l1_fee: L1Fee::None,
+            l1_margin: L1_MARGIN,
             inclusion_window: Duration::from_secs(5),
         }
     }
