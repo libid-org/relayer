@@ -307,33 +307,64 @@ pub(crate) async fn target<P: Provider>(
     data: &Bytes,
     value: U256,
 ) -> Result<TransactionRequest, Refusal> {
-    let call = TransactionRequest::default()
-        .with_from(config.relayer)
-        .with_value(value);
-    let data = data.clone();
     if let Some(c) = create {
         let factory = WalletFactory::new(config.factory, provider);
         let address = factory.walletAddress(c.platform_id, c.id_node, c.salt);
         if address.call().await.map_err(node)? != wallet {
             return Err(Refusal::UnknownWallet);
         }
+    }
+    vouched(provider, config, wallet, create.is_some(), value).await?;
+    Ok(outer(config, wallet, create, data, value))
+}
+
+/// The relayer's call of `wallet`'s batch `data` with `value`, unchecked.
+pub(crate) fn outer(
+    config: &Config,
+    wallet: Address,
+    create: Option<Create>,
+    data: &Bytes,
+    value: U256,
+) -> TransactionRequest {
+    let call = TransactionRequest::default()
+        .with_from(config.relayer)
+        .with_value(value);
+    let data = data.clone();
+    if let Some(c) = create {
         let input = (c.platform_id, c.id_node, c.salt, AUTHORIZED_MODE, data);
         let input = WalletFactory::createAndExecuteCall::new(input).abi_encode();
-        return Ok(call.with_to(config.factory).with_input(input));
+        return call.with_to(config.factory).with_input(input);
     }
-    let vouched = check_target(provider, config.factory, config.forwarder, wallet);
-    let release = match vouched.await.map_err(node)? {
-        Some(Target::FactoryWallet(release)) => release,
-        Some(Target::Account(release)) if value.is_zero() => release,
-        Some(Target::Account(_)) => return Err(Refusal::ValueNotAllowed),
-        None => return Err(Refusal::UnknownWallet),
+    let input = IWebWallet::executeCall::new((AUTHORIZED_MODE, data)).abi_encode();
+    call.with_to(wallet).with_input(input)
+}
+
+/// The contracts vouch for `wallet` on a supported release: on the create path with
+/// no code yet, the factory's latest; a 7702 account only with no value.
+pub(crate) async fn vouched<P: Provider>(
+    provider: &P,
+    config: &Config,
+    wallet: Address,
+    create: bool,
+    value: U256,
+) -> Result<(), Refusal> {
+    let new = create && provider.get_code_at(wallet).await.map_err(node)?.is_empty();
+    let version = if new {
+        let factory = WalletFactory::new(config.factory, provider);
+        factory.latest().call().await.map_err(node)?.version
+    } else {
+        let vouched = check_target(provider, config.factory, config.forwarder, wallet);
+        match vouched.await.map_err(node)? {
+            Some(Target::FactoryWallet(release)) => release.version,
+            Some(Target::Account(release)) if value.is_zero() => release.version,
+            Some(Target::Account(_)) => return Err(Refusal::ValueNotAllowed),
+            None => return Err(Refusal::UnknownWallet),
+        }
     };
-    let version = release.version;
     if !config.supported_releases.contains(&version) {
         return Err(Refusal::UnsupportedRelease { version });
     }
-    let input = IWebWallet::executeCall::new((AUTHORIZED_MODE, data)).abi_encode();
-    Ok(call.with_to(wallet).with_input(input))
+    Ok(())
 }
 
 /// `tx`, as it is sent, still runs after the block `at` and at `late`, which

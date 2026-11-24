@@ -16,6 +16,7 @@ use alloy::{
     },
     sol_types::SolError,
 };
+use libid_contracts::deploy::deploy_with_ctor;
 use relayer::{
     check::Checked,
     config::FeeParams,
@@ -430,8 +431,10 @@ fn fillable(data: &Bytes, refunds: &[U256]) -> u64 {
 
 /// A key delegated to the forwarder by a real EIP-7702 authorization, reset into the
 /// factory's release with K linked, relays as a wallet. A release outside the supported
-/// set is refused, for it and for a factory wallet. Re-delegated to code that skips the
-/// refund after its send is broadcast, it costs the relayer only that send's gas.
+/// set is refused, for it and for a factory wallet, created or not. Reset into such a
+/// release while queued, it keeps its id and fails at its send. Re-delegated to code
+/// that skips the refund after its send is broadcast, it costs the relayer only that
+/// send's gas.
 #[tokio::test]
 async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
     let mut o = Onboarding::new(true).await;
@@ -485,9 +488,21 @@ async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
         supported_releases: vec![version + 1],
         ..o.config()
     };
-    for wallet in [o.wallet, wallet] {
+    // On the create path: a new wallet's release from `latest`.
+    let (platform_id, new) = (o.stack.platform, B256::repeat_byte(0xa3));
+    let new_wallet = factory.walletAddress(platform_id, new, U256::ZERO);
+    let (new_wallet, salt) = (new_wallet.call().await.unwrap(), U256::ZERO);
+    let path = |id_node| {
+        Some(Create {
+            platform_id,
+            id_node,
+            salt,
+        })
+    };
+    for (wallet, create) in [(o.wallet, None), (wallet, None), (new_wallet, path(new))] {
         let request = Request {
             wallet,
+            create,
             ..request.clone()
         };
         let refused = request.check(&o.relayer, &unsupported).await.err();
@@ -495,6 +510,50 @@ async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
         assert!(named, "{wallet}: {refused:?}");
     }
     o.send(&request).await;
+
+    // Queued, then reset into a release 2 outside the supported set: relayed again it
+    // keeps its id, and its send fails unsent.
+    let data = o.authorize(&b, Some(q.call_gas)).await;
+    let queued = o.request_at(&data, q.gas_limit).await;
+    let r = o.start(&db("reset")).await.unwrap();
+    let id = r.relay(&queued).await.unwrap();
+    let (s, code) = (
+        o.stack,
+        Artifacts::embedded().bytecode("WebWallet").unwrap(),
+    );
+    let args =
+        (s.factory, s.wallet_registry, 2u64, s.escrow, s.escrow).abi_encode_params();
+    let release = deploy_with_ctor(&o.owner, &code, &args, "", None)
+        .await
+        .unwrap();
+    mined!(factory.publish(release));
+    // The created wallet on the create path: its own release, not `latest`.
+    let created = Request {
+        wallet,
+        create: path(id_node),
+        ..request.clone()
+    };
+    let refused = created.check(&o.relayer, &unsupported).await.err();
+    let own = matches!(refused, Some(Refusal::UnsupportedRelease { version: 1 }));
+    assert!(own, "{refused:?}");
+    // The account's release slot as its reset writes it.
+    let reset = U256::from(2) << 160 | U256::from_be_slice(release.as_slice());
+    let slot = o.owner.get_storage_at(o.wallet, RELEASE_SLOT.into()).await;
+    let at = |word: U256| {
+        o.owner
+            .anvil_set_storage_at(o.wallet, RELEASE_SLOT.into(), word.into())
+    };
+    let slot = slot.unwrap();
+    at(reset).await.unwrap();
+    assert_eq!(r.relay(&queued).await.unwrap(), id, "a new id");
+    r.tick().await.unwrap();
+    let report = r.status(id).await.unwrap();
+    let gated = matches!(
+        report.status,
+        Status::Failed(Refusal::UnsupportedRelease { version: 2 })
+    );
+    assert!(gated && report.tx_hashes.is_empty(), "{:?}", report.status);
+    at(slot).await.unwrap();
 
     // The same batch at the account's next nonce.
     let data = o.authorize(&b, Some(q.call_gas)).await;

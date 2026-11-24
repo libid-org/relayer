@@ -218,9 +218,14 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
         max_cancel_fee_percent: o.config().max_fee_percent,
         ..o.config()
     };
+    let none = Config {
+        supported_releases: vec![],
+        ..o.config()
+    };
     for (config, setting) in [
         (short, "inclusion_window"),
         (cheap, "max_cancel_fee_percent"),
+        (none, "supported_releases"),
     ] {
         let refused = Relayer::start(o.relayer.clone(), config, &crate::db("bad")).await;
         let refused = refused.err().unwrap().to_string();

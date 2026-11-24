@@ -62,9 +62,10 @@ use crate::{
     check::{
         decode,
         node,
+        outer,
         rerun,
         reverted,
-        target,
+        vouched,
         Checked,
         Refusal,
         Request,
@@ -102,8 +103,8 @@ impl std::error::Error for Stop {}
 /// A request's `R - value` and the L1 fee bound its refund covers.
 type Cover = (U256, U256);
 
-/// A queued request: id, transaction, cover, deadline.
-type Queued = (B256, String, Cover, u64);
+/// A queued request: id, transaction, cover, deadline, wallet.
+type Queued = (B256, String, Cover, u64, Address);
 
 /// The fee-history percentile a cancel's tip is read at.
 const CANCEL_PERCENTILE: f64 = 90.0;
@@ -283,12 +284,12 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Check `request` and queue it under its id, within the loss budgets. The same
-    /// request again returns its id; one that failed is queued again under it.
+    /// request again returns its id unchecked; one that failed is queued again under it.
     pub async fn relay(&self, request: &Request) -> Result<B256, Refusal> {
         let (message, ..) = decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
         let (p, c, wallet) = (&self.provider, &self.config, request.wallet);
-        let call = target(p, c, wallet, request.create, &request.data, message.value);
-        let id = request_id(c.chain_id, &call.await?, message.value);
+        let call = outer(c, wallet, request.create, &request.data, message.value);
+        let id = request_id(c.chain_id, &call, message.value);
         if let Some(id) = admit(&self.db(), id, wallet)? {
             return Ok(id);
         }
@@ -402,9 +403,10 @@ impl<P: Provider> Relayer<P> {
 
     /// The oldest queued request.
     fn queued(&self) -> Result<Option<Queued>, Error> {
-        let sql = "SELECT id, tx, net, l1, deadline FROM requests \
+        let sql = "SELECT id, tx, net, l1, deadline, wallet FROM requests \
                    WHERE status = 'queued' ORDER BY rowid LIMIT 1";
-        let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?));
+        let row =
+            |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?, address(r, 5)?));
         Ok(self.db().query_row(sql, [], row).optional()?)
     }
 
@@ -493,8 +495,7 @@ impl<P: Provider> Relayer<P> {
     fn losses(&self, window: Duration) -> Result<BTreeMap<Address, U256>, Error> {
         let sql = "SELECT wallet, loss FROM requests \
                    WHERE loss IS NOT NULL AND included_at > unixepoch() - ?1";
-        let row =
-            |r: &Row| Ok((Address::from_slice(&r.get::<_, Vec<u8>>(0)?), u256(r, 1)?));
+        let row = |r: &Row| Ok((address(r, 0)?, u256(r, 1)?));
         let mut losses = BTreeMap::<_, U256>::new();
         for (wallet, loss) in rows(&self.db(), sql, [window.as_secs()], row)? {
             let sum = losses.entry(wallet).or_default();
@@ -581,22 +582,22 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Sign the queued transaction at `nonce` with its fee cap at most the pinned
-    /// block's fee bound and the tip read now, run it again at the pinned block, then
-    /// commit and broadcast it. True when it failed instead, and the next may be sent:
-    /// its refund no longer covering the floor at the L1 bound read now, its run
-    /// failing for good, or a node error on its run for `node_error_ticks` ticks in a
-    /// row.
+    /// block's fee bound and the tip read now, check its target and run it again at the
+    /// pinned block, then commit and broadcast it. True when it failed instead, and the
+    /// next may be sent: its refund no longer covering the floor at the L1 bound read
+    /// now, its target or run failing for good, or a node error on them for
+    /// `node_error_ticks` ticks in a row.
     async fn send(
         &self,
         ticking: &mut Ticking,
-        (id, tx, (net, l1), deadline): Queued,
+        (id, tx, (net, l1), deadline, wallet): Queued,
         head: &Head,
         nonce: u64,
         balance: U256,
     ) -> Result<bool, Error> {
         let tx: TransactionRequest = serde_json::from_str(&tx)?;
         let (limit, value) = (tx.gas.unwrap_or_default(), tx.value.unwrap_or_default());
-        let refund = net + value;
+        let (refund, create) = (net + value, tx.to == Some(self.config.factory.into()));
         // A node error here is not the request's, so it counts no strike.
         let now = gas::l1_fee_bound(&self.provider, &self.config, &tx, limit, head.at());
         let now = now.await.map_err(refused)?;
@@ -622,9 +623,10 @@ impl<P: Provider> Relayer<P> {
         if balance < required {
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }
+        let vouched = vouched(&self.provider, &self.config, wallet, create, value);
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
         let n = self.config.node_error_ticks;
-        match run.await {
+        match async { vouched.await.and(run.await) }.await {
             Err(Refusal::Node(e)) if !deterministic(&e) && ticking.strike(id) < n => {
                 return Err(e.into());
             }
@@ -951,8 +953,12 @@ fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
         Refusal::RelayerUnderfunded { balance, required } => {
             ("RelayerUnderfunded".into(), words(balance, required))
         }
+        Refusal::UnsupportedRelease { version } => {
+            let version = U256::from(*version).to_be_bytes::<32>();
+            ("UnsupportedRelease".into(), version.to_vec())
+        }
         Refusal::Node(e) => ("Node".into(), e.as_bytes().to_vec()),
-        other => (format!("{other:?}"), vec![]),
+        other => (other.name().into(), vec![]),
     }
 }
 
@@ -972,6 +978,11 @@ fn decode_failure(name: &str, detail: Option<Vec<u8>>) -> Refusal {
             balance: first,
             required: second,
         },
+        "UnsupportedRelease" => Refusal::UnsupportedRelease {
+            version: first.saturating_to(),
+        },
+        "ValueNotAllowed" => Refusal::ValueNotAllowed,
+        "UnknownWallet" => Refusal::UnknownWallet,
         "Node" => Refusal::Node(String::from_utf8_lossy(&detail).into()),
         _ => Refusal::Expired,
     }
@@ -996,6 +1007,10 @@ pub(crate) fn rows<T>(
 
 pub(crate) fn first<T: rusqlite::types::FromSql>(row: &Row) -> rusqlite::Result<T> {
     row.get(0)
+}
+
+fn address(row: &Row, i: usize) -> rusqlite::Result<Address> {
+    Ok(Address::from_slice(&row.get::<_, Vec<u8>>(i)?))
 }
 
 fn b256(row: &Row, i: usize) -> rusqlite::Result<B256> {
@@ -1028,5 +1043,15 @@ mod tests {
         let (net, l1) = (U256::from(703), U256::from(3));
         assert_eq!(affordable(&raw, (net, l1)).unwrap(), U256::from(708));
         assert!(affordable(&raw, (net - U256::ONE, l1)).is_err());
+    }
+
+    #[test]
+    fn a_target_failure_reads_back_as_stored() {
+        let release = Refusal::UnsupportedRelease { version: 7 };
+        for refusal in [release, Refusal::ValueNotAllowed, Refusal::UnknownWallet] {
+            let (name, detail) = encode_failure(&refusal);
+            let read = decode_failure(&name, Some(detail));
+            assert_eq!(format!("{read:?}"), format!("{refusal:?}"));
+        }
     }
 }

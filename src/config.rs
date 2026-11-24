@@ -201,9 +201,12 @@ impl Config {
         config
     }
 
-    /// Refuses settings the sender cannot keep: an inclusion window shorter than
-    /// two blocks, or a max cancel fee below 1.1 × M.
+    /// Refuses settings the sender cannot keep: no supported release, an inclusion
+    /// window shorter than two blocks, or a max cancel fee below 1.1 × M.
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.supported_releases.is_empty() {
+            return Err("supported_releases is empty; list a release".into());
+        }
         if self.inclusion_window < 2 * self.block_time {
             let (w, b) = (self.inclusion_window, self.block_time);
             return Err(format!(
