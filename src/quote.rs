@@ -54,7 +54,7 @@ pub struct Draft {
 }
 
 /// What the client signs: `call_gas`, and a refund of at least `value + min_refund`
-/// for a send at `gas_limit`.
+/// for a send at `gas_limit`. Its fee is the node's estimate when quoted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quote {
     /// The gas the wallet reserves for each call: the simulation's gas used.
