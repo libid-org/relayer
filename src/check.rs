@@ -7,7 +7,6 @@ use std::{
 };
 
 use alloy::{
-    eips::BlockNumberOrTag,
     network::TransactionBuilder,
     primitives::{
         Address,
@@ -146,7 +145,7 @@ pub async fn check<P: Provider>(
         let required = message.value.saturating_add(gas_cost);
         return Err(Refusal::RefundTooLow { refund, required });
     }
-    let sim = gas::simulate(provider, &call).await?;
+    let sim = gas::simulate(provider, &call, late).await?;
     if !sim.status {
         return Err(reverted(sim.return_data));
     }
@@ -188,13 +187,9 @@ async fn unexpired<P: Provider>(
     deadline: u64,
     window: Duration,
 ) -> Result<u64, Refusal> {
-    let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
-    let latest = latest.await.map_err(node)?;
-    let now = latest
-        .ok_or_else(|| node("no latest block"))?
-        .header
-        .timestamp;
-    let late = now.saturating_add(window.as_secs());
+    let late = gas::latest_time(provider)
+        .await?
+        .saturating_add(window.as_secs());
     if deadline < late {
         return Err(Refusal::Expired);
     }

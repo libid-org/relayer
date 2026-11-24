@@ -76,7 +76,9 @@ pub async fn quote<P: Provider>(
     let (wallet, create) = (draft.wallet, draft.create);
     let call = target(provider, config, wallet, create, &draft.data, message.value);
     let call = call.await?;
-    let sim = gas::simulate(provider, &call).await?;
+    // After the latest block: nodes refuse a simulated block that is not.
+    let late = gas::latest_time(provider).await? + config.inclusion_window.as_secs();
+    let sim = gas::simulate(provider, &call, late).await?;
     // Every call ran; only the dummy signatures failed.
     let unsigned = sim.return_data[..] == IWebWallet::ExecutionNotSigned::SELECTOR;
     if !sim.status && !unsigned {

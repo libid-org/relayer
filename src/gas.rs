@@ -2,7 +2,10 @@
 
 use alloy::{
     consensus::SignableTransaction,
-    eips::eip1559::Eip1559Estimation,
+    eips::{
+        eip1559::Eip1559Estimation,
+        BlockNumberOrTag,
+    },
     network::TransactionBuilder,
     primitives::{
         address,
@@ -16,6 +19,7 @@ use alloy::{
             SimCallResult,
             SimulatePayload,
         },
+        BlockOverrides,
         TransactionRequest,
     },
 };
@@ -68,13 +72,28 @@ pub(crate) fn priced(
         .with_chain_id(chain_id)
 }
 
-/// `tx` run once with `eth_simulateV1` on the latest block, with the block's gas.
+/// The latest block's timestamp.
+pub(crate) async fn latest_time<P: Provider>(provider: &P) -> Result<u64, Refusal> {
+    let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
+    let latest = latest.await.map_err(node)?;
+    Ok(latest
+        .ok_or_else(|| node("no latest block"))?
+        .header
+        .timestamp)
+}
+
+/// `tx` run once with `eth_simulateV1` after the latest block, in a block at `time`.
 pub(crate) async fn simulate<P: Provider>(
     provider: &P,
     tx: &TransactionRequest,
+    time: u64,
 ) -> Result<SimCallResult, Refusal> {
     let payload = SimulatePayload {
         block_state_calls: vec![SimBlock {
+            block_overrides: Some(BlockOverrides {
+                time: Some(time),
+                ..Default::default()
+            }),
             calls: vec![tx.clone()],
             ..Default::default()
         }],
@@ -85,7 +104,14 @@ pub(crate) async fn simulate<P: Provider>(
         .into_iter()
         .next()
         .and_then(|b| b.calls.into_iter().next());
-    call.ok_or_else(|| node("eth_simulateV1 returned no call"))
+    let mut call = call.ok_or_else(|| node("eth_simulateV1 returned no call"))?;
+    // Some nodes (anvil 1.8) return a revert's data only in `error.data`.
+    if !call.status && call.return_data.is_empty() {
+        if let Some(data) = call.error.as_ref().and_then(|e| e.data.clone()) {
+            call.return_data = data;
+        }
+    }
+    Ok(call)
 }
 
 /// `k × getL1FeeUpperBound` of `tx`'s unsigned size: the L1 fee a refund covers (D5).

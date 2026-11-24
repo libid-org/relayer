@@ -231,10 +231,12 @@ async fn anvil_simulates_a_draft_to_execution_not_signed() {
     let b = Batch(o.onboarding(), o.value, vec![&o.k], None);
     let sim = o.run(&o.authorize(&b, None).await, o.value, false).await;
     assert!(!sim.status && sim.gas_used > 21_000, "{sim:?}");
-    assert_eq!(
-        sim.return_data[..],
-        IWebWallet::ExecutionNotSigned::SELECTOR
-    );
+    // anvil 1.8 returns the revert data only in `error.data`.
+    let data = match sim.error.as_ref().and_then(|e| e.data.clone()) {
+        Some(data) if sim.return_data.is_empty() => data,
+        _ => sim.return_data.clone(),
+    };
+    assert_eq!(data[..], IWebWallet::ExecutionNotSigned::SELECTOR);
 }
 
 /// The create path: a `callGas` signed above the quote is `GasLimitTooLow` with
