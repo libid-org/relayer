@@ -41,6 +41,7 @@ use libid_contracts::{
         OPERATIONS_DOMAIN,
     },
     testing::*,
+    wallet_target::RELEASE_SLOT,
     Artifacts,
 };
 use relayer::{
@@ -322,6 +323,10 @@ impl Onboarding {
     }
 }
 
+fn reverted(r: &Refusal, name: &str) -> bool {
+    matches!(r, Refusal::Reverted { error: Some(e), .. } if e.name() == name)
+}
+
 fn admin() -> Policy {
     Policy {
         admin: true,
@@ -387,6 +392,11 @@ async fn the_relayer_checks_and_lands_the_onboarding() {
     );
     assert_eq!((sent.mode, sent.data), (AUTHORIZED_MODE, data), "I7, D4");
     assert_eq!(tx.inner.value(), o.value);
+    assert_eq!(
+        tx.inner.gas_limit(),
+        GAS_LIMIT,
+        "the limit R was priced for"
+    );
     let worst = U256::from(tx.inner.gas_limit()) * U256::from(tx.inner.max_fee_per_gas());
     assert!(
         worst <= o.refund() - o.value,
@@ -399,7 +409,28 @@ async fn the_relayer_checks_and_lands_the_onboarding() {
 #[tokio::test]
 async fn refuses_before_sending() {
     let o = Onboarding::new(true).await;
+    let factory = WalletFactory::new(o.stack.factory, &o.owner);
+    let (platform, id_node) = (o.stack.platform, B256::repeat_byte(0xa2));
+    let existing = factory.walletAddress(platform, id_node, U256::ZERO);
+    let existing = existing.call().await.unwrap(); // a factory wallet K has no session in
+    mined!(factory.createWallet(platform, id_node, U256::ZERO));
+    let account = Address::repeat_byte(0x77); // delegated to the forwarder, release 1
+    let delegation = [&[0xef, 0x01, 0x00][..], o.stack.forwarder.as_slice()].concat();
+    o.owner
+        .anvil_set_code(account, delegation.into())
+        .await
+        .unwrap();
+    let release: U256 = U256::from_be_slice(o.stack.release.implementation.as_slice())
+        | U256::from(o.stack.release.version) << 160;
+    let slot = RELEASE_SLOT.into();
+    o.owner
+        .anvil_set_storage_at(account, slot, B256::from(release))
+        .await
+        .unwrap();
+    // Nothing is mined below, so the check reads this fee and this time.
     let (r, now) = (o.refund(), o.now().await);
+    let fees = o.relayer.estimate_eip1559_fees().await.unwrap();
+    let bound = o.value + U256::from(GAS_LIMIT) * U256::from(fees.max_fee_per_gas);
     let good = o.sign(&o.onboarding()).await;
     let calldata = encode_executions(&o.onboarding());
     let missing = |r: &Refusal| matches!(r, Refusal::RefundMissing);
@@ -407,6 +438,9 @@ async fn refuses_before_sending() {
     let noncanonical = |r: &Refusal| matches!(r, Refusal::NoncanonicalData);
     let expired = |r: &Refusal| matches!(r, Refusal::Expired);
     let unknown = |r: &Refusal| matches!(r, Refusal::UnknownWallet);
+    // The batch ran on the target: its link or bind failed, not the check.
+    let failed_call = |r: &Refusal| reverted(r, "FailedCall");
+    let wrong_bind = |r: &Refusal| reverted(r, "WrongBindValue");
 
     let nested = IWebWallet::executeCall {
         mode: AUTHORIZED_MODE,
@@ -438,6 +472,12 @@ async fn refuses_before_sending() {
     let bare = o.repay(o.value); // repays the fronted value, nothing for gas
     let sign_at =
         |value, at, deadline| o.sign_until(calldata.clone(), value, at, deadline);
+    let on = |wallet, data| Request {
+        wallet,
+        create: None,
+        ..o.request(data)
+    };
+    let below_bound = o.request_for(&o.batch(o.repay(bound - U256::ONE))).await;
 
     #[rustfmt::skip]
     let cases: Vec<Case> = vec![
@@ -448,6 +488,8 @@ async fn refuses_before_sending() {
         ("refund = value", o.request_for(&o.batch(bare)).await, low),
         // Signed with `value` R, so R - value is 0.
         ("value = refund", o.request(sign_at(r, now, now + 3600)), low),
+        ("value > refund", o.request(sign_at(r + U256::ONE, now, now + 3600)), low),
+        ("refund 1 wei below the bound", below_bound.clone(), low),
         ("moved offsets", o.request(moved.into()), noncanonical),
         ("trailing word", o.request(trailing.into()), noncanonical),
         ("cut", o.request(good.slice(..good.len() - 1)), noncanonical),
@@ -456,6 +498,9 @@ async fn refuses_before_sending() {
         ("expired", o.request(sign_at(o.value, now - 10, now - 1)), expired),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
+        ("account with value", on(account, good.clone()), unknown),
+        ("account, no value", on(account, sign_at(U256::ZERO, now, now + 3600)), failed_call),
+        ("factory wallet", on(existing, good.clone()), wrong_bind),
     ];
 
     let nonce = o.relayer_nonce().await;
@@ -471,10 +516,23 @@ async fn refuses_before_sending() {
         o.owner.get_code_at(o.wallet).await.unwrap().is_empty(),
         "a wallet was created"
     );
+    let refused = check(&o.relayer, &o.config(), &below_bound).await.err();
+    let Some(Refusal::RefundTooLow { refund, required }) = refused else {
+        panic!("{refused:?}")
+    };
+    assert_eq!((refund, required), (bound - U256::ONE, bound));
     // The good request still passes: every refusal above is the change's.
-    check(&o.relayer, &o.config(), &o.request(good))
+    let at_bound = o.request_for(&o.batch(o.repay(bound))).await;
+    for request in [o.request(good.clone()), at_bound] {
+        check(&o.relayer, &o.config(), &request).await.unwrap();
+    }
+    // A node error that is not a revert is not reported as one.
+    o.owner
+        .anvil_set_balance(o.relayer_address, U256::ZERO)
         .await
         .unwrap();
+    let refused = check(&o.relayer, &o.config(), &o.request(good)).await.err();
+    assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
 }
 
 /// D2: a step already done fails as a decoded revert. With nothing escrowed
