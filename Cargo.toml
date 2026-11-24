@@ -19,6 +19,7 @@ libid-contracts.workspace = true
 rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
 
 [dev-dependencies]
 alloy = { version = "2", features = ["node-bindings", "provider-anvil-api", "signer-local"] }

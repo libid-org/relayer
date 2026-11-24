@@ -3366,6 +3366,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

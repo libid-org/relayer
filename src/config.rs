@@ -21,6 +21,11 @@ pub const QUOTE_VALIDITY: Duration = Duration::from_secs(10);
 /// The fee-history percentile a send's tip is read at, between 50 and 90.
 pub const TIP_PERCENTILE: f64 = 75.0;
 
+const UNLIMITED: Budget = Budget {
+    wei: U256::MAX,
+    window: Duration::from_secs(3600),
+};
+
 /// How the relayer bounds the L1 data fee of a send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum L1Fee {
@@ -98,6 +103,15 @@ pub enum FeeParams {
     Fixed(Eip1559),
 }
 
+/// At most `wei` lost over any `window`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// The loss that trips the budget, in wei.
+    pub wei: U256,
+    /// How far back losses count.
+    pub window: Duration,
+}
+
 /// One chain's relayer configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -142,14 +156,19 @@ pub struct Config {
     /// The blocks our nonce may stay mined with no receipt of ours, as from a lagging
     /// node, before sending pauses.
     pub receipt_lag_blocks: u64,
+    /// The loss budget of each wallet: past it, its requests are `RateLimited`.
+    pub wallet_budget: Budget,
+    /// The loss budget of all wallets, each counted up to its own budget: past it,
+    /// sending pauses and requests are `Paused`.
+    pub global_budget: Budget,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
-    /// ticks of node errors on a request, receipts up to 10 blocks behind, and release
-    /// 1, the one the contracts' test stack publishes.
+    /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
+    /// budgets, and release 1, the one the contracts' test stack publishes.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -174,6 +193,8 @@ impl Config {
             min_balance: U256::ZERO,
             node_error_ticks: 5,
             receipt_lag_blocks: 10,
+            wallet_budget: UNLIMITED,
+            global_budget: UNLIMITED,
         };
         let window = config.blocks(config.inclusion_window);
         config.max_fee_percent = Eip1559::L1.growth_percent(window);

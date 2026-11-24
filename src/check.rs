@@ -130,8 +130,34 @@ pub enum Refusal {
         /// The request in flight.
         id: B256,
     },
+    /// The wallet lost its loss budget.
+    RateLimited,
+    /// Sending paused: all wallets lost the global loss budget.
+    Paused,
     /// The node could not answer.
     Node(String),
+}
+
+impl Refusal {
+    /// The refusal's name, as the API and metrics report it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NoncanonicalData => "NoncanonicalData",
+            Self::RefundMissing => "RefundMissing",
+            Self::RefundTooLow { .. } => "RefundTooLow",
+            Self::GasLimitTooLow { .. } => "GasLimitTooLow",
+            Self::UnknownWallet => "UnknownWallet",
+            Self::ValueNotAllowed => "ValueNotAllowed",
+            Self::UnsupportedRelease { .. } => "UnsupportedRelease",
+            Self::Expired => "Expired",
+            Self::Reverted { .. } => "Reverted",
+            Self::RelayerUnderfunded { .. } => "RelayerUnderfunded",
+            Self::WalletBusy { .. } => "WalletBusy",
+            Self::RateLimited => "RateLimited",
+            Self::Paused => "Paused",
+            Self::Node(_) => "Node",
+        }
+    }
 }
 
 impl Request {
