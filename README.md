@@ -69,7 +69,9 @@ On `[http] port`:
 `create` is `{platformId, idNode, salt}` when the batch creates the wallet.
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
 signatures. A status is `queued`, `sent`, `included`, `cancelled` or `failed`.
-Relaying the same request again answers its current status.
+Relaying the same request again answers its current status; a failed one is
+queued again. A receipt that does not parse for `node_error_ticks` ticks is
+charged at its send's worst cost, and its request fails as `Node`.
 
 A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 

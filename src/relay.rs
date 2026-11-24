@@ -111,7 +111,7 @@ type Queued = (B256, String, Cover, u64, Address);
 const CANCEL_PERCENTILE: f64 = 90.0;
 
 /// The schema version, `PRAGMA user_version`, a database must have.
-const VERSION: i32 = 3;
+const VERSION: i32 = 4;
 
 const SCHEMA: &str = "
     CREATE TABLE requests (id BLOB PRIMARY KEY, wallet BLOB NOT NULL,
@@ -121,7 +121,7 @@ const SCHEMA: &str = "
         included_at INTEGER, loss BLOB, block_hash BLOB);
     CREATE TABLE attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
         nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL,
-        block INTEGER NOT NULL, at INTEGER NOT NULL,
+        block INTEGER NOT NULL, at INTEGER NOT NULL, worst BLOB NOT NULL,
         sent_at INTEGER NOT NULL DEFAULT (unixepoch()));
     CREATE INDEX attempts_nonce ON attempts (nonce);
     CREATE TABLE nonce (next INTEGER NOT NULL);";
@@ -147,7 +147,8 @@ pub enum Status {
     },
     /// Replaced by a cancel that landed; not queued again.
     Cancelled,
-    /// Refused before its first broadcast; queued again when relayed again.
+    /// Refused before its first broadcast, or charged at its worst as `Node` when its
+    /// receipt did not parse; queued again when relayed again.
     Failed(Refusal),
 }
 
@@ -188,28 +189,35 @@ struct Attempt {
     /// The number and time of the block it was signed at.
     block: u64,
     at: u64,
+    /// The most it takes from the balance, at the L1 bound it was sent with.
+    worst: U256,
 }
 
 /// What a tick leaves for the next, behind the lock that runs one tick at a time.
 #[derive(Default)]
 struct Ticking {
-    /// The last request whose run met a node error or whose receipt did not parse, and
-    /// the ticks in a row it did.
-    errors: (B256, u32),
+    /// Node errors on a queued request's run.
+    send: Strikes,
+    /// Receipts of a request that did not parse.
+    receipt: Strikes,
     /// Our nonces mined with no receipt of ours, and the block each was first seen at.
     missing: BTreeMap<u64, u64>,
 }
 
-impl Ticking {
-    /// Count a tick of node errors on `id`'s run: the ticks in a row.
+/// Each request's ticks in a row with an error.
+#[derive(Default)]
+struct Strikes(BTreeMap<B256, u32>);
+
+impl Strikes {
+    /// Count a tick with an error on `id`: its ticks in a row.
     fn strike(&mut self, id: B256) -> u32 {
-        let n = if self.errors.0 == id {
-            self.errors.1
-        } else {
-            0
-        };
-        self.errors = (id, n + 1);
-        n + 1
+        let n = self.0.entry(id).or_default();
+        *n += 1;
+        *n
+    }
+
+    fn clear(&mut self, id: B256) {
+        self.0.remove(&id);
     }
 }
 
@@ -342,7 +350,11 @@ impl<P: Provider> Relayer<P> {
             return Ok(stored);
         }
         let row = params![&id[..], &wallet[..], tx, net, l1, deadline];
-        db.execute("DELETE FROM attempts WHERE id = ?1", [&id[..]])
+        // A charged failure stays in the budgets, under another id.
+        let keep = "UPDATE requests SET id = id || CAST(rowid AS BLOB) \
+                    WHERE id = ?1 AND loss IS NOT NULL";
+        db.execute(keep, [&id[..]])
+            .and_then(|_| db.execute("DELETE FROM attempts WHERE id = ?1", [&id[..]]))
             .and_then(|_| db.execute(
                 "INSERT OR REPLACE INTO requests (id, wallet, tx, net, l1, deadline, status) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued')",
@@ -367,23 +379,14 @@ impl<P: Provider> Relayer<P> {
         let mined = mined.block_id(head.at()).await?;
         let mut missing = BTreeMap::new();
         for (id, deadline, cover) in self.in_flight(mined)? {
-            match self.watch(id, deadline, cover, &head, mined).await {
-                Ok(Some(n)) => drop(
-                    missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number)),
-                ),
-                Ok(None) => {}
-                Err(e)
-                    if e.is::<Unreadable>()
-                        && ticking.strike(id) >= self.config.node_error_ticks =>
-                {
-                    tracing::warn!("{id} charged at its worst: its receipt: {e}");
-                    self.charge_worst(id, cover.1)?;
-                }
-                Err(e) => return Err(e),
+            let watched = self.watch(id, deadline, cover, &head, mined).await;
+            if let Some(Some(n)) = self.read(&mut ticking.receipt, id, watched)? {
+                missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number));
             }
         }
         for (id, net) in self.uncharged()? {
-            self.resolve(id, net, &head).await?;
+            let resolved = self.resolve(id, net, &head).await;
+            self.read(&mut ticking.receipt, id, resolved)?;
         }
         let lag = self.config.receipt_lag_blocks;
         let unexplained = missing.values().any(|at| head.number >= at + lag);
@@ -702,7 +705,7 @@ impl<P: Provider> Relayer<P> {
             .nonce(nonce)
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
-        let attempt = self.sign(tx, false, head).await?;
+        let attempt = self.sign(tx, false, head, now).await?;
         let required = affordable(&attempt.raw, (net, now))?;
         if balance < required {
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
@@ -711,30 +714,60 @@ impl<P: Provider> Relayer<P> {
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
         let n = self.config.node_error_ticks;
         match async { vouched.await.and(run.await) }.await {
-            Err(Refusal::Node(e)) if !deterministic(&e) && ticking.strike(id) < n => {
+            Err(Refusal::Node(e))
+                if !deterministic(&e) && ticking.send.strike(id) < n =>
+            {
                 return Err(e.into());
             }
-            Err(refusal) => return self.fail(id, &refusal),
-            Ok(()) => {}
+            Err(refusal) => {
+                ticking.send.clear(id);
+                return self.fail(id, &refusal);
+            }
+            Ok(()) => ticking.send.clear(id),
         }
         self.commit(id, &attempt)?;
         self.broadcast(&attempt, (net, l1), None, head).await?;
         Ok(false)
     }
 
-    /// Charge `id` as included with no refund at its attempts' worst cost: gas at the
-    /// cap, its value and the L1 bound `l1`.
-    fn charge_worst(&self, id: B256, l1: U256) -> Result<(), Error> {
-        let mut worst = U256::ZERO;
-        for a in self.attempts(id)? {
-            let tx = TxEnvelope::decode_2718(&mut &a.raw[..])?;
-            let gas = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas());
-            worst = worst.max(gas + l1 + tx.value());
+    /// `result`, of reading `id`'s receipt: a success clears its strikes; a receipt that
+    /// does not parse is struck, and charged at its worst after `node_error_ticks`.
+    fn read<T>(
+        &self,
+        strikes: &mut Strikes,
+        id: B256,
+        result: Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        match result {
+            Ok(t) => {
+                strikes.clear(id);
+                Ok(Some(t))
+            }
+            Err(e)
+                if e.is::<Unreadable>()
+                    && strikes.strike(id) >= self.config.node_error_ticks =>
+            {
+                tracing::warn!("{id} charged at its worst: its receipt: {e}");
+                strikes.clear(id);
+                self.charge_worst(id, &e).map(|()| None)
+            }
+            Err(e) => Err(e),
         }
+    }
+
+    /// Charge `id` with no refund at its attempts' stored worst; with no receipt
+    /// recorded, it fails as `Node`.
+    fn charge_worst(&self, id: B256, e: &Error) -> Result<(), Error> {
+        let sql = "SELECT worst FROM attempts WHERE id = ?1";
+        let worst = rows(&self.db(), sql, [&id[..]], |r| u256(r, 0))?;
+        let worst = worst.into_iter().max().unwrap_or_default();
+        let unread = Refusal::Node(format!("its receipt does not parse: {e}"));
+        let (failure, detail) = encode_failure(&unread);
         self.db().execute(
-            "UPDATE requests SET status = 'included', loss = ?2, \
-             included_at = coalesce(included_at, unixepoch()) WHERE id = ?1",
-            params![&id[..], worst.to_be_bytes::<32>()],
+            "UPDATE requests SET loss = ?2, status = iif(block IS NULL, 'failed', status), \
+             failure = iif(block IS NULL, ?3, failure), detail = iif(block IS NULL, ?4, \
+             detail), included_at = coalesce(included_at, unixepoch()) WHERE id = ?1",
+            params![&id[..], worst.to_be_bytes::<32>(), failure, detail],
         )?;
         Ok(())
     }
@@ -751,6 +784,8 @@ impl<P: Provider> Relayer<P> {
     /// least 1.1× `last`'s.
     async fn cancel(&self, id: B256, last: &Attempt, head: &Head) -> Result<(), Error> {
         let tx = TxEnvelope::decode_2718(&mut &last.raw[..])?;
+        // The L1 bound `last` was sent with.
+        let l1 = last.worst.saturating_sub(most(&tx, U256::ZERO));
         if last.cancel && head.base_fee <= tx.max_fee_per_gas() {
             let again = self.broadcast(last, Default::default(), None, head);
             return again.await.map(drop);
@@ -774,7 +809,7 @@ impl<P: Provider> Relayer<P> {
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.min(cap))
             .with_chain_id(self.config.chain_id);
-        let attempt = self.sign(cancel, true, head).await?;
+        let attempt = self.sign(cancel, true, head, l1).await?;
         self.commit(id, &attempt)?;
         self.broadcast(&attempt, Default::default(), None, head)
             .await
@@ -786,11 +821,13 @@ impl<P: Provider> Relayer<P> {
         at + self.config.inclusion_window.as_secs()
     }
 
+    /// `tx` signed at `head`, sent with the L1 bound `l1`.
     async fn sign(
         &self,
         tx: TransactionRequest,
         cancel: bool,
         head: &Head,
+        l1: U256,
     ) -> Result<Attempt, Error> {
         let nonce = tx.nonce.unwrap_or_default();
         let signed = self.provider.fill_and_sign_transaction(tx).await?;
@@ -802,6 +839,7 @@ impl<P: Provider> Relayer<P> {
             raw,
             block: head.number,
             at: head.time,
+            worst: most(&signed, l1),
         })
     }
 
@@ -887,8 +925,8 @@ impl<P: Provider> Relayer<P> {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT INTO attempts (hash, id, nonce, cancel, raw, block, at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO attempts (hash, id, nonce, cancel, raw, block, at, worst) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 &a.hash[..],
                 &id[..],
@@ -896,7 +934,8 @@ impl<P: Provider> Relayer<P> {
                 a.cancel,
                 &a.raw[..],
                 a.block,
-                a.at
+                a.at,
+                a.worst.to_be_bytes::<32>()
             ],
         )?;
         tx.execute("UPDATE nonce SET next = max(next, ?1)", [a.nonce + 1])?;
@@ -948,7 +987,7 @@ impl<P: Provider> Relayer<P> {
 
     fn attempts(&self, id: B256) -> Result<Vec<Attempt>, Error> {
         let sql =
-            "SELECT hash, nonce, cancel, raw, block, at FROM attempts WHERE id = ?1 \
+            "SELECT hash, nonce, cancel, raw, block, at, worst FROM attempts WHERE id = ?1 \
                    ORDER BY rowid";
         rows(&self.db(), sql, [&id[..]], |r| {
             let (hash, nonce, cancel) = (b256(r, 0)?, r.get(1)?, r.get(2)?);
@@ -960,6 +999,7 @@ impl<P: Provider> Relayer<P> {
                 raw,
                 block: r.get(4)?,
                 at: r.get(5)?,
+                worst: u256(r, 6)?,
             })
         })
     }
@@ -1031,14 +1071,21 @@ fn admit(
 }
 
 /// The send `raw` costs at most `R - value`: its gas at its cap plus the L1 bound.
-/// Returns that cost plus its value, the most it takes from the balance.
+/// Returns its [`most`].
 fn affordable(raw: &[u8], (net, l1): Cover) -> Result<U256, Error> {
     let tx = TxEnvelope::decode_2718(&mut &raw[..])?;
-    let worst = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1;
+    let most = most(&tx, l1);
+    let worst = most - tx.value();
     if worst > net {
         return Err(format!("a send costs up to {worst}, above R - value {net}").into());
     }
-    Ok(worst + tx.value())
+    Ok(most)
+}
+
+/// The most `tx` takes from the balance at the L1 bound `l1`: its gas at its cap,
+/// `l1` and its value.
+fn most(tx: &TxEnvelope, l1: U256) -> U256 {
+    U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1 + tx.value()
 }
 
 /// A node error that the same run meets again: one naming fees, gas or funds.

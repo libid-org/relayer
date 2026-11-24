@@ -880,35 +880,107 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
 }
 
 /// A receipt that does not parse holds the queue for `node_error_ticks` ticks, then
-/// is charged as included with no refund at its send's worst cost, in the budgets and
-/// the stats.
+/// its request fails as `Node`, charged at its send's worst cost from the ledger alone,
+/// in the budgets and the stats. A retry keeps the charge, and fails in its run once the
+/// batch landed.
 #[tokio::test]
-async fn an_unparsed_receipt_is_charged_at_its_worst_after_its_ticks() {
+async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("garbled"));
     let (r, mode) = o.armable(&path).await;
-    let left = r.budget_left().unwrap();
-    let id = o.queue(&r).await;
+    let lost = {
+        let left = r.budget_left().unwrap();
+        move |r: &Relayer<Racing>| left - r.budget_left().unwrap()
+    };
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let request = o.request_for(&o.onboarding()).await;
+    let id = r.relay(&request).await.unwrap();
     r.tick().await.unwrap();
+    let hash = r.status(id).await.unwrap().tx_hashes[0];
     mode.store(GARBLED, Ordering::Relaxed);
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    ledger
+        .execute("UPDATE attempts SET raw = x'00'", [])
+        .unwrap();
     for _ in 1..o.config().node_error_ticks {
         r.tick().await.expect_err("no parse error");
     }
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
-    assert!(
-        matches!(report.status, Status::Included { .. }),
-        "{:?}",
-        report.status
-    );
-    let t = o.tx(report.tx_hashes[0]).await.inner;
+    let node = matches!(report.status, Status::Failed(Refusal::Node(_)));
+    assert!(node, "{:?}", report.status);
+    let t = o.tx(hash).await.inner;
     let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + t.value();
-    assert_eq!(
-        left - r.budget_left().unwrap(),
-        worst,
-        "not charged at its worst"
-    );
+    assert_eq!(lost(&r), worst, "not charged at its worst");
     let profit = relayer::stats::stats(&path).unwrap().profit;
     assert_eq!(profit, -alloy::primitives::I256::try_from(worst).unwrap());
+    r.relay(&request).await.unwrap();
+    assert!(matches!(r.status(id).await.unwrap().status, Status::Queued));
+    assert_eq!(lost(&r), worst, "a retry dropped the charge");
+    mode.store(0, Ordering::Relaxed);
+    o.owner.evm_mine(None).await.unwrap();
+    assert!(o.mined(hash).await);
+    r.tick().await.unwrap();
+    let report = r.status(id).await.unwrap();
+    let failed = matches!(report.status, Status::Failed(ref f) if f.name() != "Node");
+    assert!(failed && report.tx_hashes.is_empty(), "{:?}", report.status);
+    assert!(
+        r.relay(&request).await.is_err(),
+        "a landed batch relayed again"
+    );
+    assert_eq!(lost(&r), worst, "a failed retry is charged");
+}
+
+/// Strikes count in a row per request, apart for its run and its receipt: a send
+/// struck short of `node_error_ticks` and an unparsed receipt between readable ones
+/// charge nothing.
+#[tokio::test]
+async fn strikes_reset_and_count_apart() {
+    let (o, path) = (Onboarding::new(true).await, db("strikes"));
+    let (r, mode) = o.armable(&path).await;
+    let n = o.config().node_error_ticks;
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let id = o.queue(&r).await;
+    let ticks = async |m: u8, k: u32| {
+        mode.store(m, Ordering::Relaxed);
+        for _ in 0..k {
+            r.tick().await.expect_err("no strike");
+        }
+        mode.store(0, Ordering::Relaxed);
+        r.tick().await.unwrap();
+    };
+    ticks(STALL, n - 1).await;
+    ticks(GARBLED, n - 1).await;
+    ticks(GARBLED, 1).await;
+    let report = r.status(id).await.unwrap();
+    assert!(matches!(report.status, Status::Sent), "{:?}", report.status);
+    assert_eq!(
+        relayer::stats::stats(&path).unwrap().profit,
+        Default::default()
+    );
+}
+
+/// An included request whose receipt no longer parses while its loss is pending is
+/// struck, then charged at its worst, and the ticks go on.
+#[tokio::test]
+async fn an_unparsed_receipt_of_a_pending_loss_is_charged_after_its_ticks() {
+    let (o, path) = (Onboarding::new(true).await, db("pending-garbled"));
+    let (r, mode) = o.armable(&path).await;
+    let id = o.queue(&r).await;
+    r.tick().await.unwrap();
+    mode.store(BLIND, Ordering::Relaxed);
+    let report = o.settle(&r, id, included).await;
+    mode.store(GARBLED, Ordering::Relaxed);
+    for _ in 1..o.config().node_error_ticks {
+        r.tick().await.expect_err("no parse error");
+    }
+    r.tick().await.unwrap();
+    r.tick().await.unwrap();
+    let stats = relayer::stats::stats(&path).unwrap();
+    let t = o.tx(report.tx_hashes[0]).await.inner;
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + t.value();
+    let worst = alloy::primitives::I256::try_from(worst).unwrap();
+    assert_eq!((stats.pending, stats.profit), (0, -worst));
+    assert!(included(&r.status(id).await.unwrap().status));
 }
 
 /// A charged loss whose request a lagging node shows in flight again is not charged

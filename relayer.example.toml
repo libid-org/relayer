@@ -74,7 +74,8 @@ global_budget = { wei = "10000000000000000", window = "1h" }
 max_gas_limit = 5000000
 # The wallet releases whose AUTHORIZED data the relayer decodes.
 supported_releases = [1]
-# Ticks of node errors on a request before it fails.
+# Ticks of node errors on a request before it fails, and of a receipt that does
+# not parse before it is charged at its worst.
 node_error_ticks = 5
 # Blocks a receipt may lag its mined nonce before sending pauses.
 receipt_lag_blocks = 50
