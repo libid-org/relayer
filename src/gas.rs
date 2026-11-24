@@ -52,6 +52,9 @@ use crate::{
 /// Calldata gas per byte above a zero byte's (EIP-2028).
 pub(crate) const NONZERO_BYTE: u64 = 12;
 
+/// Calldata gas per zero byte (EIP-2028), the least a byte costs.
+pub(crate) const ZERO_BYTE: u64 = 4;
+
 /// The blocks of fee history a tip is read over.
 const TIP_BLOCKS: u64 = 10;
 
@@ -282,8 +285,21 @@ pub(crate) async fn l1_fee_bound<P: Provider>(
         .max_fee_per_gas(u128::MAX)
         .max_priority_fee_per_gas(u128::MAX);
     let size = tx.build_1559().map_err(node)?.encoded_for_signing().len();
+    l1_bound(provider, config, U256::from(size), block).await
+}
+
+/// `k × getL1FeeUpperBound(size)` read at `block`; 0 on a chain without an L1 fee.
+pub(crate) async fn l1_bound<P: Provider>(
+    provider: &P,
+    config: &Config,
+    size: U256,
+    block: BlockId,
+) -> Result<U256, Refusal> {
+    if config.l1_fee == L1Fee::None {
+        return Ok(U256::ZERO);
+    }
     let oracle = GasPriceOracle::new(GAS_PRICE_ORACLE, provider);
-    let bound = oracle.getL1FeeUpperBound(U256::from(size));
+    let bound = oracle.getL1FeeUpperBound(size);
     let bound = bound.call().block(block).await.map_err(node)?;
     Ok(bound.saturating_mul(U256::from(config.l1_margin)) / U256::from(100))
 }

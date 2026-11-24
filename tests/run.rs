@@ -78,6 +78,36 @@ fn the_example_loads_with_its_overrides() {
     assert!(e.ends_with("name the same chain"), "{e}");
 }
 
+/// Each setting the relayer cannot run with is refused, naming it.
+#[test]
+fn settings_it_cannot_run_with_are_refused() {
+    let env = |name: &'static str, value: &'static str| {
+        move |n: &str| (n == name).then(|| value.to_owned())
+    };
+    #[rustfmt::skip]
+    let rows: [(&str, &str, &str, &str); 9] = [
+        ("poll_interval = \"1s\"", "poll_interval = \"0s\"", "", "poll_interval"),
+        ("concurrency_limit = 64", "concurrency_limit = 0", "", "concurrency_limit"),
+        ("request_timeout = \"30s\"", "request_timeout = \"0s\"", "", "request_timeout"),
+        ("tip_percentile = 75.0", "tip_percentile = 49.9", "", "tip_percentile"),
+        ("tip_percentile = 75.0", "tip_percentile = 90.1", "", "tip_percentile"),
+        ("tip_percentile = 75.0", "tip_percentile = nan", "", "tip_percentile"),
+        ("", "", "RELAYER_PORT", "RELAYER_PORT 9090 is [http] metrics_port"),
+        ("", "", "RELAYER_SIGNER", "RELAYER_SIGNER is empty"),
+        ("tip_percentile = 75.0", "tip_percentile = 90.0", "", ""),
+    ];
+    for (from, to, name, hint) in rows {
+        let value = if name == "RELAYER_PORT" { "9090" } else { "" };
+        assert!(EXAMPLE.contains(from), "{from}");
+        let loaded =
+            Settings::load(&write("bad", &EXAMPLE.replace(from, to)), env(name, value));
+        match loaded {
+            Ok(_) => assert_eq!(hint, "", "{to} {name} loaded"),
+            Err(e) => assert!(!hint.is_empty() && e.to_string().contains(hint), "{e}"),
+        }
+    }
+}
+
 /// A configuration, code planted at an address, and the hint refused with; none when it
 /// passes.
 type Case<'a> = (Config, Option<(Address, &'a str)>, &'a str);
@@ -98,6 +128,13 @@ async fn each_startup_check_refuses_with_its_hint() {
     let (ep, implementation) = (o.stack.entry_point, o.stack.release.implementation);
     let missing_ep = format!("no EntryPoint v0.9 at {ep}");
     let op = with(&|c| c.l1_fee = L1Fee::OpStack);
+    // The oracle's L1 fee bound: 0, or 2^255 for one row.
+    let oracle = alloy::primitives::address!("420000000000000000000000000000000000000F");
+    o.set_code(oracle, zero).await;
+    let huge = "7f8000000000000000000000000000000000000000000000000000000000000000\
+                60005260206000f3";
+    let costly =
+        with(&|c| (c.l1_fee, c.wallet_budget.wei) = (L1Fee::OpStack, U256::MAX >> 10));
     #[rustfmt::skip]
     let rows: Vec<Case> = vec![
         (ok.clone(), None, ""),
@@ -108,9 +145,11 @@ async fn each_startup_check_refuses_with_its_hint() {
         (with(&|c| c.forwarder = at), Some((at, one)), "set this factory's forwarder"),
         (ok.clone(), Some((implementation, one)), "set the factory that published it"),
         (ok.clone(), Some((ep, "")), &missing_ep),
+        (ok.clone(), Some((o.stack.factory, "60406000f3")), "published no release"),
         (with(&|c| c.supported_releases = vec![2]), None, "run a relayer that decodes"),
         (with(&|c| c.min_balance = U256::MAX), None, "fund"),
         (with(&|c| c.wallet_budget.wei = U256::ONE), None, "wallet_budget 1 is below"),
+        (costly, Some((oracle, huge)), "the L1 fee bound"),
         (op.clone(), Some((l1_block, one)), "operator fee is on"),
         (op.clone(), Some((l1_block, revert)), ""),
         (op.clone(), Some((l1_block, zero)), ""),
@@ -177,7 +216,7 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
             ("rpc_url = \"https://sepolia.base.org\"", rpc.as_str()),
             ("# signer = \"alias/libid-relayer\"", &signed),
             ("chain_id = 84532", &chain), ("\"op-stack\"", "\"none\""), ("\"header\"", fixed),
-            ("max_fee_percent = 200", "max_fee_percent = 181"), ("\"200ms\"", "\"1s\""),
+            ("max_fee_percent = 210", "max_fee_percent = 181"), ("\"200ms\"", "\"1s\""),
             ("poll_interval = \"1s\"", "poll_interval = \"100ms\""), ("\"10s\"", "\"5s\""),
             ("port = 8080", "port = 0"), ("metrics_port = 9090", "metrics_port = 0"),
             ("\"1000000000000000\"", "\"1000000000000000000\""),

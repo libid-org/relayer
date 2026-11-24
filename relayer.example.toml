@@ -15,7 +15,7 @@ chain_id = 84532
 # network_file = "../chain-configurations/networks/base-sepolia.toml"
 # The chain's block time: the step of the base fee's growth.
 block_time = "200ms"
-# How often the relayer ticks. /health answers 503 once no tick succeeded for ten.
+# How often the relayer ticks, above 0. /health answers 503 once no tick succeeded for ten.
 poll_interval = "1s"
 
 [contracts]
@@ -42,9 +42,10 @@ tip_percentile = 75.0
 l1_fee = "op-stack"
 # k: the refund covers k percent of getL1FeeUpperBound.
 l1_margin_percent = 130
-# M: a send's fee cap is at most M percent of the base fee. Start warns when it is
-# under the base fee's growth over inclusion_window.
-max_fee_percent = 200
+# M: a send's fee cap is at most M percent of the base fee. Keep it at least the
+# base fee's growth over inclusion_window, 201% on Base Sepolia; start warns when
+# it is under.
+max_fee_percent = 210
 # A cancel's highest fee cap, in percent of the base fee: at least 1.1 × M.
 max_cancel_fee_percent = 1000
 # "header" reads an OP-stack header's extraData; or a fixed rule:
@@ -66,7 +67,8 @@ concurrency_limit = 64
 
 [limits]
 # What one wallet may cost in unrefunded sends before it is rate limited: at least
-# max_gas_limit at max_fee_percent of the base fee, which start checks.
+# max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of that
+# much calldata, which start checks. A batch's value is uncapped and not in it.
 wallet_budget = { wei = "1000000000000000", window = "1h" }
 # What all wallets may cost before sending pauses.
 global_budget = { wei = "10000000000000000", window = "1h" }

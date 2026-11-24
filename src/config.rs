@@ -215,7 +215,8 @@ impl Config {
     }
 
     /// Refuses settings the sender cannot keep: no supported release, an inclusion
-    /// window shorter than two blocks, or a max cancel fee below 1.1 × M.
+    /// window shorter than two blocks, a max cancel fee below 1.1 × M, or a tip
+    /// percentile outside 50 to 90.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.supported_releases.is_empty() {
             return Err("supported_releases is empty; list a release".into());
@@ -230,6 +231,12 @@ impl Config {
         if u128::from(cancel) * 10 < u128::from(m) * 11 {
             return Err(format!(
                 "max_cancel_fee_percent {cancel} is under 1.1 × max_fee_percent {m}; raise it"
+            ));
+        }
+        let tip = self.tip_percentile;
+        if !(50.0..=90.0).contains(&tip) {
+            return Err(format!(
+                "tip_percentile {tip} is outside 50 to 90; set it within"
             ));
         }
         Ok(())

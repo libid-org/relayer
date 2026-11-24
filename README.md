@@ -20,7 +20,10 @@ once. `stats` opens the ledger read-only, so it works beside a running relayer.
 
 [`relayer.example.toml`](relayer.example.toml) lists every key, with what it
 means. Durations are humantime (`"10s"`); wei amounts are decimal strings.
-Relative paths are read from the file's directory.
+Relative paths are read from the file's directory. Loading refuses, naming the
+setting, a zero `poll_interval`, `request_timeout` or `concurrency_limit`, a
+`tip_percentile` outside 50 to 90, an API port equal to `metrics_port`, and an
+empty `RELAYER_SIGNER`.
 
 The environment overrides the file:
 
@@ -45,11 +48,14 @@ the RPC URL's scheme, host and port only.
 - the signer's address differs from `[key] address` (a KMS key included);
 - the factory or the forwarder has no code;
 - the forwarder's `FACTORY()` is not the factory;
+- the factory has published no release;
 - the latest release's `FACTORY()` and `REGISTRY()` are not the factory's;
 - the release's EntryPoint v0.9 has no code;
 - the latest release is not in `supported_releases`;
 - the signer's balance is under `min_balance`;
-- `wallet_budget` is under one request's worst loss;
+- `wallet_budget` is under one request's worst loss: `max_gas_limit` at
+  `max_fee_percent` of the base fee, plus the L1 fee bound of `max_gas_limit`
+  of zero-byte calldata. A batch's value is uncapped and not in it;
 - the OP-stack operator fee is on;
 - another relayer holds the ledger's lock (`<db>.lock`);
 - the chain's nonce of the key disagrees with the ledger's.

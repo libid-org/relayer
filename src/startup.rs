@@ -126,6 +126,13 @@ pub async fn check<P: Provider>(
         ));
     }
     let latest = factory.latest().call().await?;
+    if latest.implementation == Address::ZERO {
+        return fail(
+            "the factory has published no release: publish one, or set [contracts] \
+             factory to one that has"
+                .into(),
+        );
+    }
     let (version, wallet) = (
         latest.version,
         IWebWallet::new(latest.implementation, provider),
@@ -160,15 +167,19 @@ pub async fn check<P: Provider>(
             "the signer's balance {balance} is below [limits] min_balance {floor}: fund {signer}"
         ));
     }
-    let head = gas::head(provider, config)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let worst = U256::from(config.max_gas_limit) * U256::from(head.fee_bound(config));
-    let budget = config.wallet_budget.wei;
+    let refused = |e| format!("{e:?}");
+    let head = gas::head(provider, config).await.map_err(refused)?;
+    // The largest transaction of max_gas_limit gas: all its calldata zero bytes.
+    let size = U256::from(config.max_gas_limit / gas::ZERO_BYTE);
+    let l1 = gas::l1_bound(provider, config, size, head.at());
+    let l1 = l1.await.map_err(refused)?;
+    let gas = U256::from(config.max_gas_limit) * U256::from(head.fee_bound(config));
+    let (worst, budget) = (gas.saturating_add(l1), config.wallet_budget.wei);
     if budget < worst {
         return fail(format!(
             "[limits] wallet_budget {budget} is below one request's worst loss {worst}, \
-             max_gas_limit at max_fee_percent of the base fee: raise it"
+             max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of \
+             that much calldata, and no batch value, which is uncapped: raise it"
         ));
     }
     operator_fee(provider, config).await

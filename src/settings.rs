@@ -168,10 +168,31 @@ impl Settings {
                 return Err(format!("{both}: name the same chain").into());
             }
         }
-        let port = match env("RELAYER_PORT") {
-            Some(port) => port.parse().map_err(|e| format!("RELAYER_PORT: {e}"))?,
-            None => http.port,
+        let (port, named) = match env("RELAYER_PORT") {
+            Some(port) => (
+                port.parse().map_err(|e| format!("RELAYER_PORT: {e}"))?,
+                "RELAYER_PORT",
+            ),
+            None => (http.port, "[http] port"),
         };
+        if port != 0 && port == http.metrics_port {
+            let same = format!("{named} {port} is [http] metrics_port");
+            return Err(format!("{same}: give each its own port").into());
+        }
+        let zero = [
+            (chain.poll_interval.is_zero(), "[chain] poll_interval"),
+            (http.request_timeout.is_zero(), "[http] request_timeout"),
+            (http.concurrency_limit == 0, "[http] concurrency_limit"),
+        ];
+        if let Some((_, name)) = zero.iter().find(|(zero, _)| *zero) {
+            return Err(format!("{name} is 0: set it above 0").into());
+        }
+        let signer = env("RELAYER_SIGNER");
+        if signer.as_deref() == Some("") {
+            return Err(
+                "RELAYER_SIGNER is empty: set it, or unset it for [key] signer".into(),
+            );
+        }
         let config = Config {
             chain_id: chain.chain_id,
             factory: contracts.factory,
@@ -198,7 +219,7 @@ impl Settings {
         Ok(Self {
             config,
             rpc_url: env("RELAYER_RPC_URL").or(chain.rpc_url),
-            signer: env("RELAYER_SIGNER").or(key.signer),
+            signer: signer.or(key.signer),
             db: base.join(state.db),
             port,
             metrics_port: http.metrics_port,
