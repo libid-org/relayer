@@ -128,7 +128,8 @@ pub struct Config {
     /// least the base fee rule's growth over the inclusion window.
     pub max_fee_percent: u64,
     /// The highest fee cap a cancel is raised to, in percent of the pinned block's
-    /// base fee: at least 1.1 × M, so a cancel can replace any send.
+    /// base fee, or of the send's when the base fee fell: at least 1.1 × M, the
+    /// least cap that replaces a send.
     pub max_cancel_fee_percent: u64,
     /// The balance below which sending pauses, in wei.
     pub min_balance: U256,
@@ -176,7 +177,7 @@ impl Config {
 
     /// Refuses settings the sender cannot keep: an inclusion window shorter than
     /// two blocks, or a max cancel fee below 1.1 × M.
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.inclusion_window < 2 * self.block_time {
             let (w, b) = (self.inclusion_window, self.block_time);
             return Err(format!(

@@ -320,7 +320,8 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     o.assert_onboarded(o.refund()).await;
 }
 
-/// A send the node lost that no longer runs is cancelled at once, inside its window.
+/// A send the node lost that no longer runs is cancelled at once, inside its window,
+/// at 1.1× its cap even when the base fee fell below a tenth of it.
 #[tokio::test]
 async fn a_lost_send_that_no_longer_runs_is_cancelled_at_once() {
     let o = Onboarding::new(true).await;
@@ -329,8 +330,10 @@ async fn a_lost_send_that_no_longer_runs_is_cancelled_at_once() {
     let id = o.queue(&r).await;
     r.tick().await.unwrap();
     let sent = r.status(id).await.unwrap().tx_hashes[0];
+    let cap = o.tx(sent).await.inner.max_fee_per_gas();
     o.owner.anvil_drop_transaction(sent).await.unwrap();
     o.set_code(o.stack.factory, "5f5ffd").await; // the factory now reverts
+    o.base_fee(cap / 1000).await; // 1.1× the send's cap is above the max cancel fee
     o.owner.evm_mine(None).await.unwrap();
     r.tick().await.unwrap();
     let hashes = r.status(id).await.unwrap().tx_hashes;
@@ -472,21 +475,30 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
 }
 
 /// A queued request whose cap from R falls below the pinned base fee's growth over the
-/// window fails `RefundTooLow` unsent, and the next is sent in the same tick.
+/// window while it waits behind a send fails `RefundTooLow` unsent once that send is
+/// cancelled, and the next is sent in the same tick.
 #[tokio::test]
 async fn a_request_priced_out_while_queued_fails_and_the_next_is_sent() {
     let mut o = Onboarding::new(true).await;
     let r = o.start(&db("outbid")).await.unwrap();
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let ahead = o.queue(&r).await;
+    r.tick().await.unwrap();
     let latest = o.owner.get_block_by_number(Default::default()).await;
-    let base = u128::from(latest.unwrap().unwrap().header.base_fee_per_gas.unwrap());
+    let header = latest.unwrap().unwrap().header;
+    let base = u128::from(header.base_fee_per_gas.unwrap());
     let refund = o.value + U256::from(GAS_LIMIT) * U256::from(10 * base);
+    o.wallet_at(U256::ONE).await;
     let low = o.request_for(&o.batch(o.repay(refund))).await;
     let low = r.relay(&low).await.unwrap();
-    o.wallet_at(U256::ONE).await;
+    o.wallet_at(U256::from(2)).await;
     let next = o.queue(&r).await;
     o.base_fee(100 * base).await;
+    let late = header.timestamp + o.config().inclusion_window.as_secs();
+    o.owner.anvil_set_next_block_timestamp(late).await.unwrap();
     o.owner.evm_mine(None).await.unwrap();
-    r.tick().await.unwrap();
+    o.settle(&r, ahead, |s| matches!(s, Status::Cancelled))
+        .await;
     let report = r.status(low).await.unwrap();
     let failed = matches!(report.status, Status::Failed(Refusal::RefundTooLow { .. }));
     assert!(failed && report.tx_hashes.is_empty(), "{:?}", report.status);

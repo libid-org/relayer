@@ -72,7 +72,7 @@ pub struct Request {
 /// A request that passed every check: the only thing the relayer queues.
 #[derive(Clone, Debug)]
 pub struct Checked {
-    /// The transaction that was simulated, as it is sent.
+    /// The transaction to send, at the cap from R; simulated at its cap bounded by M.
     pub(crate) tx: TransactionRequest,
     /// `R - value`: the most a send may cost the relayer.
     pub(crate) net: U256,

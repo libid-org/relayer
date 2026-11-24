@@ -524,29 +524,20 @@ impl<P: Provider> Relayer<P> {
 
     /// A 0-value self-send at `last`'s nonce. The last cancel is sent again while the
     /// pinned base fee is at most its cap; past it, a new one is signed with its cap
-    /// `max(1.1× last's, 2× base fee)` and the market's tip, at least 1.1× last's, up to
-    /// the max cancel fee. Above that the last cancel is sent again, the queue held.
+    /// twice the base fee up to the max cancel fee, and its tip the market's; both at
+    /// least 1.1× `last`'s.
     async fn cancel(&self, id: B256, last: &Attempt, head: &Head) -> Result<(), Error> {
         let tx = TxEnvelope::decode_2718(&mut &last.raw[..])?;
-        let again = || self.broadcast(last, Default::default(), None, head);
         if last.cancel && head.base_fee <= tx.max_fee_per_gas() {
-            return again().await.map(drop);
+            let again = self.broadcast(last, Default::default(), None, head);
+            return again.await.map(drop);
         }
         let more = |fee: u128| fee.saturating_mul(11).div_ceil(10);
         let percent = self.config.max_cancel_fee_percent.into();
-        let (least, max) = (
-            more(tx.max_fee_per_gas()),
-            head.base_fee.saturating_mul(percent) / 100,
-        );
-        if least > max {
-            if last.cancel {
-                again().await?;
-            }
-            let n = last.nonce;
-            let above = format!("the cancel at nonce {n} needs a fee cap above {max}");
-            return Err(format!("{above}: raise max_cancel_fee_percent").into());
-        }
-        let cap = least.max(head.base_fee.saturating_mul(2)).min(max);
+        let max = head.base_fee.saturating_mul(percent) / 100;
+        // Above `max` only after the base fee fell: within it at the send's base fee.
+        let cap = head.base_fee.saturating_mul(2).min(max);
+        let cap = cap.max(more(tx.max_fee_per_gas()));
         let tip = gas::tip(&self.provider, CANCEL_PERCENTILE)
             .await
             .map_err(refused)?;
