@@ -30,11 +30,12 @@ use crate::{
         Refusal,
     },
     config::Config,
-    gas,
+    gas::{
+        self,
+        NONZERO_BYTE,
+    },
 };
 
-/// Calldata gas per byte above a zero byte's (EIP-2028).
-const NONZERO_BYTE: u64 = 12;
 /// A call's extra gas for sending value (`CALL`'s value transfer).
 const CALL_VALUE: u64 = 9_000;
 
@@ -111,7 +112,7 @@ pub async fn quote<P: Provider>(
 /// refund drafted at 0, and, below quorum, the rules check of that many calls.
 fn unmeasured(
     authorization: &ExecuteAuthorization,
-    refunds: impl Iterator<Item = U256>,
+    refunds: impl Iterator<Item = U256> + Clone,
     call_gas: u64,
     below_quorum: Option<usize>,
 ) -> u64 {
@@ -127,18 +128,11 @@ fn unmeasured(
     });
     // The draft signs `callGas = 0`; the signed data carries `call_gas`.
     let call_gas_bytes = u64::from(u64::BITS - call_gas.leading_zeros()).div_ceil(8);
-    // The client fills the signatures and may change R after the quote.
-    let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
-    let signed = authorization.signatures.iter().map(|s| zeros(&s.signature));
-    let (mut filled, mut transfers) = (signed.sum::<u64>(), 0);
-    for r in refunds {
-        filled += zeros(&r.to_be_bytes::<32>());
-        transfers += if r.is_zero() { CALL_VALUE } else { 0 };
-    }
+    let transfers = refunds.clone().filter(|r| r.is_zero()).count() as u64 * CALL_VALUE;
     let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
-    let bytes = call_gas_bytes + filled;
     costs.verify_tail()
-        + NONZERO_BYTE * bytes
+        + NONZERO_BYTE * call_gas_bytes
+        + gas::fillable(authorization, refunds)
         + unchecked.sum::<u64>()
         + rules
         + transfers

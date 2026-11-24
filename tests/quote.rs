@@ -216,6 +216,8 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
 
     let above = o.authorize(&b, Some(2 * q.call_gas)).await;
     let expected = o.limit(&above, o.value, 2 * q.call_gas).await;
+    // Reported with its fillable zero bytes as nonzero, at 12 gas × 1.25.
+    let allowance = 15 * fillable(&above, &[o.refund()]);
     let mut required = 0;
     for gas_limit in [q.gas_limit, expected - 3] {
         let refused = o.relay(&above, gas_limit).await.err();
@@ -223,18 +225,34 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
             panic!("{refused:?}")
         };
         assert!(
-            r.abs_diff(expected) <= 2,
-            "required {r}, expected {expected}"
+            r.abs_diff(expected + allowance) <= 2,
+            "required {r}, expected {expected} + {allowance}"
         );
         required = r;
     }
-    // A limit priced for exactly the required one passes; one gas less does not.
-    let refused = o.relay(&above, required - 1).await.err();
+    // A limit priced for exactly the batch's passes; one gas less does not.
+    let exact = required - allowance;
+    let refused = o.relay(&above, exact - 1).await.err();
     assert!(
         matches!(refused, Some(Refusal::GasLimitTooLow { .. })),
         "{refused:?}"
     );
-    o.relay(&above, required).await.unwrap();
+    o.relay(&above, exact).await.unwrap();
+    // Re-signed with fewer zero bytes in R, at the `required` reported, it passes.
+    let refunding = |r| {
+        let mut calls = o.batch(o.repay(r));
+        calls.push(call(swallower, U256::ZERO, vec![]));
+        Batch(calls, o.value, vec![&o.k], None)
+    };
+    let round = U256::from(1u64 << 58);
+    let zeroed = o.authorize(&refunding(round), Some(2 * q.call_gas)).await;
+    let refused = o.relay(&zeroed, q.gas_limit).await.err();
+    let Some(Refusal::GasLimitTooLow { required }) = refused else {
+        panic!("{refused:?}")
+    };
+    let filled = refunding(round + U256::from(0x0101_0101_0101_0101u64));
+    let filled = o.authorize(&filled, Some(2 * q.call_gas)).await;
+    o.relay(&filled, required).await.unwrap();
 
     let data = o.authorize(&b, Some(q.call_gas)).await;
     let limit = o.limit(&data, o.value, q.call_gas).await;
@@ -392,6 +410,15 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
             "sent at {sent}, expected {limit}"
         );
     }
+}
+
+/// The zero bytes a client may fill when it signs `data` with `refunds`.
+fn fillable(data: &Bytes, refunds: &[U256]) -> u64 {
+    let (_, authorization) = ExecuteMessage::from_authorized_data(data).unwrap();
+    let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
+    let signatures = authorization.signatures.iter().map(|s| zeros(&s.signature));
+    let refunds = refunds.iter().map(|r| zeros(&r.to_be_bytes::<32>()));
+    signatures.sum::<u64>() + refunds.sum::<u64>()
 }
 
 #[tokio::test]

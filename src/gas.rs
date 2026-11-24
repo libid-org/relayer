@@ -20,7 +20,10 @@ use alloy::{
         TransactionRequest,
     },
 };
-use libid_contracts::gas::CALL_OVERHEAD;
+use libid_contracts::{
+    bindings::wallet::ExecuteAuthorization,
+    gas::CALL_OVERHEAD,
+};
 
 use crate::{
     check::{
@@ -32,6 +35,9 @@ use crate::{
         L1Fee,
     },
 };
+
+/// Calldata gas per byte above a zero byte's (EIP-2028).
+pub(crate) const NONZERO_BYTE: u64 = 12;
 
 /// The OP-stack `GasPriceOracle` predeploy.
 const GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
@@ -54,6 +60,18 @@ pub(crate) fn limit(gas: u64, call_gas: u64, create: bool) -> u64 {
     let reserve = (reserve * 64u128.pow(d)).div_ceil(63u128.pow(d));
     let run = u128::from(gas) * 5;
     u64::try_from(run.div_ceil(4) + reserve).unwrap_or(u64::MAX)
+}
+
+/// The gas of the zero bytes a client fills when it signs, priced as nonzero: the
+/// signatures and `refunds`.
+pub(crate) fn fillable(
+    authorization: &ExecuteAuthorization,
+    refunds: impl Iterator<Item = U256>,
+) -> u64 {
+    let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
+    let signed = authorization.signatures.iter().map(|s| zeros(&s.signature));
+    let refunds = refunds.map(|r| zeros(&r.to_be_bytes::<32>()));
+    NONZERO_BYTE * (signed.sum::<u64>() + refunds.sum::<u64>())
 }
 
 /// `call` priced at `gas_limit` and the node's fees, the tip at most the fee cap; its

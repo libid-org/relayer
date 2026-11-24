@@ -93,7 +93,8 @@ pub enum Refusal {
     },
     /// The signed batch needs a higher gas limit than the one its refund was priced for.
     GasLimitTooLow {
-        /// The limit the batch is sent at.
+        /// The limit to price a re-signed batch for: the zero bytes its client fills
+        /// priced as nonzero.
         required: u64,
     },
     /// The contracts do not vouch for the target.
@@ -118,7 +119,7 @@ pub async fn check<P: Provider>(
     config: &Config,
     request: &Request,
 ) -> Result<Checked, Refusal> {
-    let (message, _, executions) =
+    let (message, authorization, executions) =
         decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
     let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
     let late =
@@ -142,7 +143,10 @@ pub async fn check<P: Provider>(
     }
     let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
     let (create, priced_for) = (create.is_some(), request.gas_limit);
-    let limit = relay_limit(provider, &call, late, call_gas, create, priced_for);
+    let fillable = gas::fillable(&authorization, refunds(&executions, config.relayer));
+    let limit = relay_limit(
+        provider, &call, late, call_gas, create, priced_for, fillable,
+    );
     tx.set_gas_limit(limit.await?);
     simulate(provider, &tx, late).await?;
     let timeout = config.inclusion_window;
@@ -178,7 +182,8 @@ pub(crate) fn refunds(
 }
 
 /// The gas limit `call` is sent at, from its run at `late`, for its signed
-/// `call_gas` and path; at most the limit its refund was priced for.
+/// `call_gas` and path; at most the limit its refund was priced for. A refusal
+/// reports the limit with the `fillable` gas a re-signed batch may add.
 async fn relay_limit<P: Provider>(
     provider: &P,
     call: &TransactionRequest,
@@ -186,6 +191,7 @@ async fn relay_limit<P: Provider>(
     call_gas: u64,
     create: bool,
     priced_for: u64,
+    fillable: u64,
 ) -> Result<u64, Refusal> {
     let sim = gas::simulate(provider, call, late).await?;
     if !sim.status {
@@ -193,6 +199,7 @@ async fn relay_limit<P: Provider>(
     }
     let required = gas::limit(sim.gas_used, call_gas, create);
     if required > priced_for {
+        let required = gas::limit(sim.gas_used + fillable, call_gas, create);
         return Err(Refusal::GasLimitTooLow { required });
     }
     Ok(required)
