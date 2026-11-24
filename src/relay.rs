@@ -59,6 +59,7 @@ use crate::{
         rerun,
         reverted,
         target,
+        Checked,
         Refusal,
         Request,
     },
@@ -173,27 +174,33 @@ impl<P: Provider> Relayer<P> {
         let (message, ..) = decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
         let (p, c, wallet) = (&self.provider, &self.config, request.wallet);
         let call = target(p, c, wallet, request.create, &request.data, message.value);
-        let call = call.await?;
-        let to = TransactionBuilder::to(&call).unwrap_or_default();
-        let input = TransactionBuilder::input(&call)
-            .cloned()
-            .unwrap_or_default();
-        let id = (U256::from(c.chain_id), to, input, message.value);
-        let id = keccak256(id.abi_encode_params());
+        let id = request_id(c.chain_id, &call.await?, message.value);
         if let Some(id) = admit(&self.db(), id, wallet)? {
             return Ok(id);
         }
         let checked = check(p, c, request).await?;
-        let (tx, l1) = (checked.tx, checked.l1_fee_bound);
-        let unsigned = tx.clone().nonce(u64::MAX).build_1559().map_err(node)?;
-        gas::l1_gate(p, c, unsigned.encoded_for_signing().into(), l1).await?;
-        let tx = serde_json::to_string(&tx).map_err(node)?;
-        let (net, l1) = (checked.net.to_be_bytes::<32>(), l1.to_be_bytes::<32>());
+        let unsigned = checked.tx.clone().nonce(u64::MAX).build_1559();
+        let unsigned = unsigned.map_err(node)?.encoded_for_signing().into();
+        gas::l1_gate(p, c, unsigned, checked.l1_fee_bound).await?;
+        self.queue(id, wallet, &checked, message.deadline.to())
+    }
+
+    /// Store `checked` as `id`, queued, unless [`admit`] now answers for it.
+    #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
+    fn queue(
+        &self,
+        id: B256,
+        wallet: Address,
+        checked: &Checked,
+        deadline: u64,
+    ) -> Result<B256, Refusal> {
+        let tx = serde_json::to_string(&checked.tx).map_err(node)?;
+        let (net, l1) = (checked.net, checked.l1_fee_bound);
+        let (net, l1) = (net.to_be_bytes::<32>(), l1.to_be_bytes::<32>());
         let db = self.db();
         if let Some(id) = admit(&db, id, wallet)? {
             return Ok(id);
         }
-        let deadline = message.deadline.to::<u64>();
         let row = params![&id[..], &wallet[..], tx, net, l1, deadline];
         db.execute("DELETE FROM attempts WHERE id = ?1", [&id[..]])
             .and_then(|_| db.execute(
@@ -210,20 +217,10 @@ impl<P: Provider> Relayer<P> {
     pub async fn tick(&self) -> Result<(), Error> {
         let mined = self.provider.get_transaction_count(self.config.relayer);
         let mined = mined.latest().await?;
-        let row = |r: &Row| Ok((b256(r, 0)?, r.get::<_, u64>(1)?, cover(r)?));
-        let sent = "SELECT id, deadline, net, l1 FROM requests \
-                    WHERE status IN ('sent', 'included')";
-        let sent = rows(&self.db(), sent, [], row)?;
-        for (id, deadline, cover) in sent {
+        for (id, deadline, cover) in self.in_flight()? {
             self.watch(id, deadline, cover, mined).await?;
         }
-        let queued =
-            "SELECT id, tx, net, l1, deadline FROM requests WHERE status = 'queued' \
-                      ORDER BY rowid";
-        let row =
-            |r: &Row| Ok((b256(r, 0)?, r.get::<_, String>(1)?, cover(r)?, r.get(4)?));
-        let queued = rows(&self.db(), queued, [], row)?;
-        for (id, tx, cover, deadline) in queued {
+        for (id, tx, cover, deadline) in self.queued()? {
             if self.paused.load(Relaxed) {
                 break;
             }
@@ -231,6 +228,22 @@ impl<P: Provider> Relayer<P> {
             self.send(id, tx, cover, deadline, mined).await?;
         }
         Ok(())
+    }
+
+    /// The sent and included requests: id, deadline, cover.
+    fn in_flight(&self) -> Result<Vec<(B256, u64, Cover)>, Error> {
+        let sql = "SELECT id, deadline, net, l1 FROM requests \
+                   WHERE status IN ('sent', 'included')";
+        let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?));
+        rows(&self.db(), sql, [], row)
+    }
+
+    /// The queued requests in arrival order: id, transaction, cover, deadline.
+    fn queued(&self) -> Result<Vec<(B256, String, Cover, u64)>, Error> {
+        let sql = "SELECT id, tx, net, l1, deadline FROM requests \
+                   WHERE status = 'queued' ORDER BY rowid";
+        let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?));
+        rows(&self.db(), sql, [], row)
     }
 
     /// `id`'s status and its transactions.
@@ -256,7 +269,7 @@ impl<P: Provider> Relayer<P> {
             "included" => Status::Included { block, reverted },
             "confirmed" => Status::Confirmed { block, reverted },
             "cancelled" => Status::Cancelled,
-            _ => Status::Failed(failed(&failure.unwrap_or_default(), detail)),
+            _ => Status::Failed(decode_failure(&failure.unwrap_or_default(), detail)),
         };
         let tx_hashes = self.attempts(id)?.iter().map(|a| a.hash).collect();
         Ok(Report { status, tx_hashes })
@@ -290,9 +303,9 @@ impl<P: Provider> Relayer<P> {
                 (false, true) => "confirmed",
                 (false, false) => "included",
             };
-            return self.set(id, status, Some((block, !receipt.status())), None);
+            return self.set_status(id, status, Some((block, !receipt.status())), None);
         }
-        self.set(id, "sent", None, None)?; // a receipt a reorg removed
+        self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
         let Some(last) = attempts.last() else {
             return Ok(());
         };
@@ -333,7 +346,7 @@ impl<P: Provider> Relayer<P> {
         };
         match gate.await {
             Err(Refusal::Node(e)) => return Err(e.into()),
-            Err(refusal) => return self.set(id, "failed", None, Some(&refusal)),
+            Err(refusal) => return self.set_status(id, "failed", None, Some(&refusal)),
             Ok(()) => {}
         }
         self.commit(id, &attempt)?;
@@ -436,7 +449,7 @@ impl<P: Provider> Relayer<P> {
         Ok(tx.commit()?)
     }
 
-    fn set(
+    fn set_status(
         &self,
         id: B256,
         status: &str,
@@ -444,7 +457,7 @@ impl<P: Provider> Relayer<P> {
         failed: Option<&Refusal>,
     ) -> Result<(), Error> {
         let (block, reverted) = receipt.unzip();
-        let (failure, detail) = failed.map(failure).unzip();
+        let (failure, detail) = failed.map(encode_failure).unzip();
         self.db().execute(
             "UPDATE requests SET status = ?2, block = ?3, reverted = ?4, failure = ?5, \
              detail = ?6 WHERE id = ?1",
@@ -471,6 +484,13 @@ impl<P: Provider> Relayer<P> {
     fn db(&self) -> MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// A request's id: its chain, target, calldata and value.
+fn request_id(chain_id: u64, call: &TransactionRequest, value: U256) -> B256 {
+    let to = TransactionBuilder::to(call).unwrap_or_default();
+    let input = TransactionBuilder::input(call).cloned().unwrap_or_default();
+    keccak256((U256::from(chain_id), to, input, value).abi_encode_params())
 }
 
 /// `mined` lies between the lowest nonce of an unconfirmed send and the next nonce,
@@ -531,7 +551,7 @@ fn affordable(raw: &[u8], (net, l1): Cover) -> Result<(), Error> {
 }
 
 /// A failure as stored: its name and its fields.
-fn failure(refusal: &Refusal) -> (String, Vec<u8>) {
+fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
     match refusal {
         Refusal::L1FeeAboveBound { fee, bound } => {
             let words = [fee.to_be_bytes::<32>(), bound.to_be_bytes::<32>()];
@@ -542,8 +562,8 @@ fn failure(refusal: &Refusal) -> (String, Vec<u8>) {
     }
 }
 
-/// The failure [`failure`] stored: what a send's L1 gate or run refuses.
-fn failed(name: &str, detail: Option<Vec<u8>>) -> Refusal {
+/// The failure [`encode_failure`] stored: what a send's L1 gate or run refuses.
+fn decode_failure(name: &str, detail: Option<Vec<u8>>) -> Refusal {
     let detail = detail.unwrap_or_default();
     match name {
         "L1FeeAboveBound" => Refusal::L1FeeAboveBound {
