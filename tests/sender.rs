@@ -126,6 +126,8 @@ const BROKE: u8 = 4;
 const BLIND: u8 = 5;
 /// Answers `eth_getTransactionReceipt` with what does not parse.
 const GARBLED: u8 = 6;
+/// `BLIND`, and `eth_getTransactionCount` one behind, as from a lagging node.
+const LAGGING: u8 = 7;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -164,13 +166,33 @@ impl Provider for Racing {
         alloy::providers::RpcWithBlock::new_provider(move |block| {
             let receipts =
                 matches!(block, BlockId::Hash(h) if h.require_canonical.is_none());
-            if mode.load(Ordering::Relaxed) == BLIND && receipts {
+            if [BLIND, LAGGING].contains(&mode.load(Ordering::Relaxed)) && receipts {
                 let blind = alloy::transports::TransportErrorKind::custom_str("blind");
                 return alloy::providers::ProviderCall::ready(Err(blind));
             }
             let inner = inner.clone();
             let balance = async move { inner.get_balance(address).block_id(block).await };
             alloy::providers::ProviderCall::BoxedFuture(Box::pin(balance))
+        })
+    }
+
+    fn get_transaction_count(
+        &self,
+        address: Address,
+    ) -> alloy::providers::RpcWithBlock<
+        Address,
+        alloy::primitives::U64,
+        u64,
+        fn(alloy::primitives::U64) -> u64,
+    > {
+        let (inner, mode) = (self.0.clone(), self.1.clone());
+        alloy::providers::RpcWithBlock::new_provider(move |block| {
+            let (inner, lag) = (inner.clone(), mode.load(Ordering::Relaxed) == LAGGING);
+            let count = async move {
+                let count = inner.get_transaction_count(address).block_id(block).await?;
+                Ok(count - u64::from(lag))
+            };
+            alloy::providers::ProviderCall::BoxedFuture(Box::pin(count))
         })
     }
 
@@ -858,11 +880,13 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
 }
 
 /// A receipt that does not parse holds the queue for `node_error_ticks` ticks, then
-/// fails its request as `Node`.
+/// is charged as included with no refund at its send's worst cost, in the budgets and
+/// the stats.
 #[tokio::test]
-async fn an_unparsed_receipt_fails_its_request_after_its_ticks() {
-    let o = Onboarding::new(true).await;
-    let (r, mode) = o.armable(&db("garbled")).await;
+async fn an_unparsed_receipt_is_charged_at_its_worst_after_its_ticks() {
+    let (o, path) = (Onboarding::new(true).await, db("garbled"));
+    let (r, mode) = o.armable(&path).await;
+    let left = r.budget_left().unwrap();
     let id = o.queue(&r).await;
     r.tick().await.unwrap();
     mode.store(GARBLED, Ordering::Relaxed);
@@ -870,7 +894,39 @@ async fn an_unparsed_receipt_fails_its_request_after_its_ticks() {
         r.tick().await.expect_err("no parse error");
     }
     r.tick().await.unwrap();
-    let status = r.status(id).await.unwrap().status;
-    let node = matches!(status, Status::Failed(Refusal::Node(_)));
-    assert!(node, "{status:?}");
+    let report = r.status(id).await.unwrap();
+    assert!(
+        matches!(report.status, Status::Included { .. }),
+        "{:?}",
+        report.status
+    );
+    let t = o.tx(report.tx_hashes[0]).await.inner;
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + t.value();
+    assert_eq!(
+        left - r.budget_left().unwrap(),
+        worst,
+        "not charged at its worst"
+    );
+    let profit = relayer::stats::stats(&path).unwrap().profit;
+    assert_eq!(profit, -alloy::primitives::I256::try_from(worst).unwrap());
+}
+
+/// A charged loss whose request a lagging node shows in flight again is not charged
+/// again: here its balances no longer read, which would leave it pending.
+#[tokio::test]
+async fn a_charged_loss_is_not_recomputed() {
+    let (o, path) = (Onboarding::new(true).await, db("lagging"));
+    let (r, mode) = o.armable(&path).await;
+    let id = o.queue(&r).await;
+    o.settle(&r, id, included).await;
+    r.tick().await.unwrap();
+    let charged = || {
+        let stats = relayer::stats::stats(&path).unwrap();
+        (stats.pending, stats.profit)
+    };
+    let before = charged();
+    assert_eq!(before.0, 0, "no loss charged");
+    mode.store(LAGGING, Ordering::Relaxed);
+    r.tick().await.unwrap();
+    assert_eq!(charged(), before, "charged again");
 }

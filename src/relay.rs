@@ -147,8 +147,7 @@ pub enum Status {
     },
     /// Replaced by a cancel that landed; not queued again.
     Cancelled,
-    /// Refused before its first broadcast, or its receipt did not parse; queued again
-    /// when relayed again.
+    /// Refused before its first broadcast; queued again when relayed again.
     Failed(Refusal),
 }
 
@@ -374,8 +373,8 @@ impl<P: Provider> Relayer<P> {
                     if e.is::<Unreadable>()
                         && ticking.strike(id) >= self.config.node_error_ticks =>
                 {
-                    tracing::warn!("{id} failed as its receipt does not parse: {e}");
-                    self.fail(id, &Refusal::Node(e.to_string()))?;
+                    tracing::warn!("{id} charged at its worst: its receipt: {e}");
+                    self.charge_worst(id, cover.1)?;
                 }
                 Err(e) => return Err(e),
             }
@@ -718,6 +717,23 @@ impl<P: Provider> Relayer<P> {
         self.commit(id, &attempt)?;
         self.broadcast(&attempt, (net, l1), None, head).await?;
         Ok(false)
+    }
+
+    /// Charge `id` as included with no refund at its attempts' worst cost: gas at the
+    /// cap, its value and the L1 bound `l1`.
+    fn charge_worst(&self, id: B256, l1: U256) -> Result<(), Error> {
+        let mut worst = U256::ZERO;
+        for a in self.attempts(id)? {
+            let tx = TxEnvelope::decode_2718(&mut &a.raw[..])?;
+            let gas = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas());
+            worst = worst.max(gas + l1 + tx.value());
+        }
+        self.db().execute(
+            "UPDATE requests SET status = 'included', loss = ?2, \
+             included_at = coalesce(included_at, unixepoch()) WHERE id = ?1",
+            params![&id[..], worst.to_be_bytes::<32>()],
+        )?;
+        Ok(())
     }
 
     /// Mark `id` failed for `refusal`; true, as the next may be sent.
