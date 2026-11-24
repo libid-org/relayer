@@ -262,7 +262,9 @@ impl<P: Provider> Relayer<P> {
     /// when none is in flight and the key's count at the pinned block is the stored
     /// next nonce. Above it a foreign nonce pauses sending; below it ours is unmined.
     pub async fn tick(&self) -> Result<(), Error> {
-        let head = gas::head(&self.provider).await.map_err(refused)?;
+        let head = gas::head(&self.provider, &self.config)
+            .await
+            .map_err(refused)?;
         let mined = self.provider.get_transaction_count(self.config.relayer);
         let mined = mined.block_id(head.at()).await?;
         for (id, deadline, cover) in self.in_flight(mined)? {

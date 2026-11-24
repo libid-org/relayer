@@ -214,6 +214,13 @@ async fn refuses_before_sending() {
         panic!("{refused:?}")
     };
     assert_eq!(required, bound + U256::from(CLAIMED * 13 / 10));
+    // Funded for the gas at M × base, not at the cap from R: run at the cap sent.
+    let m = U256::from(o.config().max_fee_percent);
+    let at_bound = U256::from(GAS_LIMIT) * U256::from(base) * m / U256::from(100);
+    o.set_balance(o.relayer_address, o.value + at_bound).await;
+    check(&o.relayer, &o.config(), &o.request(good.clone()))
+        .await
+        .unwrap();
     // A node error that is not a revert is not reported as one.
     o.set_balance(o.relayer_address, U256::ZERO).await;
     let refused = check(&o.relayer, &o.config(), &o.request(good.clone()))

@@ -116,8 +116,14 @@ pub(crate) async fn fee_floor<P: Provider>(
     config: &Config,
     time: Duration,
 ) -> Result<u128, Refusal> {
-    let latest = latest(provider).await?;
-    let extra = &latest.extra_data;
+    grown(config, &latest(provider).await?, time)
+}
+
+/// `header`'s base fee, at least the chain's minimum, grown by its most over
+/// `time`'s blocks.
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+fn grown(config: &Config, header: &Header, time: Duration) -> Result<u128, Refusal> {
+    let extra = &header.extra_data;
     let unknown = || format!("extraData {extra} is no OP-stack fee rule; set fee_params");
     let rule = match config.fee_params {
         FeeParams::Fixed(rule) => rule,
@@ -125,7 +131,7 @@ pub(crate) async fn fee_floor<P: Provider>(
             Eip1559::from_extra_data(extra).ok_or_else(|| node(unknown()))?
         }
     };
-    let base_fee = latest.base_fee_per_gas.unwrap_or_default().into();
+    let base_fee = header.base_fee_per_gas.unwrap_or_default().into();
     Ok(rule.grow(base_fee, config.blocks(time)))
 }
 
@@ -168,6 +174,8 @@ pub(crate) struct Head {
     pub(crate) number: u64,
     pub(crate) time: u64,
     pub(crate) base_fee: u128,
+    /// Its base fee grown over the inclusion window: the least cap a send runs at.
+    pub(crate) floor: u128,
 }
 
 impl Head {
@@ -184,13 +192,17 @@ impl Head {
 }
 
 /// The latest block, to pin.
-pub(crate) async fn head<P: Provider>(provider: &P) -> Result<Head, Refusal> {
+pub(crate) async fn head<P: Provider>(
+    provider: &P,
+    config: &Config,
+) -> Result<Head, Refusal> {
     let latest = latest(provider).await?;
     Ok(Head {
         hash: latest.hash,
         number: latest.number,
         time: latest.timestamp,
         base_fee: latest.base_fee_per_gas.unwrap_or_default().into(),
+        floor: grown(config, &latest, config.inclusion_window)?,
     })
 }
 
@@ -269,6 +281,7 @@ mod tests {
             number: 0,
             time: 0,
             base_fee: 0,
+            floor: 0,
         };
         let id = serde_json::to_value(head.at()).unwrap();
         assert_eq!(id["requireCanonical"], true, "{id}");
