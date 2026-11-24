@@ -3,6 +3,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::Path,
 };
 
@@ -13,6 +14,10 @@ use alloy::primitives::{
 use rusqlite::{
     Connection,
     OpenFlags,
+};
+use serde_json::{
+    json,
+    Value,
 };
 
 use crate::relay::{
@@ -42,6 +47,51 @@ pub struct Stats {
     /// Included requests whose loss is not yet charged, outside profit, cancel rate
     /// and cost ratio.
     pub pending: u64,
+}
+
+impl Stats {
+    /// The numbers as JSON, wei amounts as decimal strings.
+    pub fn json(&self) -> Value {
+        json!({
+            "requests": self.requests,
+            "profit": self.profit.to_string(),
+            "profitPerRequest": self.profit_per_request.to_string(),
+            "cancelRate": self.cancel_rate,
+            "inclusionSeconds": self.inclusion_seconds,
+            "costRatio": self.cost_ratio,
+            "pending": self.pending,
+        })
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let requests = self.requests.iter().map(|(s, n)| format!("{s} {n}"));
+        let requests = requests.collect::<Vec<_>>().join(", ");
+        writeln!(
+            f,
+            "requests      {}",
+            if requests.is_empty() {
+                "none"
+            } else {
+                &requests
+            }
+        )?;
+        let each = self.profit_per_request;
+        writeln!(f, "profit        {} wei, {each} per request", self.profit)?;
+        writeln!(f, "cancel rate   {:.3}", self.cancel_rate)?;
+        match self.inclusion_seconds {
+            Some([p50, p90, p99]) => {
+                writeln!(f, "inclusion     p50 {p50}s, p90 {p90}s, p99 {p99}s")?
+            }
+            None => writeln!(f, "inclusion     none")?,
+        }
+        match self.cost_ratio {
+            Some(ratio) => writeln!(f, "cost ratio    {ratio}")?,
+            None => writeln!(f, "cost ratio    none")?,
+        }
+        writeln!(f, "pending       {}", self.pending)
+    }
 }
 
 /// The numbers of the ledger at `db`, opened read-only.

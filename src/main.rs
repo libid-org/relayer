@@ -31,11 +31,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Check the chain, then serve and send until interrupted; a second interrupt
-    /// exits at once.
+    /// Check the chain, then serve and send until interrupted or terminated; a second
+    /// signal exits at once.
     Run,
     /// Print the ledger's numbers.
-    Stats,
+    Stats {
+        /// As JSON, wei amounts as decimal strings.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -53,10 +57,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Command::Stats = cli.command {
+    if let Command::Stats { json } = cli.command {
         return match stats(&settings.db) {
+            Ok(stats) if json => {
+                println!("{:#}", stats.json());
+                ExitCode::SUCCESS
+            }
             Ok(stats) => {
-                println!("{stats:#?}");
+                print!("{stats}");
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -86,14 +94,33 @@ fn main() -> ExitCode {
     }
 }
 
-/// The first interrupt; a second exits at once.
+/// The first interrupt or SIGTERM; a second exits at once.
 async fn interrupted() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!(
-        "shutting down once requests in flight finish; interrupt again to exit"
-    );
+    signal().await;
+    tracing::info!("shutting down once requests in flight finish; signal again to exit");
     tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
+        signal().await;
         std::process::exit(130);
     });
+}
+
+/// Ctrl-C, or SIGTERM, which `docker stop` sends.
+async fn signal() {
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{
+            signal,
+            SignalKind,
+        };
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => drop(terminate.recv().await),
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminate => {}
+    }
 }
