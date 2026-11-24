@@ -124,6 +124,8 @@ pub struct Config {
     /// The release versions a target may run: the ones whose AUTHORIZED data layout
     /// the relayer decodes.
     pub supported_releases: Vec<u64>,
+    /// The highest gas limit a request may be priced for; above it, `GasLimitTooHigh`.
+    pub max_gas_limit: u64,
     /// The sending key's address, which every refund must pay.
     pub relayer: Address,
     /// The L1 fee model.
@@ -159,8 +161,8 @@ pub struct Config {
     pub receipt_lag_blocks: u64,
     /// The loss budget of each wallet: past it, its requests are `RateLimited`.
     pub wallet_budget: Budget,
-    /// The loss budget of all wallets, each counted up to its own budget: past it,
-    /// sending pauses and requests are `Paused`.
+    /// The loss budget of all wallets: past it, sending pauses and requests are
+    /// `Paused`.
     pub global_budget: Budget,
 }
 
@@ -169,7 +171,8 @@ impl Config {
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
-    /// budgets, and release 1, the one the contracts' test stack publishes.
+    /// budgets or gas limit cap, and release 1, the one the contracts' test stack
+    /// publishes.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -181,6 +184,7 @@ impl Config {
             factory,
             forwarder,
             supported_releases: vec![1],
+            max_gas_limit: u64::MAX,
             relayer,
             l1_fee: L1Fee::None,
             l1_margin: L1_MARGIN,

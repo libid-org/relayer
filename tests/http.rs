@@ -20,6 +20,7 @@ use relayer::{
     config::Budget,
     http::{
         serve,
+        Limits,
         Service,
     },
     stats::stats,
@@ -32,9 +33,10 @@ use serde_json::{
 /// A key whose hex holds a marker no output may carry.
 const MARKER: &str = "5ec7e75ec7e7";
 
-/// A server on a random port, and every body it answered.
+/// A server on random ports, and every body it answered.
 struct Server {
     url: String,
+    metrics: String,
     service: Arc<Service<DynProvider>>,
     seen: Mutex<String>,
 }
@@ -44,21 +46,42 @@ impl Server {
     async fn start(o: &Onboarding, config: Config, db: &Path, every: Duration) -> Self {
         let relayer = Relayer::start(o.relayer.clone(), config, db).await.unwrap();
         let service = Service::new(relayer, Duration::from_secs(5));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(serve(
+        let bind = || tokio::net::TcpListener::bind("127.0.0.1:0");
+        let (api, metrics) = (bind().await.unwrap(), bind().await.unwrap());
+        let at =
+            |l: &tokio::net::TcpListener| format!("http://{}", l.local_addr().unwrap());
+        let (url, metrics_url) = (at(&api), at(&metrics));
+        let limits = Limits {
+            timeout: Duration::from_secs(30),
+            concurrency: 8,
+        };
+        let listeners = (api, metrics);
+        let serving = serve(
             service.clone(),
             every,
-            listener,
+            limits,
+            listeners,
             std::future::pending(),
-        ));
+        );
+        tokio::spawn(serving);
         let seen = Mutex::default();
-        Self { url, service, seen }
+        Self {
+            url,
+            metrics: metrics_url,
+            service,
+            seen,
+        }
     }
 
-    /// `path`'s status and body, JSON or text: a POST of `body` when given, else a GET.
+    /// `path`'s status and body, JSON or text: a POST of `body` when given, else a GET;
+    /// `/metrics` on its own listener.
     async fn call(&self, path: &str, body: Option<Value>) -> (u16, Value) {
-        let (http, url) = (reqwest::Client::new(), format!("{}{path}", self.url));
+        let base = if path == "/metrics" {
+            &self.metrics
+        } else {
+            &self.url
+        };
+        let (http, url) = (reqwest::Client::new(), format!("{base}{path}"));
         let request = match body {
             Some(body) => http.post(url).json(&body),
             None => http.get(url),
@@ -168,6 +191,11 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
     assert_eq!((code, &accepted["status"]), (202, &json!("queued")));
     let done = s.settle(&o, &accepted["id"], "included").await;
     assert_eq!(done["reverted"], false, "{done}");
+    let (code, again) = s.relay(&request).await;
+    assert_eq!(
+        (code, again),
+        (202, json!({"id": accepted["id"], "status": "included"}))
+    );
     o.assert_onboarded(o.refund()).await;
 
     let (cost, net) = (cost(&o, &done).await, o.refund() - o.value);
@@ -176,7 +204,7 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
     let profit = I256::try_from(net).unwrap() - I256::try_from(cost).unwrap();
     assert_eq!((stats.profit, stats.profit_per_request), (profit, profit));
     assert_eq!(stats.cancel_rate, 0.0);
-    assert_eq!(stats.margin, Some(f64::from(cost) / f64::from(net)));
+    assert_eq!(stats.cost_ratio, Some(f64::from(cost) / f64::from(net)));
     assert!(stats.inclusion_seconds.is_some());
 
     let noncanonical = json!({"wallet": o.wallet, "data": "0x00", "gasLimit": GAS_LIMIT});
@@ -192,6 +220,8 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
     assert!(s.gauge("key_balance_wei").await > 0.0);
     assert!(s.gauge("budget_left_wei").await > 0.0);
     assert_eq!(s.call("/nowhere", None).await.0, 404);
+    let main_port = reqwest::get(format!("{}/metrics", s.url)).await.unwrap();
+    assert_eq!(main_port.status(), 404, "/metrics on the API's port");
 }
 
 /// Refusals carry their names: the relayer's own with their fields, and a revert
@@ -200,7 +230,7 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
 async fn refusals_carry_their_decoded_names() {
     let o = Onboarding::new(false).await;
     let mut underfunded = o.config();
-    underfunded.min_balance = U256::MAX;
+    (underfunded.min_balance, underfunded.max_gas_limit) = (U256::MAX, GAS_LIMIT);
     let s = Server::start(&o, underfunded, &db("names"), Duration::from_secs(3600)).await;
     assert_eq!(
         s.call("/health", None).await.0,
@@ -227,6 +257,16 @@ async fn refusals_carry_their_decoded_names() {
     assert_eq!(quoted["error"]["contract"], "HandleEscrow");
     let (code, bad) = s.call("/v1/quote", Some(json!({"wallet": 1}))).await;
     assert_eq!((code, name(&bad)), (400, "BadRequest"));
+    let (_, config) = s.call("/v1/config", None).await;
+    let max = config["maxGasLimit"].as_u64().unwrap();
+    assert_eq!(config["registry"], json!(o.stack.wallet_registry));
+    let mut over = wire(&unclaimed);
+    over["gasLimit"] = (max + 1).into();
+    let (code, high) = s.call("/v1/relay", Some(over)).await;
+    assert_eq!(
+        (code, name(&high), &high["error"]["args"]["max"]),
+        (400, "GasLimitTooHigh", &config["maxGasLimit"])
+    );
 
     let mut calls = o.onboarding();
     calls.remove(2); // no claim: the wallet pays the refund from its own funds
@@ -242,7 +282,7 @@ async fn refusals_carry_their_decoded_names() {
 }
 
 /// A wallet that lost its budget is `RateLimited` while others relay; once wallets
-/// lose the global budget, each counted up to its own, requests are `Paused`.
+/// lose the global budget, their whole losses counted, requests are `Paused`.
 #[tokio::test]
 async fn a_wallet_budget_trips_before_the_global_pause() {
     let (mut o, path) = (Onboarding::new(true).await, db("budgets"));
@@ -253,21 +293,21 @@ async fn a_wallet_budget_trips_before_the_global_pause() {
             window,
         },
         global_budget: Budget {
-            wei: U256::from(2),
+            wei: o.value, // over a reverted send's gas, under a mined one's loss
             window,
         },
         ..o.config()
     };
     let s = Server::start(&o, config, &path, Duration::from_secs(3600)).await;
-    let first = s.unrefunded(&o, "00").await; // STOP: mined, status 1
+    let first = s.unrefunded(&o, "60006000fd").await; // REVERT: mined, status 0
     let again = o
         .request_for(&o.batch(o.repay(o.refund() + U256::ONE)))
         .await;
     let (code, limited) = s.relay(&again).await;
     assert_eq!((code, name(&limited)), (429, "RateLimited"));
     o.wallet_at(U256::ONE).await;
-    // Accepted, one wei of the global budget left; REVERT: mined, status 0.
-    let second = s.unrefunded(&o, "60006000fd").await;
+    // Accepted within the global budget; STOP: mined, status 1, its value lost too.
+    let second = s.unrefunded(&o, "00").await;
     o.wallet_at(U256::from(2)).await;
     let (code, paused) = s.relay(&o.request_for(&o.onboarding()).await).await;
     assert_eq!((code, name(&paused)), (503, "Paused"));

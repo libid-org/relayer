@@ -446,7 +446,7 @@ async fn the_original_landing_before_its_cancel_resolves_from_its_receipt() {
     o.owner.evm_mine(None).await.unwrap();
     assert!(o.mined(*sent.inner.tx_hash()).await);
     o.settle(&r, id, included).await;
-    assert!(!r.paused().await, "an alarm on our own receipt");
+    assert!(!r.paused(), "an alarm on our own receipt");
 }
 
 /// A foreign nonce pauses sending, and our stored nonce under it refuses start.
@@ -457,7 +457,7 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     o.foreign().await;
     o.onboard(&r, 3600).await.unwrap();
     let _ = r.tick().await;
-    assert!(r.paused().await, "no pause on a foreign nonce");
+    assert!(r.paused(), "no pause on a foreign nonce");
     let _ = r.tick().await;
     assert_eq!(o.relayer_nonce().await, 1, "sent while paused");
     drop(r);
@@ -485,15 +485,12 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     o.owner.anvil_set_auto_mine(true).await.unwrap();
     o.foreign().await;
     for lag in 0..=o.config().receipt_lag_blocks {
-        assert!(
-            !r.paused().await,
-            "paused {lag} blocks after a missing receipt"
-        );
+        assert!(!r.paused(), "paused {lag} blocks after a missing receipt");
         r.tick().await.unwrap();
         o.owner.evm_mine(None).await.unwrap();
     }
     r.tick().await.unwrap();
-    assert!(r.paused().await, "no pause on a taken nonce");
+    assert!(r.paused(), "no pause on a taken nonce");
     assert_eq!(r.status(id).await.unwrap().tx_hashes, [hash], "cancelled");
     let held = r.status(next).await.unwrap().status;
     assert!(matches!(held, Status::Queued), "sent past it: {held:?}");
@@ -545,7 +542,7 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     else {
         panic!("{status:?}")
     };
-    assert!(!r.paused().await, "paused by one request");
+    assert!(!r.paused(), "paused by one request");
     o.set_balance(o.relayer_address, worst).await;
     oracle(10 * gwei).await;
     assert_eq!(r.relay(&request).await.unwrap(), id);
@@ -606,7 +603,7 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     assert_eq!(r.status(id).await.unwrap().tx_hashes, hashes);
     let late = r.status(late).await.unwrap().status;
     let reverted = matches!(late, Status::Failed(Refusal::Reverted { .. }));
-    assert!(reverted && !r.paused().await, "{late:?}");
+    assert!(reverted && !r.paused(), "{late:?}");
 }
 
 /// A queued request whose cap from R falls below the pinned base fee's growth over the
@@ -705,7 +702,7 @@ async fn an_underfunded_relayer_pauses_before_its_send() {
         o.set_balance(o.relayer_address, balance).await;
         let refused = r.tick().await.expect_err("sent underfunded").to_string();
         assert!(refused.contains("min_balance"), "{refused}");
-        assert!(r.paused().await, "no pause");
+        assert!(r.paused(), "no pause");
         let report = r.status(id).await.unwrap();
         let queued =
             matches!(report.status, Status::Queued) && report.tx_hashes.is_empty();
@@ -713,7 +710,7 @@ async fn an_underfunded_relayer_pauses_before_its_send() {
     }
     o.set_balance(o.relayer_address, floor).await;
     o.settle(&r, id, included).await;
-    assert!(!r.paused().await, "paused while funded");
+    assert!(!r.paused(), "paused while funded");
 }
 
 /// A first send the node refuses is uncommitted, queued again, and pauses.
@@ -739,7 +736,7 @@ async fn a_refused_first_send_is_queued_again_and_pauses() {
         report.status
     );
     assert!(
-        report.tx_hashes.is_empty() && r.paused().await,
+        report.tx_hashes.is_empty() && r.paused(),
         "sent or unpaused"
     );
     // Its nonce free again: still paused, nothing sent.
@@ -761,9 +758,9 @@ async fn a_nonce_taken_before_broadcast_is_checked_again_from_a_new_block() {
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
     let dropped = matches!(report.status, Status::Queued) && report.tx_hashes.is_empty();
-    assert!(dropped && !r.paused().await, "{:?}", report.status);
+    assert!(dropped && !r.paused(), "{:?}", report.status);
     r.tick().await.unwrap();
-    assert!(r.paused().await, "no pause on the foreign nonce");
+    assert!(r.paused(), "no pause on the foreign nonce");
     assert_eq!(o.relayer_nonce().await, 1, "signed past the taken nonce");
 }
 

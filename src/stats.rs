@@ -1,5 +1,5 @@
 //! What the ledger says the relayer earned: requests by status, profit, cancel rate,
-//! inclusion times and margin. Wei amounts are summed in Rust: they are 32-byte blobs.
+//! inclusion times and cost ratio. Wei amounts are summed in Rust: they are 32-byte blobs.
 
 use std::{
     collections::BTreeMap,
@@ -34,12 +34,13 @@ pub struct Stats {
     pub profit_per_request: I256,
     /// Cancelled requests per request with a receipt.
     pub cancel_rate: f64,
-    /// Seconds from first send to first seen receipt: p50, p90, p99.
+    /// Seconds from first send to first seen receipt, at least 0: p50, p90, p99.
     pub inclusion_seconds: Option<[u64; 3]>,
-    /// The cost of included requests whose refund arrived per their `net`.
-    pub margin: Option<f64>,
+    /// The cost of included requests whose refund arrived per their `net`; lower is
+    /// better.
+    pub cost_ratio: Option<f64>,
     /// Included requests whose loss is not yet charged, outside profit, cancel rate
-    /// and margin.
+    /// and cost ratio.
     pub pending: u64,
 }
 
@@ -48,17 +49,15 @@ pub fn stats(db: &Path) -> Result<Stats, Error> {
     let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let sql = "SELECT CASE WHEN r.reverted THEN 'reverted' ELSE r.status END, r.net, \
                r.gas_used, r.gas_price, r.l1_fee, \
-               r.included_at - (SELECT min(sent_at) FROM attempts a WHERE a.id = r.id), \
+               max(r.included_at - (SELECT min(sent_at) FROM attempts a WHERE a.id = r.id), 0), \
                r.loss FROM requests r";
     let row = |r: &rusqlite::Row| {
         let cost = match r.get::<_, Option<u64>>(2)? {
-            Some(gas) => {
-                let loss = r.get::<_, Option<Vec<u8>>>(6)?;
-                let loss = loss.map(|w| U256::from_be_slice(&w));
-                Some((U256::from(gas) * u256(r, 3)? + u256(r, 4)?, loss))
-            }
+            Some(gas) => Some(U256::from(gas) * u256(r, 3)? + u256(r, 4)?),
             None => None,
         };
+        let loss = r.get::<_, Option<Vec<u8>>>(6)?;
+        let cost = (cost, loss.map(|w| U256::from_be_slice(&w)));
         Ok((
             first::<String>(r)?,
             u256(r, 1)?,
@@ -74,14 +73,14 @@ pub fn stats(db: &Path) -> Result<Stats, Error> {
     for (status, net, cost, inclusion) in rows(&db, sql, [], row)? {
         *stats.requests.entry(status.clone()).or_default() += 1;
         times.extend(inclusion.filter(|_| status != "cancelled"));
-        let Some((cost, loss)) = cost else { continue };
-        let Some(loss) = loss else {
-            stats.pending += 1;
+        // A loss charged with no receipt read has no cost.
+        let (cost, Some(loss)) = cost else {
+            stats.pending += u64::from(cost.0.is_some());
             continue;
         };
         receipts += 1;
         cancelled += u64::from(status == "cancelled");
-        if status == "included" && loss.is_zero() {
+        if let (Some(cost), true) = (cost, status == "included" && loss.is_zero()) {
             stats.profit += signed(net) - signed(cost);
             (costs, nets) = (costs + cost, nets + net);
         } else {
@@ -95,6 +94,6 @@ pub fn stats(db: &Path) -> Result<Stats, Error> {
     times.sort_unstable();
     let at = |p: usize| times[(times.len() * p).div_ceil(100).max(1) - 1];
     stats.inclusion_seconds = (!times.is_empty()).then(|| [at(50), at(90), at(99)]);
-    stats.margin = (!nets.is_zero()).then(|| f64::from(costs) / f64::from(nets));
+    stats.cost_ratio = (!nets.is_zero()).then(|| f64::from(costs) / f64::from(nets));
     Ok(stats)
 }

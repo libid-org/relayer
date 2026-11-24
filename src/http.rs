@@ -5,13 +5,16 @@
 //! - `POST /v1/relay`: a [`Request`]; `202 {id, status}`
 //! - `GET  /v1/relay/{id}`
 //! - `GET  /health`: `OK` while the last tick succeeded recently, else `503`
-//! - `GET  /metrics`
+//! - `GET  /metrics`, on a listener of its own
 //!
 //! A refusal is `{"error": {name, contract?, args?, message}}`; wei amounts are
 //! decimal strings.
 
 use std::{
-    future::Future,
+    future::{
+        Future,
+        IntoFuture,
+    },
     sync::{
         atomic::{
             AtomicU64,
@@ -23,7 +26,10 @@ use std::{
 };
 
 use alloy::{
-    primitives::B256,
+    primitives::{
+        Address,
+        B256,
+    },
     providers::Provider,
 };
 use axum::{
@@ -37,6 +43,7 @@ use axum::{
         HeaderValue,
         StatusCode as C,
     },
+    middleware::map_response,
     response::{
         IntoResponse,
         Response,
@@ -48,6 +55,7 @@ use axum::{
     Json,
     Router,
 };
+use libid_contracts::bindings::wallet::WalletFactory;
 use prometheus_client::{
     metrics::{
         counter::Counter,
@@ -60,7 +68,12 @@ use serde_json::{
     json,
     Value,
 };
-use tokio::time::Instant;
+use tokio::{
+    net::TcpListener,
+    time::Instant,
+};
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::{
     check::{
@@ -82,6 +95,16 @@ pub const STATUS_PATH: &str = "/v1/relay/{id}";
 pub const HEALTH_PATH: &str = "/health";
 pub const METRICS_PATH: &str = "/metrics";
 
+/// What bounds the API's requests: each one's time, answered `408` past it, and how
+/// many are served at once; the rest wait.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// The most a request may take.
+    pub timeout: Duration,
+    /// The requests served at once.
+    pub concurrency: usize,
+}
+
 /// A relayer served over HTTP, the heartbeat of its ticks, and its refusals counted.
 pub struct Service<P> {
     relayer: Relayer<P>,
@@ -91,6 +114,8 @@ pub struct Service<P> {
     /// When the last tick succeeded, in milliseconds after `started` plus one; 0 before.
     last_tick: AtomicU64,
     refusals: Family<[(&'static str, &'static str); 1], Counter>,
+    /// The factory's `REGISTRY()`, once read.
+    registry: tokio::sync::OnceCell<Address>,
 }
 
 impl<P: Provider + 'static> Service<P> {
@@ -103,6 +128,7 @@ impl<P: Provider + 'static> Service<P> {
             started,
             last_tick,
             refusals,
+            registry: Default::default(),
         })
     }
 
@@ -137,12 +163,14 @@ impl<P: Provider + 'static> Service<P> {
     }
 }
 
-/// Serve `service` on `listener`, ticking every `every` from one `every` on, until
-/// `shutdown` resolves; requests in flight finish first.
+/// Serve `service`'s API on `api` within `limits` and its metrics on `metrics`,
+/// ticking every `every` from one `every` on, until `shutdown` resolves; requests in
+/// flight finish first.
 pub async fn serve<P: Provider + 'static>(
     service: Arc<Service<P>>,
     every: Duration,
-    listener: tokio::net::TcpListener,
+    limits: Limits,
+    (api, metrics): (TcpListener, TcpListener),
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let ticker = service.clone();
@@ -154,38 +182,71 @@ pub async fn serve<P: Provider + 'static>(
             ticker.tick().await;
         }
     });
-    tracing::info!("relayer listening on {}", listener.local_addr()?);
+    let (at, scraped) = (api.local_addr()?, metrics.local_addr()?);
+    tracing::info!("relayer listening on {at}, metrics on {scraped}");
     let app = Router::new()
         .route(CONFIG_PATH, get(config))
         .route(QUOTE_PATH, post(quote))
         .route(RELAY_PATH, post(relay))
         .route(STATUS_PATH, get(status))
         .route(HEALTH_PATH, get(health))
-        .route(METRICS_PATH, get(metrics))
         .fallback(|| async { C::NOT_FOUND })
-        .layer(axum::middleware::map_response(standing_headers))
+        .layer(GlobalConcurrencyLimitLayer::new(limits.concurrency))
+        .layer(TimeoutLayer::with_status_code(
+            C::REQUEST_TIMEOUT,
+            limits.timeout,
+        ))
+        .layer(map_response(standing_headers))
+        .with_state(service.clone());
+    let scrape = Router::new()
+        .route(METRICS_PATH, get(scrape))
+        .fallback(|| async { C::NOT_FOUND })
+        .layer(map_response(standing_headers))
         .with_state(service);
-    let served = axum::serve(listener, app).with_graceful_shutdown(shutdown);
-    let served = served.await;
+    let (stop, stopped) = tokio::sync::watch::channel(());
+    tokio::spawn(async move {
+        shutdown.await;
+        drop(stop);
+    });
+    let on_stop = |mut stopped: tokio::sync::watch::Receiver<()>| async move {
+        let _ = stopped.changed().await;
+    };
+    let served = tokio::try_join!(
+        axum::serve(api, app)
+            .with_graceful_shutdown(on_stop(stopped.clone()))
+            .into_future(),
+        axum::serve(metrics, scrape)
+            .with_graceful_shutdown(on_stop(stopped))
+            .into_future(),
+    );
     ticking.abort();
-    served
+    served.map(drop)
 }
 
 type S<P> = State<Arc<Service<P>>>;
 
-async fn config<P: Provider + 'static>(State(s): S<P>) -> Response {
-    let c = s.relayer.config();
-    Json(json!({
+async fn config<P: Provider + 'static>(State(s): S<P>) -> Answer {
+    let (c, p) = (s.relayer.config(), &s.relayer.provider);
+    let read = async || WalletFactory::new(c.factory, p).REGISTRY().call().await;
+    let registry = s.registry.get_or_try_init(read).await.map_err(|e| {
+        tracing::error!("REGISTRY(): {e}");
+        error(C::SERVICE_UNAVAILABLE, "Node", "the node could not answer")
+    })?;
+    Ok(Json(json!({
         "chainId": c.chain_id,
         "relayer": c.relayer,
         "factory": c.factory,
+        "registry": registry,
         "forwarder": c.forwarder,
         "supportedReleases": c.supported_releases,
+        "maxGasLimit": c.max_gas_limit,
+        "maxFeePercent": c.max_fee_percent,
+        "maxCancelFeePercent": c.max_cancel_fee_percent,
         "l1MarginPercent": c.l1_margin,
         "inclusionWindowSeconds": c.inclusion_window.as_secs(),
         "quoteValiditySeconds": c.quote_validity.as_secs(),
     }))
-    .into_response()
+    .into_response())
 }
 
 type Answer = Result<Response, Response>;
@@ -207,9 +268,9 @@ async fn quote<P: Provider + 'static>(State(s): S<P>, body: Bytes) -> Answer {
 }
 
 async fn relay<P: Provider + 'static>(State(s): S<P>, body: Bytes) -> Answer {
-    let id = s.relayer.relay(&parse::<Request>(&body)?).await;
-    let id = id.map_err(|refusal| s.refused(refusal))?;
-    let body = json!({"id": id, "status": "queued"});
+    let submitted = s.relayer.submit(&parse::<Request>(&body)?).await;
+    let (id, status) = submitted.map_err(|refusal| s.refused(refusal))?;
+    let body = json!({"id": id, "status": status});
     Ok((C::ACCEPTED, Json(body)).into_response())
 }
 
@@ -253,8 +314,9 @@ async fn health<P: Provider + 'static>(State(s): S<P>) -> Response {
     }
 }
 
-/// The refusals counted, and gauges read at the scrape.
-async fn metrics<P: Provider + 'static>(State(s): S<P>) -> Response {
+/// The refusals counted, and gauges read at the scrape from the ledger and the last
+/// tick.
+async fn scrape<P: Provider + 'static>(State(s): S<P>) -> Response {
     let r = &s.relayer;
     let mut registry = Registry::with_prefix("libid_relayer");
     registry.register("refusals", "Requests refused, by why", s.refusals.clone());
@@ -263,13 +325,13 @@ async fn metrics<P: Provider + 'static>(State(s): S<P>) -> Response {
         gauge.set(value.unwrap_or(f64::NAN));
         registry.register(name, help, gauge);
     };
-    let paused = Some(f64::from(u8::from(r.paused().await)));
+    let paused = Some(f64::from(u8::from(r.paused())));
     gauge("paused", "Whether sending paused", paused);
-    let balance = r.provider.get_balance(r.config().relayer).await;
+    let balance = r.balance().map(f64::from);
     gauge(
         "key_balance_wei",
-        "The key's balance",
-        balance.ok().map(f64::from),
+        "The key's balance at the last tick",
+        balance,
     );
     let oldest = r.oldest_in_flight().ok().map(|age| age.unwrap_or(0) as f64);
     gauge(
@@ -315,6 +377,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
         RefundMissing => (C::BAD_REQUEST, "no top-level Execution(relayer, R, \"\")"),
         RefundTooLow { .. } => (C::BAD_REQUEST, "sign a refund of at least `required`"),
         GasLimitTooLow { .. } => (C::BAD_REQUEST, "quote again for `required` gas"),
+        GasLimitTooHigh { .. } => (C::BAD_REQUEST, "the batch needs over `max` gas"),
         UnknownWallet => (C::BAD_REQUEST, "the contracts do not vouch for the wallet"),
         ValueNotAllowed => (C::BAD_REQUEST, "an EIP-7702 account's batch carries value"),
         UnsupportedRelease { .. } => {
@@ -337,6 +400,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
             json!({"refund": wei(refund), "required": wei(required)})
         }
         GasLimitTooLow { required } => json!({ "required": required }),
+        GasLimitTooHigh { max } => json!({ "max": max }),
         UnsupportedRelease { version } => json!({ "version": version }),
         WalletBusy { id } => json!({ "id": id }),
         Reverted { data, .. } => json!({ "data": data }),

@@ -28,6 +28,7 @@ use crate::{
         refunds,
         reverted,
         target,
+        under_max,
         Create,
         Refusal,
     },
@@ -106,6 +107,7 @@ impl Draft {
         let unmeasured =
             unmeasured(&message, &authorization, refunds, call_gas, below_quorum);
         let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
+        under_max(gas_limit, config)?;
         let growth = config.quote_validity + config.inclusion_window;
         let floor = gas::fee_floor(provider, config, growth).await?;
         let max_fee_per_gas = floor + gas::tip(provider, config.tip_percentile).await?;

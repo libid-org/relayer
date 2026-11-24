@@ -194,15 +194,11 @@ struct Attempt {
 /// What a tick leaves for the next, behind the lock that runs one tick at a time.
 #[derive(Default)]
 struct Ticking {
-    /// The balance at the last pinned block is below `min_balance`.
-    low: bool,
     /// The last request whose run met a node error or whose receipt did not parse, and
     /// the ticks in a row it did.
     errors: (B256, u32),
     /// Our nonces mined with no receipt of ours, and the block each was first seen at.
     missing: BTreeMap<u64, u64>,
-    /// One of them still had none `receipt_lag_blocks` later.
-    unexplained: bool,
 }
 
 impl Ticking {
@@ -225,6 +221,12 @@ pub struct Relayer<P> {
     config: Config,
     db: Mutex<Connection>,
     paused: AtomicBool,
+    /// The balance at the last pinned block is below `min_balance`.
+    low: AtomicBool,
+    /// One of our nonces mined with no receipt of ours `receipt_lag_blocks` later.
+    unexplained: AtomicBool,
+    /// The balance at the last pinned block.
+    balance: Mutex<Option<U256>>,
     ticking: tokio::sync::Mutex<Ticking>,
     _lock: File,
 }
@@ -239,7 +241,10 @@ impl<P: Provider> Relayer<P> {
         lock.push(".lock");
         let lock = PathBuf::from(lock);
         let file = File::create(&lock)?;
-        let held = |_| format!("{} is held by another relayer", lock.display());
+        let held = |_| {
+            let held = format!("{} is held by another relayer", lock.display());
+            format!("{held}: stop it, or give this one another state.db")
+        };
         file.try_lock().map_err(held)?;
         let mut conn = Connection::open(db)?;
         let tables: u64 =
@@ -281,20 +286,29 @@ impl<P: Provider> Relayer<P> {
             config,
             db: Mutex::new(conn),
             paused: AtomicBool::new(false),
+            low: AtomicBool::new(false),
+            unexplained: AtomicBool::new(false),
+            balance: Mutex::new(None),
             ticking: Default::default(),
             _lock: file,
         })
     }
 
-    /// Check `request` and queue it under its id, within the loss budgets. The same
-    /// request again returns its id unchecked; one that failed is queued again under it.
+    /// [`Self::submit`]'s id.
     pub async fn relay(&self, request: &Request) -> Result<B256, Refusal> {
+        self.submit(request).await.map(|(id, _)| id)
+    }
+
+    /// Check `request` and queue it under its id, within the loss budgets: its id and
+    /// status. The same request again returns its id and stored status unchecked; one
+    /// that failed is queued again under it.
+    pub async fn submit(&self, request: &Request) -> Result<(B256, String), Refusal> {
         let (message, ..) = decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
         let (p, c, wallet) = (&self.provider, &self.config, request.wallet);
         let call = outer(c, wallet, request.create, &request.data, message.value);
         let id = request_id(c.chain_id, &call, message.value);
-        if let Some(id) = admit(&self.db(), id, wallet)? {
-            return Ok(id);
+        if let Some(stored) = admit(&self.db(), id, wallet)? {
+            return Ok(stored);
         }
         // A wallet that lost its budget is refused before the global budget counts.
         let budget = c.wallet_budget;
@@ -317,13 +331,13 @@ impl<P: Provider> Relayer<P> {
         wallet: Address,
         checked: &Checked,
         deadline: u64,
-    ) -> Result<B256, Refusal> {
+    ) -> Result<(B256, String), Refusal> {
         let tx = serde_json::to_string(&checked.tx).map_err(node)?;
         let (net, l1) = (checked.net, checked.l1_fee_bound);
         let (net, l1) = (net.to_be_bytes::<32>(), l1.to_be_bytes::<32>());
         let db = self.db();
-        if let Some(id) = admit(&db, id, wallet)? {
-            return Ok(id);
+        if let Some(stored) = admit(&db, id, wallet)? {
+            return Ok(stored);
         }
         let row = params![&id[..], &wallet[..], tx, net, l1, deadline];
         db.execute("DELETE FROM attempts WHERE id = ?1", [&id[..]])
@@ -333,7 +347,7 @@ impl<P: Provider> Relayer<P> {
                 row,
             ))
             .map_err(node)?;
-        Ok(id)
+        Ok((id, "queued".into()))
     }
 
     /// Resolve or rebroadcast each request in flight, then send the oldest queued one
@@ -370,7 +384,8 @@ impl<P: Provider> Relayer<P> {
             self.resolve(id, net, &head).await?;
         }
         let lag = self.config.receipt_lag_blocks;
-        ticking.unexplained = missing.values().any(|at| head.number >= at + lag);
+        let unexplained = missing.values().any(|at| head.number >= at + lag);
+        self.unexplained.store(unexplained, Relaxed);
         ticking.missing = missing;
         let next = self.db().query_row("SELECT next FROM nonce", [], first)?;
         if mined > next {
@@ -382,7 +397,8 @@ impl<P: Provider> Relayer<P> {
             .block_id(head.at())
             .await?;
         let floor = self.config.min_balance;
-        ticking.low = balance < floor;
+        *self.balance.lock().unwrap_or_else(PoisonError::into_inner) = Some(balance);
+        self.low.store(balance < floor, Relaxed);
         if self.paused.load(Relaxed)
             || mined < next
             || !self.in_flight(mined)?.is_empty()
@@ -390,7 +406,7 @@ impl<P: Provider> Relayer<P> {
         {
             return Ok(());
         }
-        if ticking.low {
+        if self.low.load(Relaxed) {
             let low = format!("balance {balance} below min_balance {floor}");
             return Err(Stop::LowBalance(format!(
                 "{low}: sending paused until it is funded"
@@ -487,15 +503,20 @@ impl<P: Provider> Relayer<P> {
     /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a
     /// refused first send, our nonce mined with no receipt of ours for
     /// `receipt_lag_blocks`, or a spent global loss budget.
-    pub async fn paused(&self) -> bool {
-        let ticking = self.ticking.lock().await;
+    pub fn paused(&self) -> bool {
         let spent = self.budget_left().map_or(true, |left| left.is_zero());
-        self.paused.load(Relaxed) || ticking.low || ticking.unexplained || spent
+        let (low, unexplained) = (self.low.load(Relaxed), self.unexplained.load(Relaxed));
+        self.paused.load(Relaxed) || low || unexplained || spent
     }
 
     /// The configuration it runs with.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The key's balance at the last tick's pinned block.
+    pub fn balance(&self) -> Option<U256> {
+        *self.balance.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// How long the oldest queued or sent request has waited, in seconds.
@@ -507,11 +528,10 @@ impl<P: Provider> Relayer<P> {
 
     /// What is left of the global loss budget.
     pub fn budget_left(&self) -> Result<U256, Error> {
-        let cap = self.config.wallet_budget.wei;
         let losses = self.losses(self.config.global_budget.window)?;
         let lost = losses
             .values()
-            .fold(U256::ZERO, |sum, l| sum.saturating_add(cap.min(*l)));
+            .fold(U256::ZERO, |sum, l| sum.saturating_add(*l));
         Ok(self.config.global_budget.wei.saturating_sub(lost))
     }
 
@@ -969,14 +989,18 @@ async fn explained<P: Provider>(
     Ok(())
 }
 
-/// `id` again when it is stored and has not failed; `WalletBusy` while another batch
-/// of `wallet` is queued, sent, or included with its loss not yet charged.
+/// `id` and its status when it is stored and has not failed; `WalletBusy` while
+/// another batch of `wallet` is queued, sent, or included with its loss not yet charged.
 #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
-fn admit(db: &Connection, id: B256, wallet: Address) -> Result<Option<B256>, Refusal> {
+fn admit(
+    db: &Connection,
+    id: B256,
+    wallet: Address,
+) -> Result<Option<(B256, String)>, Refusal> {
     let status = "SELECT status FROM requests WHERE id = ?1";
     let status = db.query_row(status, [&id[..]], first::<String>).optional();
-    if status.map_err(node)?.is_some_and(|s| s != "failed") {
-        return Ok(Some(id));
+    if let Some(status) = status.map_err(node)?.filter(|s| s != "failed") {
+        return Ok(Some((id, status)));
     }
     let busy = "SELECT id FROM requests WHERE wallet = ?1 \
          AND (status IN ('queued', 'sent') OR (status = 'included' AND loss IS NULL))";
