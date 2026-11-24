@@ -23,6 +23,7 @@ use libid_contracts::{
 use crate::{
     check::{
         decode,
+        refunds,
         reverted,
         target,
         Create,
@@ -85,7 +86,8 @@ pub async fn quote<P: Provider>(
     }
     let call_gas = sim.gas_used;
     let below_quorum = draft.below_quorum.then_some(executions.len());
-    let unmeasured = unmeasured(&authorization, call_gas, below_quorum);
+    let refunds = refunds(&executions, config.relayer);
+    let unmeasured = unmeasured(&authorization, refunds, call_gas, below_quorum);
     let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
     let (tx, l1_fee_bound, min_refund) =
         gas::price(provider, config, call, gas_limit).await?;
@@ -99,10 +101,12 @@ pub async fn quote<P: Provider>(
 }
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
-/// did not check, the rest of a valid `_verify`, the signed `call_gas` word, and,
-/// below quorum, the rules check of that many calls.
+/// did not check, the rest of a valid `_verify`, the signed `call_gas` word, the
+/// zero bytes of its signatures and `refunds` as nonzero, and, below quorum, the
+/// rules check of that many calls.
 fn unmeasured(
     authorization: &ExecuteAuthorization,
+    refunds: impl Iterator<Item = U256>,
     call_gas: u64,
     below_quorum: Option<usize>,
 ) -> u64 {
@@ -118,6 +122,12 @@ fn unmeasured(
     });
     // The draft signs `callGas = 0`; the signed data carries `call_gas`.
     let call_gas_bytes = u64::from(u64::BITS - call_gas.leading_zeros()).div_ceil(8);
+    // The client fills the signatures and may change R after the quote.
+    let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
+    let signed = authorization.signatures.iter().map(|s| zeros(&s.signature));
+    let filled =
+        signed.sum::<u64>() + refunds.map(|r| zeros(&r.to_be_bytes::<32>())).sum::<u64>();
     let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
-    costs.verify_tail() + NONZERO_BYTE * call_gas_bytes + unchecked.sum::<u64>() + rules
+    let bytes = call_gas_bytes + filled;
+    costs.verify_tail() + NONZERO_BYTE * bytes + unchecked.sum::<u64>() + rules
 }

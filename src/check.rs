@@ -163,11 +163,18 @@ pub(crate) fn decode(
 
 /// R: what the batch's top-level `Execution(relayer, R, "")` calls pay.
 fn refund(executions: &[Execution], relayer: Address) -> Option<U256> {
+    refunds(executions, relayer).reduce(U256::saturating_add)
+}
+
+/// The values of the batch's top-level `Execution(relayer, R, "")` calls.
+pub(crate) fn refunds(
+    executions: &[Execution],
+    relayer: Address,
+) -> impl Iterator<Item = U256> + '_ {
     executions
         .iter()
-        .filter(|e| e.target == relayer && e.callData.is_empty())
+        .filter(move |e| e.target == relayer && e.callData.is_empty())
         .map(|e| e.value)
-        .reduce(U256::saturating_add)
 }
 
 /// The gas limit `call` is sent at, from its run at `late`, for its signed
