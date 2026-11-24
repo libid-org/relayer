@@ -110,13 +110,6 @@ pub enum Refusal {
         /// The revert data.
         data: Bytes,
     },
-    /// The transaction's L1 fee exceeds the bound its refund covers; retriable.
-    L1FeeAboveBound {
-        /// `getL1Fee` of the transaction.
-        fee: U256,
-        /// The L1 fee bound with its margin.
-        bound: U256,
-    },
     /// Another batch of the wallet is in flight.
     WalletBusy {
         /// The request in flight.

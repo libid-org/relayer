@@ -12,7 +12,6 @@ use alloy::{
     primitives::{
         address,
         Address,
-        Bytes,
         U256,
     },
     providers::Provider,
@@ -57,7 +56,6 @@ alloy::sol! {
     #[sol(rpc)]
     interface GasPriceOracle {
         function getL1FeeUpperBound(uint256 unsignedTxSize) external view returns (uint256);
-        function getL1Fee(bytes memory data) external view returns (uint256);
     }
 }
 
@@ -136,24 +134,6 @@ pub(crate) async fn tip<P: Provider>(
     Ok(reward
         .and_then(|r| r.last()?.first().copied())
         .unwrap_or_default())
-}
-
-/// Refuses `tx`, encoded, when its `getL1Fee` exceeds `bound`.
-pub(crate) async fn l1_gate<P: Provider>(
-    provider: &P,
-    config: &Config,
-    tx: Bytes,
-    bound: U256,
-) -> Result<(), Refusal> {
-    if config.l1_fee == L1Fee::None {
-        return Ok(());
-    }
-    let oracle = GasPriceOracle::new(GAS_PRICE_ORACLE, provider);
-    let fee = oracle.getL1Fee(tx).call().await.map_err(node)?;
-    if fee > bound {
-        return Err(Refusal::L1FeeAboveBound { fee, bound });
-    }
-    Ok(())
 }
 
 /// The latest block's timestamp.

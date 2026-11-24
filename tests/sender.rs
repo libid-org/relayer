@@ -47,15 +47,6 @@ impl Onboarding {
         assert!(sent.get_receipt().await.unwrap().status());
     }
 
-    /// The oracle: `getL1FeeUpperBound` → `bound`, `getL1Fee` → `fee`, all else → 0.
-    async fn oracle(&self, bound: U256, fee: U256) {
-        let [bound, fee] =
-            [bound, fee].map(|v| alloy::hex::encode(v.to_be_bytes::<32>()));
-        let (head, mid) = ("60003560e01c8063f1c7a58b147f", "02906349948e0e147f");
-        let code = format!("{head}{bound}{mid}{fee}020160005260206000f3");
-        self.set_code(ORACLE, &code).await;
-    }
-
     /// Sent with automine off, priced out, then at its deadline: still pending.
     async fn priced_out(&self, r: &Rel) -> (B256, Transaction, Bytes) {
         self.owner.anvil_set_auto_mine(false).await.unwrap();
@@ -225,43 +216,19 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     assert!(refused.contains("relayer reconcile"), "{refused}");
 }
 
-/// `getL1Fee(rawTx) > k × U` fails the request `L1FeeAboveBound` with nothing
-/// broadcast; at exactly `k × U` it sends, within the refund's L1 part.
+/// On an OP-stack chain a balance of exactly `gasLimit × maxFeePerGas + k × U + value`
+/// sends, within the refund's L1 part.
 #[tokio::test]
-async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
+async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let o = Onboarding::new(true).await;
     let mut config = o.config();
     config.l1_fee = L1Fee::OpStack;
-    let bound = U256::from(10_000_000_000u64);
-    let k_u = bound * U256::from(config.l1_margin) / U256::from(100);
-    o.oracle(bound, k_u + U256::from(1)).await;
+    // An oracle whose `getL1FeeUpperBound` is 10 gwei.
+    o.set_code(ORACLE, "6402540be4005f5260205ff3").await;
+    let k_u = U256::from(13_000_000_000u64);
     let path = db("l1");
     let r = Relayer::start(o.relayer.clone(), config.clone(), &path).await;
     let r = r.unwrap();
-    let above = |r: &Refusal| matches!(r, Refusal::L1FeeAboveBound { .. });
-    // Refused at relay or failed before the first broadcast.
-    match o.onboard(&r, 3600).await {
-        Err(e) => assert!(above(&e), "{e:?}"),
-        Ok(id) => {
-            r.tick().await.unwrap();
-            let status = r.status(id).await.unwrap().status;
-            let failed = matches!(&status, Status::Failed(e) if above(e));
-            assert!(failed, "{status:?}");
-        }
-    }
-    assert_eq!(o.relayer_nonce().await, 0, "broadcast above the bound");
-    // Passed at relay, refused at its send: the failure keeps its fee and bound.
-    o.oracle(bound, k_u).await;
-    let id = o.onboard(&r, 1800).await.unwrap();
-    o.oracle(bound, k_u + U256::from(1)).await;
-    r.tick().await.unwrap();
-    let status = r.status(id).await.unwrap().status;
-    let fields = (k_u + U256::from(1), k_u);
-    let failed = matches!(status, Status::Failed(Refusal::L1FeeAboveBound { fee, bound })
-        if (fee, bound) == fields);
-    assert!(failed && o.relayer_nonce().await == 0, "{status:?}");
-    // A balance of exactly `gasLimit × maxFeePerGas + k × U + value` sends.
-    o.oracle(bound, k_u).await;
     let id = o.onboard(&r, 1800).await.unwrap();
     o.set_balance(o.relayer_address, U256::from(1)).await;
     let refused = r.tick().await.unwrap_err().to_string();

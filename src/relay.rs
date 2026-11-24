@@ -22,7 +22,6 @@ use std::{
 
 use alloy::{
     consensus::{
-        SignableTransaction,
         Transaction,
         TxEnvelope,
     },
@@ -205,9 +204,6 @@ impl<P: Provider> Relayer<P> {
             return Ok(id);
         }
         let checked = check(p, c, request).await?;
-        let unsigned = checked.tx.clone().nonce(u64::MAX).build_1559();
-        let unsigned = unsigned.map_err(node)?.encoded_for_signing().into();
-        gas::l1_gate(p, c, unsigned, checked.l1_fee_bound).await?;
         self.queue(id, wallet, &checked, message.deadline.to())
     }
 
@@ -366,8 +362,8 @@ impl<P: Provider> Relayer<P> {
         self.cancel(id, last, mined).await
     }
 
-    /// Sign `tx` at the next nonce with the tip read now, run it again and gate its
-    /// L1 fee, then commit it and broadcast it.
+    /// Sign `tx` at the next nonce with the tip read now, run it again, then commit it
+    /// and broadcast it.
     async fn send(
         &self,
         id: B256,
@@ -395,12 +391,7 @@ impl<P: Provider> Relayer<P> {
             let short = format!("balance {balance} below a send's cost {worst}");
             return Err(format!("{short}: sending paused; fund it and restart").into());
         }
-        let gate = async {
-            self.runs(&attempt.raw, deadline).await?;
-            let raw = attempt.raw.clone();
-            gas::l1_gate(&self.provider, &self.config, raw, cover.1).await
-        };
-        match gate.await {
+        match self.runs(&attempt.raw, deadline).await {
             Err(Refusal::Node(e)) => return Err(e.into()),
             Err(refusal) => return self.set_status(id, "failed", None, Some(&refusal)),
             Ok(()) => {}
@@ -651,23 +642,15 @@ fn affordable(raw: &[u8], (net, l1): Cover) -> Result<U256, Error> {
 /// A failure as stored: its name and its fields.
 fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
     match refusal {
-        Refusal::L1FeeAboveBound { fee, bound } => {
-            let words = [fee.to_be_bytes::<32>(), bound.to_be_bytes::<32>()];
-            ("L1FeeAboveBound".into(), words.concat())
-        }
         Refusal::Reverted { data, .. } => ("Reverted".into(), data.to_vec()),
         other => (format!("{other:?}"), vec![]),
     }
 }
 
-/// The failure [`encode_failure`] stored: what a send's L1 gate or run refuses.
+/// The failure [`encode_failure`] stored: what a send's run refuses.
 fn decode_failure(name: &str, detail: Option<Vec<u8>>) -> Refusal {
     let detail = detail.unwrap_or_default();
     match name {
-        "L1FeeAboveBound" => Refusal::L1FeeAboveBound {
-            fee: U256::from_be_slice(&detail[..32]),
-            bound: U256::from_be_slice(&detail[32..]),
-        },
         "Reverted" => reverted(detail.into()),
         _ => Refusal::Expired,
     }
