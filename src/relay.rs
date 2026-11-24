@@ -31,6 +31,7 @@ use alloy::{
         TxEnvelope,
     },
     eips::{
+        BlockId,
         Decodable2718,
         Encodable2718,
     },
@@ -110,14 +111,14 @@ type Queued = (B256, String, Cover, u64, Address);
 const CANCEL_PERCENTILE: f64 = 90.0;
 
 /// The schema version, `PRAGMA user_version`, a database must have.
-const VERSION: i32 = 2;
+const VERSION: i32 = 3;
 
 const SCHEMA: &str = "
     CREATE TABLE requests (id BLOB PRIMARY KEY, wallet BLOB NOT NULL,
         tx TEXT NOT NULL, net BLOB NOT NULL, l1 BLOB NOT NULL, deadline INTEGER NOT NULL,
         status TEXT NOT NULL, block INTEGER, reverted INTEGER, failure TEXT, detail BLOB,
         created_at INTEGER NOT NULL DEFAULT (unixepoch()), gas_used INTEGER, gas_price BLOB, l1_fee BLOB,
-        included_at INTEGER, loss BLOB);
+        included_at INTEGER, loss BLOB, block_hash BLOB);
     CREATE TABLE attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
         nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL,
         block INTEGER NOT NULL, at INTEGER NOT NULL,
@@ -146,7 +147,8 @@ pub enum Status {
     },
     /// Replaced by a cancel that landed; not queued again.
     Cancelled,
-    /// Refused before its first broadcast; queued again when relayed again.
+    /// Refused before its first broadcast, or its receipt did not parse; queued again
+    /// when relayed again.
     Failed(Refusal),
 }
 
@@ -194,7 +196,8 @@ struct Attempt {
 struct Ticking {
     /// The balance at the last pinned block is below `min_balance`.
     low: bool,
-    /// The last request whose run met a node error, and the ticks in a row it did.
+    /// The last request whose run met a node error or whose receipt did not parse, and
+    /// the ticks in a row it did.
     errors: (B256, u32),
     /// Our nonces mined with no receipt of ours, and the block each was first seen at.
     missing: BTreeMap<u64, u64>,
@@ -348,9 +351,23 @@ impl<P: Provider> Relayer<P> {
         let mined = mined.block_id(head.at()).await?;
         let mut missing = BTreeMap::new();
         for (id, deadline, cover) in self.in_flight(mined)? {
-            if let Some(n) = self.watch(id, deadline, cover, &head, mined).await? {
-                missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number));
+            match self.watch(id, deadline, cover, &head, mined).await {
+                Ok(Some(n)) => drop(
+                    missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number)),
+                ),
+                Ok(None) => {}
+                Err(e)
+                    if e.is::<Unreadable>()
+                        && ticking.strike(id) >= self.config.node_error_ticks =>
+                {
+                    tracing::warn!("{id} failed as its receipt does not parse: {e}");
+                    self.fail(id, &Refusal::Node(e.to_string()))?;
+                }
+                Err(e) => return Err(e),
             }
+        }
+        for (id, net) in self.uncharged()? {
+            self.resolve(id, net, &head).await?;
         }
         let lag = self.config.receipt_lag_blocks;
         ticking.unexplained = missing.values().any(|at| head.number >= at + lag);
@@ -408,6 +425,13 @@ impl<P: Provider> Relayer<P> {
         let row =
             |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?, address(r, 5)?));
         Ok(self.db().query_row(sql, [], row).optional()?)
+    }
+
+    /// The included requests whose loss is not yet charged: id, `R - value`.
+    fn uncharged(&self) -> Result<Vec<(B256, U256)>, Error> {
+        let sql =
+            "SELECT id, net FROM requests WHERE status = 'included' AND loss IS NULL";
+        rows(&self.db(), sql, [], |r| Ok((b256(r, 0)?, u256(r, 1)?)))
     }
 
     /// `id`'s status and its transactions.
@@ -505,36 +529,85 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// What `a`'s receipt cost the relayer: its gas and L1 fee, plus its value unless it
-    /// reverted, less R when the key's balance moved by exactly `R - value - cost` over
-    /// its block. Any other move, as from a top-up, or a balance not read, is no refund.
+    /// reverted, less R when the key's balance over its block rose by at least
+    /// `R - value - cost`. `None` while the balances are unread, until
+    /// `receipt_lag_blocks` past its block, then charged as no refund.
     async fn loss(
         &self,
         a: &Attempt,
         receipt: &AnyTransactionReceipt,
         net: U256,
-    ) -> Result<U256, Error> {
+        head: &Head,
+    ) -> Result<Option<U256>, Error> {
         let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
-        let cost = gas + l1_fee(receipt)?;
+        let cost = gas + l1_fee(receipt).map_err(unreadable)?;
         if a.cancel || !receipt.status() {
-            return Ok(cost);
+            return Ok(Some(cost));
         }
-        let value = TxEnvelope::decode_2718(&mut &a.raw[..])?.value();
+        let value = TxEnvelope::decode_2718(&mut &a.raw[..])
+            .map_err(unreadable)?
+            .value();
         let block = receipt.block_number.unwrap_or_default();
-        let balance = |n: u64| self.provider.get_balance(self.config.relayer).number(n);
-        let refunded =
-            match (balance(block).await, balance(block.saturating_sub(1)).await) {
-                (Ok(at), Ok(parent)) => parent + net == at + cost,
-                (at, parent) => {
-                    let e = at.err().or(parent.err()).map(|e| e.to_string());
-                    tracing::warn!("{} charged as unrefunded: {e:?}", a.hash);
-                    false
-                }
+        Ok(Some(match self.balances(receipt).await {
+            Ok((parent, at)) if at + cost >= parent + net => cost.saturating_sub(net),
+            Ok(_) => cost + value,
+            Err(_) if head.number < block + self.config.receipt_lag_blocks => {
+                return Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!("{} charged as unrefunded: {e}", a.hash);
+                cost + value
+            }
+        }))
+    }
+
+    /// The key's balance before and after `receipt`'s block, read by block hash.
+    async fn balances(
+        &self,
+        receipt: &AnyTransactionReceipt,
+    ) -> Result<(U256, U256), Error> {
+        let hash = receipt.block_hash.ok_or("a receipt with no block hash")?;
+        let block = self.provider.get_block_by_hash(hash).await?;
+        let parent = block.ok_or("no receipt block")?.header.parent_hash;
+        let balance = |h| {
+            self.provider
+                .get_balance(self.config.relayer)
+                .block_id(BlockId::hash(h))
+        };
+        Ok((balance(parent).await?, balance(hash).await?))
+    }
+
+    /// Record `id`'s receipt from any of its attempts with its loss, unless charged at
+    /// its block already. False with none.
+    async fn resolve(&self, id: B256, net: U256, head: &Head) -> Result<bool, Error> {
+        for a in self.attempts(id)? {
+            // Read as any receipt, which keeps an OP-stack `l1Fee`.
+            let get = self
+                .provider
+                .raw_request("eth_getTransactionReceipt".into(), (a.hash,));
+            let get: Result<Option<AnyTransactionReceipt>, _> = get.await;
+            let read = |e: alloy::transports::TransportError| match e.is_deser_error() {
+                true => unreadable(e),
+                false => e.into(),
             };
-        Ok(if refunded {
-            cost.saturating_sub(net)
-        } else {
-            cost + value
-        })
+            let Some(receipt) = get.map_err(read)? else {
+                continue;
+            };
+            let hash = receipt.block_hash.unwrap_or_default();
+            let sql = "SELECT count(*) FROM requests \
+                       WHERE id = ?1 AND block_hash = ?2 AND loss IS NOT NULL";
+            let charged =
+                self.db()
+                    .query_row(sql, params![&id[..], &hash[..]], first::<u64>);
+            if charged? == 1 {
+                return Ok(true);
+            }
+            let status = if a.cancel { "cancelled" } else { "included" };
+            let loss = self.loss(&a, &receipt, net, head).await?;
+            self.set_status(id, status, Some((&receipt, loss)), None)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Resolve `id` from a receipt of any of its attempts. With none, broadcast its send
@@ -548,21 +621,10 @@ impl<P: Provider> Relayer<P> {
         head: &Head,
         mined: u64,
     ) -> Result<Option<u64>, Error> {
-        let attempts = self.attempts(id)?;
-        for a in &attempts {
-            // Read as any receipt, which keeps an OP-stack `l1Fee`.
-            let get = self
-                .provider
-                .raw_request("eth_getTransactionReceipt".into(), (a.hash,));
-            let Some(receipt): Option<AnyTransactionReceipt> = get.await? else {
-                continue;
-            };
-            let block = receipt.block_number.unwrap_or_default();
-            let status = if a.cancel { "cancelled" } else { "included" };
-            let loss = self.loss(a, &receipt, cover.0).await?;
-            self.set_status(id, status, Some((block, &receipt, loss)), None)?;
+        if self.resolve(id, cover.0, head).await? {
             return Ok(None);
         }
+        let attempts = self.attempts(id)?;
         self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
         let (Some(send), Some(last)) = (attempts.first(), attempts.last()) else {
             return Ok(None);
@@ -810,24 +872,23 @@ impl<P: Provider> Relayer<P> {
         &self,
         id: B256,
         status: &str,
-        receipt: Option<(u64, &AnyTransactionReceipt, U256)>,
+        receipt: Option<(&AnyTransactionReceipt, Option<U256>)>,
         failed: Option<&Refusal>,
     ) -> Result<(), Error> {
-        let (block, receipt, loss) = match receipt {
-            Some((block, receipt, loss)) => (Some(block), Some(receipt), Some(loss)),
-            None => (None, None, None),
-        };
+        let (receipt, loss) = receipt.unzip();
+        let block = receipt.map(|r| r.block_number.unwrap_or_default());
+        let hash = receipt.and_then(|r| r.block_hash.map(|h| h.0));
         let (failure, detail) = failed.map(encode_failure).unzip();
         let l1 = receipt.map(l1_fee).transpose()?;
         let wei = |r: &AnyTransactionReceipt| U256::from(r.effective_gas_price);
         let (gas, price) = (receipt.map(|r| r.gas_used), receipt.map(wei));
         let reverted = receipt.map(|r| !r.status());
         let words = |w: Option<U256>| w.map(|w| w.to_be_bytes::<32>());
-        let (price, l1, loss) = (words(price), words(l1), words(loss));
+        let (price, l1, loss) = (words(price), words(l1), words(loss.flatten()));
         self.db().execute(
             "UPDATE requests SET status = ?2, block = ?3, reverted = ?4, failure = ?5, \
              detail = ?6, gas_used = ?7, gas_price = ?8, l1_fee = ?9, loss = ?10, \
-             included_at = CASE WHEN ?3 IS NULL THEN NULL \
+             block_hash = ?11, included_at = CASE WHEN ?3 IS NULL THEN NULL \
              ELSE coalesce(included_at, unixepoch()) END WHERE id = ?1",
             params![
                 &id[..],
@@ -839,7 +900,8 @@ impl<P: Provider> Relayer<P> {
                 gas,
                 price,
                 l1,
-                loss
+                loss,
+                hash
             ],
         )?;
         Ok(())
@@ -908,7 +970,7 @@ async fn explained<P: Provider>(
 }
 
 /// `id` again when it is stored and has not failed; `WalletBusy` while another batch
-/// of `wallet` is queued or sent.
+/// of `wallet` is queued, sent, or included with its loss not yet charged.
 #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
 fn admit(db: &Connection, id: B256, wallet: Address) -> Result<Option<B256>, Refusal> {
     let status = "SELECT status FROM requests WHERE id = ?1";
@@ -916,8 +978,8 @@ fn admit(db: &Connection, id: B256, wallet: Address) -> Result<Option<B256>, Ref
     if status.map_err(node)?.is_some_and(|s| s != "failed") {
         return Ok(Some(id));
     }
-    let busy =
-        "SELECT id FROM requests WHERE wallet = ?1 AND status IN ('queued', 'sent')";
+    let busy = "SELECT id FROM requests WHERE wallet = ?1 \
+         AND (status IN ('queued', 'sent') OR (status = 'included' AND loss IS NULL))";
     let busy = db.query_row(busy, [&wallet[..]], |r| b256(r, 0));
     match busy.optional().map_err(node)? {
         Some(id) => Err(Refusal::WalletBusy { id }),
@@ -1028,6 +1090,22 @@ fn cover(row: &Row) -> rusqlite::Result<Cover> {
 
 fn refused(refusal: Refusal) -> Error {
     format!("{refusal:?}").into()
+}
+
+/// A receipt or attempt that does not parse, struck as a node error on a run is.
+#[derive(Debug)]
+struct Unreadable(String);
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+fn unreadable(e: impl fmt::Display) -> Error {
+    Box::new(Unreadable(e.to_string()))
 }
 
 #[cfg(test)]

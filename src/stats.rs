@@ -38,6 +38,9 @@ pub struct Stats {
     pub inclusion_seconds: Option<[u64; 3]>,
     /// The cost of included requests whose refund arrived per their `net`.
     pub margin: Option<f64>,
+    /// Included requests whose loss is not yet charged, outside profit, cancel rate
+    /// and margin.
+    pub pending: u64,
 }
 
 /// The numbers of the ledger at `db`, opened read-only.
@@ -49,7 +52,11 @@ pub fn stats(db: &Path) -> Result<Stats, Error> {
                r.loss FROM requests r";
     let row = |r: &rusqlite::Row| {
         let cost = match r.get::<_, Option<u64>>(2)? {
-            Some(gas) => Some((U256::from(gas) * u256(r, 3)? + u256(r, 4)?, u256(r, 6)?)),
+            Some(gas) => {
+                let loss = r.get::<_, Option<Vec<u8>>>(6)?;
+                let loss = loss.map(|w| U256::from_be_slice(&w));
+                Some((U256::from(gas) * u256(r, 3)? + u256(r, 4)?, loss))
+            }
             None => None,
         };
         Ok((
@@ -68,6 +75,10 @@ pub fn stats(db: &Path) -> Result<Stats, Error> {
         *stats.requests.entry(status.clone()).or_default() += 1;
         times.extend(inclusion.filter(|_| status != "cancelled"));
         let Some((cost, loss)) = cost else { continue };
+        let Some(loss) = loss else {
+            stats.pending += 1;
+            continue;
+        };
         receipts += 1;
         cancelled += u64::from(status == "cancelled");
         if status == "included" && loss.is_zero() {

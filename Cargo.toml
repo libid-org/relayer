@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
-alloy = { version = "2", features = ["node-bindings", "provider-anvil-api", "signer-local"] }
+alloy = { version = "2", features = ["json-rpc", "node-bindings", "provider-anvil-api", "signer-local"] }
 libid-contracts = { workspace = true, features = ["testing"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

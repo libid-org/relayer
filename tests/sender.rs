@@ -8,6 +8,10 @@ include!("common/onboarding.rs");
 
 type Rel = Relayer<DynProvider>;
 
+use std::sync::atomic::AtomicU8;
+
+use alloy::eips::BlockId;
+
 impl Onboarding {
     /// The onboarding relayed, signed to expire `secs` after the latest block.
     async fn onboard(&self, r: &Rel, secs: u64) -> Result<B256, Refusal> {
@@ -25,6 +29,16 @@ impl Onboarding {
     async fn receipt(&self, hash: B256) -> TransactionReceipt {
         let receipt = self.owner.get_transaction_receipt(hash).await;
         receipt.unwrap().unwrap()
+    }
+
+    /// A relayer whose provider is armed with the mode it returns, at first none.
+    async fn armable(&self, path: &Path) -> (Relayer<Racing>, std::sync::Arc<AtomicU8>) {
+        let mode = std::sync::Arc::new(AtomicU8::new(0));
+        let racing = Racing(self.relayer.clone(), mode.clone());
+        (
+            Relayer::start(racing, self.config(), path).await.unwrap(),
+            mode,
+        )
     }
 
     /// A relayer whose provider is armed with `mode`.
@@ -108,6 +122,10 @@ const RACE: u8 = 1;
 const ECHO: u8 = 2;
 const STALL: u8 = 3;
 const BROKE: u8 = 4;
+/// Fails `eth_getBalance` at a block hash not required canonical: a receipt's loss reads.
+const BLIND: u8 = 5;
+/// Answers `eth_getTransactionReceipt` with what does not parse.
+const GARBLED: u8 = 6;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -135,6 +153,45 @@ impl Provider for Racing {
             STALL => tx.with_chain_id(1),
             BROKE => tx.from(Address::repeat_byte(2)),
             _ => tx,
+        })
+    }
+
+    fn get_balance(
+        &self,
+        address: Address,
+    ) -> alloy::providers::RpcWithBlock<Address, U256, U256> {
+        let (inner, mode) = (self.0.clone(), self.1.clone());
+        alloy::providers::RpcWithBlock::new_provider(move |block| {
+            let receipts =
+                matches!(block, BlockId::Hash(h) if h.require_canonical.is_none());
+            if mode.load(Ordering::Relaxed) == BLIND && receipts {
+                let blind = alloy::transports::TransportErrorKind::custom_str("blind");
+                return alloy::providers::ProviderCall::ready(Err(blind));
+            }
+            let inner = inner.clone();
+            let balance = async move { inner.get_balance(address).block_id(block).await };
+            alloy::providers::ProviderCall::BoxedFuture(Box::pin(balance))
+        })
+    }
+
+    fn raw_request<'a, 'b, P, R>(
+        &'a self,
+        method: std::borrow::Cow<'static, str>,
+        params: P,
+    ) -> Boxed<'b, R>
+    where
+        P: alloy::rpc::json_rpc::RpcSend + 'b,
+        R: alloy::rpc::json_rpc::RpcRecv + 'b,
+        Self: Sized + 'b,
+        'a: 'b,
+    {
+        Box::pin(async move {
+            let garbled = self.1.load(Ordering::Relaxed) == GARBLED;
+            if garbled && method == "eth_getTransactionReceipt" {
+                let e = serde_json::from_str::<u8>("{}").unwrap_err();
+                return Err(alloy::transports::RpcError::deser_err(e, "{}"));
+            }
+            self.0.raw_request(method, params).await
         })
     }
 
@@ -759,4 +816,64 @@ async fn a_cancel_is_capped_at_the_max_cancel_fee() {
     let report = r.status(id).await.unwrap();
     let cancel = o.tx(report.tx_hashes[1]).await.inner;
     assert_eq!(cancel.max_fee_per_gas(), u128::from(base) * 3 / 2);
+}
+
+/// A balance the node cannot serve at a receipt's block leaves its loss pending, out of
+/// the budgets and its wallet busy: charged once read, a dust transfer in its block
+/// still refunded, or as unrefunded `receipt_lag_blocks` later.
+#[tokio::test]
+async fn a_loss_is_pending_until_its_balances_are_read() {
+    for read in [true, false] {
+        let (o, path) = (Onboarding::new(true).await, db("blind"));
+        let (r, mode) = o.armable(&path).await;
+        let left = r.budget_left().unwrap();
+        let lost = || left - r.budget_left().unwrap();
+        let pending = || relayer::stats::stats(&path).unwrap().pending;
+        o.owner.anvil_set_auto_mine(false).await.unwrap();
+        let id = o.queue(&r).await;
+        r.tick().await.unwrap();
+        let dust = TransactionRequest::default().with_to(o.relayer_address);
+        let _dust = o
+            .owner
+            .send_transaction(dust.with_value(U256::ONE))
+            .await
+            .unwrap();
+        mode.store(BLIND, Ordering::Relaxed);
+        let report = o.settle(&r, id, included).await;
+        r.tick().await.unwrap();
+        assert_eq!((pending(), lost()), (1, U256::ZERO), "charged unread");
+        let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
+        let again = o.request(o.sign_until(calls, o.value, now, now + 1800));
+        let busy = matches!(r.relay(&again).await, Err(Refusal::WalletBusy { .. }));
+        assert!(busy, "relayed again uncharged");
+        if read {
+            mode.store(0, Ordering::Relaxed);
+        } else {
+            let lag = o.config().receipt_lag_blocks;
+            o.owner.anvil_mine(Some(lag), None).await.unwrap();
+        }
+        r.tick().await.unwrap();
+        assert_eq!(pending(), 0, "uncharged");
+        let cost = report.cost.unwrap();
+        let unrefunded = U256::from(cost.gas_used) * cost.gas_price + o.value;
+        assert_eq!(lost(), if read { U256::ZERO } else { unrefunded }, "{read}");
+    }
+}
+
+/// A receipt that does not parse holds the queue for `node_error_ticks` ticks, then
+/// fails its request as `Node`.
+#[tokio::test]
+async fn an_unparsed_receipt_fails_its_request_after_its_ticks() {
+    let o = Onboarding::new(true).await;
+    let (r, mode) = o.armable(&db("garbled")).await;
+    let id = o.queue(&r).await;
+    r.tick().await.unwrap();
+    mode.store(GARBLED, Ordering::Relaxed);
+    for _ in 1..o.config().node_error_ticks {
+        r.tick().await.expect_err("no parse error");
+    }
+    r.tick().await.unwrap();
+    let status = r.status(id).await.unwrap().status;
+    let node = matches!(status, Status::Failed(Refusal::Node(_)));
+    assert!(node, "{status:?}");
 }

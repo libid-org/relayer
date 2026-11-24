@@ -150,11 +150,12 @@ pub struct Config {
     pub max_cancel_fee_percent: u64,
     /// The balance below which sending pauses, in wei.
     pub min_balance: U256,
-    /// The ticks in a row a node error on the oldest queued request's run holds the
-    /// queue before the request fails as `Node`.
+    /// The ticks in a row a node error on the oldest queued request's run, or a receipt
+    /// in flight that does not parse, holds the queue before the request fails as `Node`.
     pub node_error_ticks: u32,
     /// The blocks our nonce may stay mined with no receipt of ours, as from a lagging
-    /// node, before sending pauses.
+    /// node, before sending pauses; and a receipt's loss stays pending for the key's
+    /// balances before it is charged as unrefunded.
     pub receipt_lag_blocks: u64,
     /// The loss budget of each wallet: past it, its requests are `RateLimited`.
     pub wallet_budget: Budget,
