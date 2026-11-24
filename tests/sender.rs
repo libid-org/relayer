@@ -371,6 +371,16 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
     let (r, request) = (r.unwrap(), o.request_for(&o.onboarding()).await);
     let id = r.relay(&request).await.unwrap();
+    // The oracle's bound doubled since the check: refused for k × the 10 gwei more.
+    o.set_code(ORACLE, "6404a817c8005f5260205ff3").await;
+    r.tick().await.unwrap();
+    let status = r.status(id).await.unwrap().status;
+    let Status::Failed(Refusal::RefundTooLow { refund, required }) = status else {
+        panic!("{status:?}")
+    };
+    assert_eq!(required - refund, k_u);
+    o.set_code(ORACLE, "6402540be4005f5260205ff3").await;
+    assert_eq!(r.relay(&request).await.unwrap(), id);
     o.set_balance(o.relayer_address, U256::from(1)).await;
     r.tick().await.unwrap();
     let status = r.status(id).await.unwrap().status;
@@ -412,6 +422,29 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     let late = r.status(late).await.unwrap().status;
     let reverted = matches!(late, Status::Failed(Refusal::Reverted { .. }));
     assert!(reverted && !r.paused().await, "{late:?}");
+}
+
+/// A queued request whose cap from R falls below the pinned base fee's growth over the
+/// window fails `RefundTooLow` unsent, and the next is sent in the same tick.
+#[tokio::test]
+async fn a_request_priced_out_while_queued_fails_and_the_next_is_sent() {
+    let mut o = Onboarding::new(true).await;
+    let r = o.start(&db("outbid")).await.unwrap();
+    let latest = o.owner.get_block_by_number(Default::default()).await;
+    let base = u128::from(latest.unwrap().unwrap().header.base_fee_per_gas.unwrap());
+    let refund = o.value + U256::from(GAS_LIMIT) * U256::from(10 * base);
+    let low = o.request_for(&o.batch(o.repay(refund))).await;
+    let low = r.relay(&low).await.unwrap();
+    o.wallet_at(U256::ONE).await;
+    let next = o.queue(&r).await;
+    o.base_fee(100 * base).await;
+    o.owner.evm_mine(None).await.unwrap();
+    r.tick().await.unwrap();
+    let report = r.status(low).await.unwrap();
+    let failed = matches!(report.status, Status::Failed(Refusal::RefundTooLow { .. }));
+    assert!(failed && report.tx_hashes.is_empty(), "{:?}", report.status);
+    assert!(matches!(r.status(next).await.unwrap().status, Status::Sent));
+    o.settle(&r, next, included).await;
 }
 
 /// A request whose deadline no longer covers the window fails unsent at its send.

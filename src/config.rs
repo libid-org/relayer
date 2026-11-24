@@ -131,12 +131,16 @@ pub struct Config {
     pub max_cancel_fee: u128,
     /// The balance below which sending pauses, in wei.
     pub min_balance: U256,
+    /// The ticks in a row a node error on the oldest queued request's run holds the
+    /// queue before the request fails as `Node`.
+    pub node_error_ticks: u32,
 }
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
-    /// growth over the window, cancels up to 10,000 gwei, and no balance floor.
+    /// growth over the window, cancels up to 10,000 gwei, no balance floor, and 5
+    /// ticks of node errors on a request.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -158,6 +162,7 @@ impl Config {
             max_fee_percent: 0,
             max_cancel_fee: 10_000_000_000_000,
             min_balance: U256::ZERO,
+            node_error_ticks: 5,
         };
         let window = config.blocks(config.inclusion_window);
         config.max_fee_percent = Eip1559::L1.growth_percent(window);

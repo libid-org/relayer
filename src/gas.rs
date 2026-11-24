@@ -102,7 +102,8 @@ pub(crate) async fn price<P: Provider>(
     gas_limit: u64,
     max_fee_per_gas: u128,
 ) -> Result<(U256, U256), Refusal> {
-    let l1_fee_bound = l1_fee_bound(provider, config, call, gas_limit).await?;
+    let latest = BlockId::latest();
+    let l1_fee_bound = l1_fee_bound(provider, config, call, gas_limit, latest).await?;
     let cost = U256::from(gas_limit)
         .saturating_mul(U256::from(max_fee_per_gas))
         .saturating_add(l1_fee_bound);
@@ -244,13 +245,14 @@ pub(crate) async fn simulate<P: Provider>(
     Ok(call)
 }
 
-/// `k × getL1FeeUpperBound` of `call`'s unsigned size at `gas_limit`: the L1 fee a
-/// refund covers.
-async fn l1_fee_bound<P: Provider>(
+/// `k × getL1FeeUpperBound` of `call`'s unsigned size at `gas_limit`, read at
+/// `block`: the L1 fee a refund covers.
+pub(crate) async fn l1_fee_bound<P: Provider>(
     provider: &P,
     config: &Config,
     call: &TransactionRequest,
     gas_limit: u64,
+    block: BlockId,
 ) -> Result<U256, Refusal> {
     if config.l1_fee == L1Fee::None {
         return Ok(U256::ZERO);
@@ -266,7 +268,7 @@ async fn l1_fee_bound<P: Provider>(
     let size = tx.build_1559().map_err(node)?.encoded_for_signing().len();
     let oracle = GasPriceOracle::new(GAS_PRICE_ORACLE, provider);
     let bound = oracle.getL1FeeUpperBound(U256::from(size));
-    let bound = bound.call().await.map_err(node)?;
+    let bound = bound.call().block(block).await.map_err(node)?;
     Ok(bound.saturating_mul(U256::from(config.l1_margin)) / U256::from(100))
 }
 

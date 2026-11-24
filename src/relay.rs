@@ -169,6 +169,21 @@ struct Attempt {
 struct Ticking {
     /// The balance at the last pinned block is below `min_balance`.
     low: bool,
+    /// The last request whose run met a node error, and the ticks in a row it did.
+    errors: (B256, u32),
+}
+
+impl Ticking {
+    /// Count a tick of node errors on `id`'s run: the ticks in a row.
+    fn strike(&mut self, id: B256) -> u32 {
+        let n = if self.errors.0 == id {
+            self.errors.1
+        } else {
+            0
+        };
+        self.errors = (id, n + 1);
+        n + 1
+    }
 }
 
 /// The relayer of one chain and one key, the only writer of the key's nonces
@@ -305,7 +320,10 @@ impl<P: Provider> Relayer<P> {
             return Err(format!("{low}: sending paused until it is funded").into());
         }
         while let Some(queued) = self.queued()? {
-            if !self.send(queued, &head, next, balance).await? {
+            if !self
+                .send(&mut ticking, queued, &head, next, balance)
+                .await?
+            {
                 break;
             }
         }
@@ -429,17 +447,34 @@ impl<P: Provider> Relayer<P> {
 
     /// Sign the queued transaction at `nonce` with its fee cap at most M × the pinned
     /// base fee and the tip read now, run it again at the pinned block, then commit
-    /// and broadcast it. True when it failed instead, and the next may be sent.
+    /// and broadcast it. True when it failed instead, and the next may be sent: its
+    /// cap or L1 bound no longer covered, its run failing for good, or a node error
+    /// on its run for `node_error_ticks` ticks in a row.
     async fn send(
         &self,
-        (id, tx, cover, deadline): Queued,
+        ticking: &mut Ticking,
+        (id, tx, (net, l1), deadline): Queued,
         head: &Head,
         nonce: u64,
         balance: U256,
     ) -> Result<bool, Error> {
         let tx: TransactionRequest = serde_json::from_str(&tx)?;
+        let (limit, value) = (tx.gas.unwrap_or_default(), tx.value.unwrap_or_default());
+        let refund = net + value;
         let cap = tx.max_fee_per_gas.unwrap_or_default();
         let cap = cap.min(head.fee_bound(&self.config));
+        if cap < head.floor {
+            let gas = U256::from(limit) * U256::from(head.floor);
+            let required = value + gas + l1;
+            return self.fail(id, &Refusal::RefundTooLow { refund, required });
+        }
+        let at = head.at();
+        let now = gas::l1_fee_bound(&self.provider, &self.config, &tx, limit, at);
+        let now = now.await.map_err(refused)?;
+        if now > l1 {
+            let required = refund + now - l1;
+            return self.fail(id, &Refusal::RefundTooLow { refund, required });
+        }
         let tip = gas::tip(&self.provider, self.config.tip_percentile).await;
         let tx = tx
             .from(self.config.relayer)
@@ -447,18 +482,22 @@ impl<P: Provider> Relayer<P> {
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
         let attempt = self.sign(tx, false, head).await?;
-        let required = affordable(&attempt.raw, cover)?;
+        let required = affordable(&attempt.raw, (net, l1))?;
         if balance < required {
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
+        let n = self.config.node_error_ticks;
         match run.await {
-            Err(Refusal::Node(e)) => return Err(e.into()),
+            Err(Refusal::Node(e)) if !deterministic(&e) && ticking.strike(id) < n => {
+                return Err(e.into());
+            }
             Err(refusal) => return self.fail(id, &refusal),
             Ok(()) => {}
         }
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, cover, None, head, nonce).await?;
+        self.broadcast(&attempt, (net, l1), None, head, nonce)
+            .await?;
         Ok(false)
     }
 
@@ -767,6 +806,12 @@ fn affordable(raw: &[u8], (net, l1): Cover) -> Result<U256, Error> {
         return Err(format!("a send costs up to {worst}, above R - value {net}").into());
     }
     Ok(worst + tx.value())
+}
+
+/// A node error that the same run meets again: one naming fees, gas or funds.
+fn deterministic(e: &str) -> bool {
+    let e = e.to_lowercase();
+    ["fee", "gas", "funds"].iter().any(|w| e.contains(w))
 }
 
 /// A failure as stored: its name and its fields.
