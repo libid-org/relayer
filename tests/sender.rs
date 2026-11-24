@@ -198,9 +198,18 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
         inclusion_window: o.config().block_time,
         ..o.config()
     };
-    let refused = Relayer::start(o.relayer.clone(), short, &crate::db("short")).await;
-    let refused = refused.err().unwrap().to_string();
-    assert!(refused.contains("inclusion_window"), "{refused}");
+    let cheap = Config {
+        max_cancel_fee_percent: o.config().max_fee_percent,
+        ..o.config()
+    };
+    for (config, setting) in [
+        (short, "inclusion_window"),
+        (cheap, "max_cancel_fee_percent"),
+    ] {
+        let refused = Relayer::start(o.relayer.clone(), config, &crate::db("bad")).await;
+        let refused = refused.err().unwrap().to_string();
+        assert!(refused.contains(setting), "{refused}");
+    }
 }
 
 /// A send left pending at a restart holds the queue: its stored raw transaction is
@@ -253,9 +262,10 @@ async fn colliding_batches_are_sent_one_at_a_time() {
 }
 
 /// A send priced out by the base fee is replaced when its window ends, long before its
-/// deadline, by a 0-value self-send at its nonce, +10% on both fees. Priced out too,
-/// the cancel is raised each new block up to the max cancel fee, then sending pauses.
-/// `cancelled`, its id is not queued again, and a new batch lands.
+/// deadline, by a 0-value self-send at its nonce, +10% on both fees and its cap at least
+/// twice the base fee. Lost by the node with the base fee below its cap, that cancel is
+/// sent again; above it, a new one is signed. `cancelled`, its id is not queued again,
+/// and a new batch lands.
 #[tokio::test]
 async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let (o, path) = (Onboarding::new(true).await, db("cancel"));
@@ -263,24 +273,30 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let (id, request, sent, _) = o.priced_out(&r).await;
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
-    let cancel = o.tx(r.status(id).await.unwrap().tx_hashes[1]).await;
-    let max = o.config().max_cancel_fee;
-    let priced_out = async |base| {
-        o.base_fee(base).await;
+    let hashes = r.status(id).await.unwrap().tx_hashes;
+    let cancel = o.tx(hashes[1]).await;
+    for _ in 0..3 {
+        o.owner.anvil_drop_transaction(hashes[1]).await.unwrap();
         o.owner.evm_mine(None).await.unwrap();
-        r.tick().await
-    };
-    priced_out(max / 2).await.unwrap(); // raised to the max
-    let paused = priced_out(2 * max).await.unwrap_err().to_string();
-    assert!(paused.contains("max_cancel_fee"), "{paused}");
-    assert!(r.paused().await);
-    priced_out(1_000_000_000).await.unwrap_err(); // the raised cancel sent again
+        r.tick().await.unwrap();
+    }
+    assert_eq!(
+        r.status(id).await.unwrap().tx_hashes,
+        hashes,
+        "raised below its cap"
+    );
+    let again = o.owner.get_transaction_by_hash(hashes[1]).await.unwrap();
+    assert!(again.is_some(), "not sent again");
+    let (c, s) = (&cancel.inner, &sent.inner);
+    o.base_fee(2 * c.max_fee_per_gas()).await;
+    o.owner.evm_mine(None).await.unwrap();
+    r.tick().await.unwrap();
+    o.base_fee(1_000_000_000).await;
     o.owner.evm_mine(None).await.unwrap();
     let cancelled = |s: &Status| matches!(s, Status::Cancelled { .. });
     let report = o.settle(&r, id, cancelled).await;
-    assert_eq!(report.tx_hashes[0], *sent.inner.tx_hash());
+    assert_eq!(report.tx_hashes[..2], hashes);
     let raised = o.tx(report.tx_hashes[2]).await;
-    let (c, s) = (&cancel.inner, &sent.inner);
     let to_self = (Some(o.relayer_address), U256::ZERO, s.nonce());
     assert_eq!((c.to(), c.value(), c.nonce()), to_self);
     assert!(c.max_fee_per_gas() * 10 >= s.max_fee_per_gas() * 11);
@@ -290,7 +306,8 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     );
     let tip = |t: &Transaction| t.inner.max_priority_fee_per_gas().unwrap();
     assert!(tip(&cancel) * 10 >= tip(&sent) * 11);
-    assert_eq!(raised.inner.max_fee_per_gas(), max, "not raised to the max");
+    let twice = 4 * c.max_fee_per_gas(); // twice the base fee it was raised at
+    assert_eq!(raised.inner.max_fee_per_gas(), twice, "not 2 × base");
     assert!(tip(&raised) * 10 >= tip(&cancel) * 11);
     drop(r);
     let r = o.start(&path).await.unwrap();
@@ -301,6 +318,24 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let retry = o.onboard(&r, 1800).await.unwrap();
     o.settle(&r, retry, included).await;
     o.assert_onboarded(o.refund()).await;
+}
+
+/// A send the node lost that no longer runs is cancelled at once, inside its window.
+#[tokio::test]
+async fn a_lost_send_that_no_longer_runs_is_cancelled_at_once() {
+    let o = Onboarding::new(true).await;
+    let r = o.start(&db("lost")).await.unwrap();
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let id = o.queue(&r).await;
+    r.tick().await.unwrap();
+    let sent = r.status(id).await.unwrap().tx_hashes[0];
+    o.owner.anvil_drop_transaction(sent).await.unwrap();
+    o.set_code(o.stack.factory, "5f5ffd").await; // the factory now reverts
+    o.owner.evm_mine(None).await.unwrap();
+    r.tick().await.unwrap();
+    let hashes = r.status(id).await.unwrap().tx_hashes;
+    assert_eq!(hashes.len(), 2, "not cancelled at once");
+    o.settle(&r, id, |s| matches!(s, Status::Cancelled)).await;
 }
 
 /// The original wins the nonce over its cancel: resolved from its receipt, no pause.

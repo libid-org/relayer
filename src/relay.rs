@@ -397,14 +397,14 @@ impl<P: Provider> Relayer<P> {
         })
     }
 
-    /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a
-    /// refused first send or a cancel above the max cancel fee.
+    /// Whether sending paused: a foreign nonce, a balance below `min_balance` or a
+    /// refused first send.
     pub async fn paused(&self) -> bool {
         self.paused.load(Relaxed) || self.ticking.lock().await.low
     }
 
     /// Resolve `id` from a receipt of any of its attempts. With none, broadcast its send
-    /// again until its window ends, then cancel it, raising the cancel each new block.
+    /// again until its window ends or it no longer runs, then cancel it.
     async fn watch(
         &self,
         id: B256,
@@ -431,12 +431,12 @@ impl<P: Provider> Relayer<P> {
             return Ok(());
         };
         let late = self.late(send.at);
-        if !last.cancel && head.time < late {
-            let run = Some((deadline, late));
-            return self.broadcast(last, cover, run, head, mined).await;
-        }
-        if last.cancel && head.number <= last.block {
-            return self.broadcast(last, cover, None, head, mined).await;
+        let run = Some((deadline, late));
+        if !last.cancel
+            && head.time < late
+            && self.broadcast(last, cover, run, head, mined).await?
+        {
+            return Ok(());
         }
         if mined > last.nonce {
             self.paused.store(true, Relaxed); // another sender's at our nonce
@@ -507,9 +507,10 @@ impl<P: Provider> Relayer<P> {
         Ok(true)
     }
 
-    /// A 0-value self-send at `last`'s nonce, both fees at least 1.1× `last`'s and its
-    /// cap twice the pinned base fee, up to the max cancel fee. Above it sending pauses
-    /// and the last cancel is sent again.
+    /// A 0-value self-send at `last`'s nonce. The last cancel is sent again while the
+    /// pinned base fee is at most its cap; past it, a new one is signed with its cap
+    /// `max(1.1× last's, 2× base fee)` and the market's tip, at least 1.1× last's, up to
+    /// the max cancel fee. Above that the last cancel is sent again, the queue held.
     async fn cancel(
         &self,
         id: B256,
@@ -518,17 +519,23 @@ impl<P: Provider> Relayer<P> {
         mined: u64,
     ) -> Result<(), Error> {
         let tx = TxEnvelope::decode_2718(&mut &last.raw[..])?;
+        let again = || self.broadcast(last, Default::default(), None, head, mined);
+        if last.cancel && head.base_fee <= tx.max_fee_per_gas() {
+            return again().await.map(drop);
+        }
         let more = |fee: u128| fee.saturating_mul(11).div_ceil(10);
-        let (least, max) = (more(tx.max_fee_per_gas()), self.config.max_cancel_fee);
+        let percent = self.config.max_cancel_fee_percent.into();
+        let (least, max) = (
+            more(tx.max_fee_per_gas()),
+            head.base_fee.saturating_mul(percent) / 100,
+        );
         if least > max {
-            self.paused.store(true, Relaxed);
             if last.cancel {
-                self.broadcast(last, Default::default(), None, head, mined)
-                    .await?;
+                again().await?;
             }
             let n = last.nonce;
             let above = format!("the cancel at nonce {n} needs a fee cap above {max}");
-            return Err(format!("{above}: sending paused; raise max_cancel_fee").into());
+            return Err(format!("{above}: raise max_cancel_fee_percent").into());
         }
         let cap = least.max(head.base_fee.saturating_mul(2)).min(max);
         let tip = gas::tip(&self.provider, CANCEL_PERCENTILE)
@@ -548,6 +555,7 @@ impl<P: Provider> Relayer<P> {
         self.commit(id, &attempt)?;
         self.broadcast(&attempt, Default::default(), None, head, mined)
             .await
+            .map(drop)
     }
 
     /// The end of the inclusion window of a send signed at `at`.
@@ -591,7 +599,7 @@ impl<P: Provider> Relayer<P> {
 
     /// Broadcast `a` unless the node has it. Its nonce mined with no receipt of ours
     /// is another sender's, and sending pauses. With `run`, a send's deadline and
-    /// window end, a send that no longer runs at `head` is left to its cancel.
+    /// window end, false when a send no longer runs at `head`, to cancel at once.
     async fn broadcast(
         &self,
         a: &Attempt,
@@ -599,27 +607,27 @@ impl<P: Provider> Relayer<P> {
         run: Option<(u64, u64)>,
         head: &Head,
         mined: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         if !a.cancel {
             affordable(&a.raw, cover)?;
         }
         let known = self.provider.get_transaction_by_hash(a.hash).await?;
         if known.is_some() {
-            return Ok(());
+            return Ok(true);
         }
         if mined > a.nonce {
             self.paused.store(true, Relaxed);
-            return Ok(());
+            return Ok(true);
         }
         if let Some((deadline, late)) = run {
             match self.runs(&a.raw, deadline, head, late).await {
                 Err(Refusal::Node(e)) => return Err(e.into()),
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(false),
                 Ok(()) => {}
             }
         }
         let Err(e) = self.provider.send_raw_transaction(&a.raw).await else {
-            return Ok(());
+            return Ok(true);
         };
         // The node may hold `a` unless it answered with an error and has no such hash.
         let first = run.is_none() && !a.cancel;
@@ -631,13 +639,13 @@ impl<P: Provider> Relayer<P> {
                 .is_none();
         if !first || !rejected {
             eprintln!("broadcast of {} refused, retried next tick: {e}", a.hash);
-            return Ok(());
+            return Ok(true);
         }
         self.uncommit(a)?;
         if e.as_error_resp()
             .is_some_and(|r| r.message.contains("nonce too low"))
         {
-            return Ok(()); // checked again from the next tick's block
+            return Ok(true); // checked again from the next tick's block
         }
         self.paused.store(true, Relaxed);
         Err(format!("the node refused send {}: {e}; sending paused", a.hash).into())

@@ -127,8 +127,9 @@ pub struct Config {
     /// M: a send's fee cap is at most M percent of the pinned block's base fee, at
     /// least the base fee rule's growth over the inclusion window.
     pub max_fee_percent: u64,
-    /// The highest fee cap a cancel is raised to, in wei per gas.
-    pub max_cancel_fee: u128,
+    /// The highest fee cap a cancel is raised to, in percent of the pinned block's
+    /// base fee: at least 1.1 × M, so a cancel can replace any send.
+    pub max_cancel_fee_percent: u64,
     /// The balance below which sending pauses, in wei.
     pub min_balance: U256,
     /// The ticks in a row a node error on the oldest queued request's run holds the
@@ -139,7 +140,7 @@ pub struct Config {
 impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
-    /// growth over the window, cancels up to 10,000 gwei, no balance floor, and 5
+    /// growth over the window, cancels up to 10× the base fee, no balance floor, and 5
     /// ticks of node errors on a request.
     pub fn anvil(
         chain_id: u64,
@@ -160,7 +161,7 @@ impl Config {
             fee_params: FeeParams::Fixed(Eip1559::L1),
             tip_percentile: TIP_PERCENTILE,
             max_fee_percent: 0,
-            max_cancel_fee: 10_000_000_000_000,
+            max_cancel_fee_percent: 1000,
             min_balance: U256::ZERO,
             node_error_ticks: 5,
         };
@@ -170,12 +171,18 @@ impl Config {
     }
 
     /// Refuses settings the sender cannot keep: an inclusion window shorter than
-    /// two blocks.
+    /// two blocks, or a max cancel fee below 1.1 × M.
     pub fn validate(&self) -> Result<(), String> {
         if self.inclusion_window < 2 * self.block_time {
             let (w, b) = (self.inclusion_window, self.block_time);
             return Err(format!(
                 "inclusion_window {w:?} is under twice block_time {b:?}; raise it"
+            ));
+        }
+        let (cancel, m) = (self.max_cancel_fee_percent, self.max_fee_percent);
+        if u128::from(cancel) * 10 < u128::from(m) * 11 {
+            return Err(format!(
+                "max_cancel_fee_percent {cancel} is under 1.1 × max_fee_percent {m}; raise it"
             ));
         }
         Ok(())
