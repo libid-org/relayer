@@ -362,10 +362,10 @@ impl Onboarding {
     }
 }
 
-/// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 2 on the
-/// create path and 1 otherwise.
+/// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the
+/// create path and 2 otherwise.
 fn reserve(call_gas: u64, create: bool) -> u64 {
-    let d = if create { 2 } else { 1 };
+    let d = if create { 4 } else { 2 };
     ((call_gas + CALL_OVERHEAD) * 64u64.pow(d)).div_ceil(63u64.pow(d))
 }
 

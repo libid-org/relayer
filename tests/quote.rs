@@ -104,7 +104,8 @@ impl Onboarding {
 
     /// This test's own `eth_simulateV1` of the outer call for `data`.
     async fn simulated(&self, data: &Bytes, value: U256) -> SimCallResult {
-        let calls = vec![self.outer(data, value).await];
+        let outer = self.outer(data, value).await; // at the block's gas limit
+        let calls = vec![TransactionRequest { gas: None, ..outer }];
         let block_state_calls = vec![SimBlock {
             calls,
             ..Default::default()
@@ -349,6 +350,48 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         matches!(refused, Some(Refusal::RefundMissing)),
         "{refused:?}"
     );
+}
+
+/// A `callGas` far beyond the 1.25 margin, on the create path and then on the wallet
+/// it created: the same data one 64/63 factor of the reserve below the relay-time
+/// limit reverts `InsufficientCallGas`, and the relayer lands it at that limit.
+#[tokio::test]
+async fn a_large_call_gas_lands_at_the_relay_time_limit() {
+    let o = Onboarding::on(Anvil::new().args(["--gas-limit", "60000000"]), true).await;
+    let r = U256::from(CLAIMED / 10);
+    let onboarding = Batch(o.onboarding(), o.value, vec![&o.k], None);
+    let repay = Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None);
+    for (b, times) in [(onboarding, 20), (repay, 50)] {
+        let call_gas = times * o.quote_with(&o.config(), &b).await.call_gas;
+        let data = o.authorize(&b, Some(call_gas)).await;
+        let limit = o.limit(&data, b.1, call_gas).await;
+        let short = limit - reserve(call_gas, o.path().await.is_some()) / 64;
+        let tx = o.outer(&data, b.1).await.with_gas_limit(short);
+        let e = o.relayer.call(tx).await.unwrap_err();
+        let revert = e.as_error_resp().and_then(|r| r.as_revert_data());
+        let revert = revert.unwrap_or_default();
+        assert_eq!(
+            revert[..4],
+            IWebWallet::InsufficientCallGas::SELECTOR,
+            "{e}"
+        );
+        let checked = o.relay(&data, limit + 2).await.unwrap();
+        let hash = chain::send(&o.relayer, checked)
+            .await
+            .unwrap()
+            .transaction_hash;
+        let tx = o
+            .owner
+            .get_transaction_by_hash(hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let sent = tx.inner.gas_limit();
+        assert!(
+            sent.abs_diff(limit) <= 2,
+            "sent at {sent}, expected {limit}"
+        );
+    }
 }
 
 #[tokio::test]
