@@ -158,7 +158,8 @@ impl Settings {
             limits,
         } = parse(path)?;
         if let Some(file) = &chain.network_file {
-            let Network { network } = parse(&base.join(file))?;
+            let named = |e| format!("network_file {}: {e}", file.display());
+            let Network { network } = parse(&base.join(file)).map_err(named)?;
             let (theirs, ours) = (network.chain_id, chain.chain_id);
             if theirs != ours {
                 let file = file.display();
@@ -211,7 +212,8 @@ impl Settings {
 }
 
 /// The TOML file at `path`; an error is placed by line and column without the source
-/// line toml quotes, which may hold a key.
+/// line toml quotes, which may hold a key, and a file that cannot be read is its
+/// `std::io::Error`.
 fn parse<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
     let text = std::fs::read_to_string(path)?;
     toml::from_str(&text).map_err(|e| {
@@ -224,8 +226,8 @@ fn parse<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
                 .chars()
                 .count();
             let line = before.matches('\n').count() + 1;
-            format!(", line {line}, column {}", column + 1)
+            format!("line {line}, column {}: ", column + 1)
         });
-        format!("{}{at}: {}", path.display(), e.message()).into()
+        format!("{at}{}", e.message()).into()
     })
 }

@@ -41,6 +41,21 @@ struct Server {
 impl Server {
     /// `o`'s relayer under `config`, ticking every `every`.
     async fn start(o: &Onboarding, config: Config, db: &Path, every: Duration) -> Self {
+        let limits = Limits {
+            timeout: Duration::from_secs(30),
+            concurrency: 8,
+        };
+        Self::within(o, config, db, every, limits).await
+    }
+
+    /// [`Self::start`], its API within `limits`.
+    async fn within(
+        o: &Onboarding,
+        config: Config,
+        db: &Path,
+        every: Duration,
+        limits: Limits,
+    ) -> Self {
         let relayer = Relayer::start(o.relayer.clone(), config, db).await.unwrap();
         let service = Service::new(relayer, Duration::from_secs(5));
         let bind = || tokio::net::TcpListener::bind("127.0.0.1:0");
@@ -48,10 +63,6 @@ impl Server {
         let at =
             |l: &tokio::net::TcpListener| format!("http://{}", l.local_addr().unwrap());
         let (url, metrics_url) = (at(&api), at(&metrics));
-        let limits = Limits {
-            timeout: Duration::from_secs(30),
-            concurrency: 8,
-        };
         let listeners = (api, metrics);
         let serving = serve(
             service.clone(),
@@ -203,6 +214,12 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
     assert_eq!(stats.cancel_rate, 0.0);
     assert_eq!(stats.cost_ratio, Some(f64::from(cost) / f64::from(net)));
     assert!(stats.inclusion_seconds.is_some());
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    ledger
+        .execute("UPDATE attempts SET sent_at = sent_at + 60", [])
+        .unwrap();
+    let stepped = relayer::stats::stats(&path).unwrap().inclusion_seconds;
+    assert_eq!(stepped, Some([0; 3]), "a clock step back");
 
     let noncanonical = json!({"wallet": o.wallet, "data": "0x00", "gasLimit": GAS_LIMIT});
     let (code, refused) = s.call("/v1/relay", Some(noncanonical)).await;
@@ -252,6 +269,15 @@ async fn refusals_carry_their_decoded_names() {
     assert_eq!(quoted, relayed);
     assert_eq!((code, name(&quoted)), (400, "NothingHeld"), "{quoted}");
     assert_eq!(quoted["error"]["contract"], "HandleEscrow");
+    let limits = Limits {
+        timeout: Duration::from_nanos(1),
+        concurrency: 1,
+    };
+    let every = Duration::from_secs(3600);
+    let slow = Server::within(&o, o.config(), &db("slow"), every, limits).await;
+    let timed_out = slow.call("/v1/quote", Some(wire(&unclaimed))).await.0;
+    let health = slow.call("/health", None).await.0; // outside the limits
+    assert_eq!((timed_out, health), (408, 503));
     let (code, bad) = s.call("/v1/quote", Some(json!({"wallet": 1}))).await;
     assert_eq!((code, name(&bad)), (400, "BadRequest"));
     let (_, config) = s.call("/v1/config", None).await;

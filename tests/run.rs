@@ -128,8 +128,27 @@ async fn each_startup_check_refuses_with_its_hint() {
     }
 }
 
-/// `relayer` started from a file, its key and RPC URL marked: help, a missing file, a
-/// mangled key and a wrong chain exit with their hints; `run` serves `/health`,
+/// A binary's exit: its file, its environment, its arguments and its hint; none when
+/// it succeeds.
+type Exit<'a> = (
+    &'a PathBuf,
+    &'a [(&'a str, &'a str)],
+    &'a [&'a str],
+    &'a str,
+);
+
+/// A child process, killed when dropped.
+struct Killed(std::process::Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+/// `relayer` started from a file holding its key and RPC URL, both marked: help, a
+/// missing file, a mangled key, a wrong chain, an unknown key, the key pasted as the
+/// address and a missing network file exit with their hints; `run` serves `/health`,
 /// `/v1/config`, a quote and a relay; with the node gone, its errors log the URL
 /// redacted; an interrupt stops it. No output carries a marker.
 #[tokio::test]
@@ -140,54 +159,67 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
     o.relayer_address = signer.address();
     o.set_balance(signer.address(), U256::from(CLAIMED)).await;
     let port = o._anvil.port();
-    let rpc = format!("http://user:{URL_MARKER}@127.0.0.1:{port}/?key={URL_MARKER}");
+    let rpc = format!(
+        "rpc_url = \"http://user:{URL_MARKER}@127.0.0.1:{port}/?key={URL_MARKER}\""
+    );
+    let (chain, signed) = (
+        format!("chain_id = {}", o.chain_id),
+        format!("signer = \"{key}\""),
+    );
     let fixed = "{ fixed = { denominator = 8, elasticity = 2, min_base_fee = 0 } }";
-    let file = |chain_id: u64| {
-        let chain = chain_id.to_string();
-        let anvil = [
-            ("84532", chain.as_str()),
-            ("\"op-stack\"", "\"none\""),
-            ("\"header\"", fixed),
-            ("max_fee_percent = 200", "max_fee_percent = 181"),
-            ("\"200ms\"", "\"1s\""),
-            ("poll_interval = \"1s\"", "poll_interval = \"100ms\""),
-            ("\"10s\"", "\"5s\""),
-            ("port = 8080", "port = 0"),
-            ("metrics_port = 9090", "metrics_port = 0"),
-            ("\"1000000000000000\"", "\"1000000000000000000\""),
-        ];
-        let mut text = anvil
-            .iter()
-            .fold(EXAMPLE.to_owned(), |t, (a, b)| t.replace(a, b));
+    let file = |extra: &[(&str, &str)]| {
+        let mut text = EXAMPLE.to_owned();
         for at in [o.stack.factory, o.stack.forwarder, signer.address()] {
             text = text.replacen(&Address::ZERO.to_string(), &at.to_string(), 1);
         }
-        write("run", &text)
-    };
-    let relayer = |config: &Path, signer: &str, args: &[&str]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_relayer"));
-        let env = [
-            ("RUST_LOG", "trace"),
-            ("RELAYER_SIGNER", signer),
-            ("RELAYER_RPC_URL", &rpc),
+        #[rustfmt::skip]
+        let anvil = [
+            ("rpc_url = \"https://sepolia.base.org\"", rpc.as_str()),
+            ("# signer = \"alias/libid-relayer\"", &signed),
+            ("chain_id = 84532", &chain), ("\"op-stack\"", "\"none\""), ("\"header\"", fixed),
+            ("max_fee_percent = 200", "max_fee_percent = 181"), ("\"200ms\"", "\"1s\""),
+            ("poll_interval = \"1s\"", "poll_interval = \"100ms\""), ("\"10s\"", "\"5s\""),
+            ("port = 8080", "port = 0"), ("metrics_port = 9090", "metrics_port = 0"),
+            ("\"1000000000000000\"", "\"1000000000000000000\""),
         ];
-        command.arg("--config").arg(config).args(args).envs(env);
+        let pairs = anvil.iter().chain(extra);
+        write("run", &pairs.fold(text, |t, (a, b)| t.replace(a, b)))
+    };
+    let relayer = |config: &Path, env: &[(&str, &str)], args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_relayer"));
+        command.arg("--config").arg(config).args(args);
+        command.env("RUST_LOG", "trace").envs(env.iter().copied());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command
     };
-    let mut seen = String::new();
-    let (good, wrong, mangled) = (file(o.chain_id), file(1), format!("{KEY_MARKER}0"));
-    let nowhere = PathBuf::from("nowhere.toml");
+    let (address, mangled) = (
+        format!("address = \"{}\"", signer.address()),
+        format!("{KEY_MARKER}0"),
+    );
+    let (pasted, limit) = (format!("address = \"{key}\""), "concurrency_limit = 64");
+    let network =
+        "# network_file = \"../chain-configurations/networks/base-sepolia.toml\"";
+    let (good, wrong) = (file(&[]), file(&[(&chain, "chain_id = 1")]));
+    let unknown = file(&[(limit, "concurrency_limit = 64\ncolour = 1")]);
+    let (pasted, lost) = (
+        file(&[(&address, &pasted)]),
+        file(&[(network, "network_file = \"lost.toml\"")]),
+    );
+    let (nowhere, none) = (PathBuf::from("nowhere.toml"), &[][..]);
     #[rustfmt::skip]
-    let exits = [
-        (&good, &key, &["--help"][..], ""),
-        (&good, &key, &["run", "--help"], ""),
-        (&nowhere, &key, &["run"], "--config or RELAYER_CONFIG"),
-        (&good, &mangled, &["run"], "fix RELAYER_SIGNER"),
-        (&wrong, &key, &["run"], "point rpc_url at it"),
+    let exits: [Exit; 8] = [
+        (&good, none, &["--help"], ""),
+        (&good, none, &["run", "--help"], ""),
+        (&nowhere, none, &["run"], "--config or RELAYER_CONFIG"),
+        (&good, &[("RELAYER_SIGNER", &mangled)], &["run"], "fix RELAYER_SIGNER"),
+        (&wrong, none, &["run"], "point rpc_url at it"),
+        (&unknown, none, &["run"], "unknown field `colour`"),
+        (&pasted, none, &["run"], "column 11"),
+        (&lost, none, &["run"], "network_file lost.toml: No such file"),
     ];
-    for (config, signer, args, hint) in exits {
-        let out = relayer(config, signer, args).output().unwrap();
+    let mut seen = String::new();
+    for (config, env, args, hint) in exits {
+        let out = relayer(config, env, args).output().unwrap();
         let text =
             String::from_utf8_lossy(&[out.stdout, out.stderr].concat()).into_owned();
         assert_eq!(out.status.success(), hint.is_empty(), "{text}");
@@ -197,10 +229,12 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
 
     let log = good.with_file_name("relayer.log");
     let stdout = std::fs::File::create(&log).unwrap();
-    let mut child = relayer(&good, &key, &["run"])
+    let stderr = stdout.try_clone().unwrap();
+    let child = relayer(&good, none, &["run"])
         .stdout(stdout)
-        .spawn()
-        .unwrap();
+        .stderr(stderr)
+        .spawn();
+    let mut child = Killed(child.unwrap());
     let logs = || std::fs::read_to_string(&log).unwrap();
     let mut ports = vec![];
     for _ in 0..600 {
@@ -221,12 +255,15 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
         let response = request.send().await.unwrap();
         (response.status().as_u16(), response.text().await.unwrap())
     };
+    let mut healthy = false;
     for _ in 0..50 {
-        if call(0, "/health", None).await.0 == 200 {
+        healthy = call(0, "/health", None).await.0 == 200;
+        if healthy {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(healthy, "no tick succeeded: {}", logs());
     let config: Value =
         serde_json::from_str(&call(0, "/v1/config", None).await.1).unwrap();
     assert_eq!(config["relayer"], json!(signer.address()));
@@ -247,9 +284,9 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
     let unreachable = call(0, "/v1/quote", Some(&wire)).await;
     assert_eq!(unreachable.0, 503, "{unreachable:?}");
     answered.push_str(&unreachable.1);
-    let pid = child.id().to_string();
+    let pid = child.0.id().to_string();
     Command::new("kill").args(["-INT", &pid]).status().unwrap();
-    assert!(child.wait().unwrap().success(), "not shut down");
+    assert!(child.0.wait().unwrap().success(), "not shut down");
     let (logs, all) = (logs(), [logs(), seen, answered].concat().to_lowercase());
     for marker in [KEY_MARKER, URL_MARKER] {
         assert!(!all.contains(marker), "{marker} in an output: {all}");

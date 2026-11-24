@@ -301,7 +301,10 @@ impl<P: Provider> Relayer<P> {
     /// Check `request` and queue it under its id, within the loss budgets: its id and
     /// status. The same request again returns its id and stored status unchecked; one
     /// that failed is queued again under it.
-    pub async fn submit(&self, request: &Request) -> Result<(B256, String), Refusal> {
+    pub(crate) async fn submit(
+        &self,
+        request: &Request,
+    ) -> Result<(B256, String), Refusal> {
         let (message, ..) = decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
         let (p, c, wallet) = (&self.provider, &self.config, request.wallet);
         let call = outer(c, wallet, request.create, &request.data, message.value);
@@ -514,7 +517,7 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// The key's balance at the last tick's pinned block.
-    pub fn balance(&self) -> Option<U256> {
+    pub(crate) fn balance(&self) -> Option<U256> {
         *self.balance.lock().unwrap_or_else(PoisonError::into_inner)
     }
 

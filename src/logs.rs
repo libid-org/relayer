@@ -45,7 +45,7 @@ pub fn init(rpc_url: Option<&str>, signer: Option<&str>) {
 /// parsed and without its userinfo, as reqwest's errors name it; then its userinfo,
 /// path and query; the spec, with and without `0x`. A part under 4 characters is
 /// left, so as not to rewrite unrelated text.
-pub fn redactions(rpc_url: Option<&str>, signer: Option<&str>) -> Vec<(String, String)> {
+fn redactions(rpc_url: Option<&str>, signer: Option<&str>) -> Vec<(String, String)> {
     let mut secrets = vec![];
     if let Some(raw) = rpc_url {
         let url = Url::parse(raw).ok();

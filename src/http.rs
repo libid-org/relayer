@@ -163,7 +163,8 @@ impl<P: Provider + 'static> Service<P> {
     }
 }
 
-/// Serve `service`'s API on `api` within `limits` and its metrics on `metrics`,
+/// Serve `service`'s API on `api`, all but `/health` within `limits`, and its metrics
+/// on `metrics`,
 /// ticking every `every` from one `every` on, until `shutdown` resolves; requests in
 /// flight finish first.
 pub async fn serve<P: Provider + 'static>(
@@ -189,13 +190,14 @@ pub async fn serve<P: Provider + 'static>(
         .route(QUOTE_PATH, post(quote))
         .route(RELAY_PATH, post(relay))
         .route(STATUS_PATH, get(status))
-        .route(HEALTH_PATH, get(health))
-        .fallback(|| async { C::NOT_FOUND })
         .layer(GlobalConcurrencyLimitLayer::new(limits.concurrency))
         .layer(TimeoutLayer::with_status_code(
             C::REQUEST_TIMEOUT,
             limits.timeout,
         ))
+        // Outside the limits: a saturated API still answers its healthcheck.
+        .route(HEALTH_PATH, get(health))
+        .fallback(|| async { C::NOT_FOUND })
         .layer(map_response(standing_headers))
         .with_state(service.clone());
     let scrape = Router::new()
