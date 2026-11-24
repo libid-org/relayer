@@ -7,6 +7,7 @@ use std::{
 };
 
 use alloy::{
+    eips::BlockId,
     network::TransactionBuilder,
     primitives::{
         Address,
@@ -166,7 +167,7 @@ pub async fn check<P: Provider>(
         .with_max_fee_per_gas(cap)
         .with_max_priority_fee_per_gas(tip)
         .with_chain_id(config.chain_id);
-    simulate(provider, &tx, late).await?;
+    simulate(provider, &tx, None, late).await?;
     Ok(Checked {
         tx,
         net,
@@ -235,6 +236,12 @@ async fn unexpired<P: Provider>(
     let late = gas::latest_time(provider)
         .await?
         .saturating_add(window.as_secs());
+    covered(deadline, late)
+}
+
+/// `late`, unless `deadline` falls before it.
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+fn covered(deadline: u64, late: u64) -> Result<u64, Refusal> {
     if deadline < late {
         return Err(Refusal::Expired);
     }
@@ -275,21 +282,25 @@ pub(crate) async fn target<P: Provider>(
     Ok(call.with_to(wallet).with_input(input))
 }
 
-/// `tx`, as it is sent, still runs before `deadline` until the inclusion window ends.
+/// `tx`, as it is sent, still runs after the block `at` and at `late`, which
+/// `deadline` is not before.
 pub(crate) async fn rerun<P: Provider>(
     provider: &P,
-    config: &Config,
     tx: &TransactionRequest,
     deadline: u64,
+    at: B256,
+    late: u64,
 ) -> Result<(), Refusal> {
-    let late = unexpired(provider, deadline, config.inclusion_window).await?;
-    simulate(provider, tx, late).await
+    let late = covered(deadline, late)?;
+    simulate(provider, tx, Some(at.into()), late).await
 }
 
-/// `tx` runs without reverting on the latest block, and with its timestamp at `late`.
+/// `tx` runs without reverting after `block`, latest by default, and with its
+/// timestamp at `late`.
 async fn simulate<P: Provider>(
     provider: &P,
     tx: &TransactionRequest,
+    block: Option<BlockId>,
     late: u64,
 ) -> Result<(), Refusal> {
     let at_late = BlockOverrides {
@@ -299,6 +310,7 @@ async fn simulate<P: Provider>(
     for overrides in [None, Some(at_late)] {
         let call = provider
             .call(tx.clone())
+            .block_opt(block)
             .with_block_overrides_opt(overrides);
         call.await.map_err(refusal)?;
     }

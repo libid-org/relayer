@@ -161,19 +161,42 @@ impl Onboarding {
                 .deposit(stack.platform, handle, native, amount)
                 .value(amount));
         }
+        let registry = WalletRegistry::new(stack.wallet_registry, &owner);
+        let value = registry.quote(stack.platform, 2).call().await.unwrap();
+        assert!(value > U256::ZERO, "the relayer fronts no value");
         let create = Create {
             platform_id: stack.platform,
             id_node,
             salt: U256::ZERO,
         };
-        let factory = WalletFactory::new(stack.factory, &owner);
-        let wallet = factory.walletAddress(stack.platform, id_node, U256::ZERO);
-        let wallet = wallet.call().await.unwrap();
-        let registry = WalletRegistry::new(stack.wallet_registry, &owner);
-        let value = registry.quote(stack.platform, 2).call().await.unwrap();
-        assert!(value > U256::ZERO, "the relayer fronts no value");
-        let k = PrivateKeySigner::random();
-        let link = transaction_data(chain_id, wallet, wallet, &key_of(&k), &admin());
+        let mut o = Self {
+            _anvil: anvil,
+            owner,
+            relayer,
+            relayer_address,
+            stack,
+            chain_id,
+            k: PrivateKeySigner::random(),
+            create,
+            wallet: Address::ZERO,
+            handle,
+            native,
+            list: Bytes::new(),
+            value,
+        };
+        o.wallet_at(U256::ZERO).await;
+        o
+    }
+
+    /// A fresh K onboarding the identity's wallet at `salt`.
+    async fn wallet_at(&mut self, salt: U256) {
+        self.create.salt = salt;
+        let (c, factory) = (self.create, WalletFactory::new(self.stack.factory, &self.owner));
+        let wallet = factory.walletAddress(c.platform_id, c.id_node, salt);
+        self.wallet = wallet.call().await.unwrap();
+        self.k = PrivateKeySigner::random();
+        let (chain_id, wallet) = (self.chain_id, self.wallet);
+        let link = transaction_data(chain_id, wallet, wallet, &key_of(&self.k), &admin());
         let operations = vec![
             Operation::bind(wallet),
             Operation {
@@ -181,27 +204,12 @@ impl Onboarding {
                 data: link,
             },
         ];
-        let list = stub_payload(&StubPayload {
+        self.list = stub_payload(&StubPayload {
             ceremonyVersion: 1,
             operationDomain: OPERATIONS_DOMAIN,
             authorizationNonce: B256::repeat_byte(1),
             transactionData: operations.abi_encode().into(),
         });
-        Self {
-            _anvil: anvil,
-            owner,
-            relayer,
-            relayer_address,
-            stack,
-            chain_id,
-            k,
-            create,
-            wallet,
-            handle,
-            native,
-            list,
-            value,
-        }
     }
 
     fn config(&self) -> Config {
@@ -337,9 +345,9 @@ impl Onboarding {
     }
 
     /// Ticks and mines until `id`'s status is `done`.
-    async fn settle(
+    async fn settle<P: Provider>(
         &self,
-        r: &Relayer<DynProvider>,
+        r: &Relayer<P>,
         id: B256,
         done: fn(&Status) -> bool,
     ) -> Report {
@@ -440,7 +448,7 @@ fn db(name: &str) -> PathBuf {
 }
 
 fn included(s: &Status) -> bool {
-    matches!(s, Status::Included { .. } | Status::Confirmed { .. })
+    matches!(s, Status::Included { .. })
 }
 
 /// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the

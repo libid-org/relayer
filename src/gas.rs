@@ -3,15 +3,13 @@
 use std::time::Duration;
 
 use alloy::{
-    consensus::{
-        Header,
-        SignableTransaction,
-    },
+    consensus::SignableTransaction,
     eips::BlockNumberOrTag,
     network::TransactionBuilder,
     primitives::{
         address,
         Address,
+        B256,
         U256,
     },
     providers::Provider,
@@ -22,6 +20,7 @@ use alloy::{
             SimulatePayload,
         },
         BlockOverrides,
+        Header,
         TransactionRequest,
     },
 };
@@ -141,10 +140,37 @@ pub(crate) async fn latest_time<P: Provider>(provider: &P) -> Result<u64, Refusa
     Ok(latest(provider).await?.timestamp)
 }
 
+/// The block a send is pinned to: its nonce, balance and runs are read at `hash`.
+pub(crate) struct Head {
+    pub(crate) hash: B256,
+    pub(crate) number: u64,
+    pub(crate) time: u64,
+    pub(crate) base_fee: u128,
+}
+
+impl Head {
+    /// M × its base fee: the most a send's fee cap is.
+    pub(crate) fn fee_bound(&self, config: &Config) -> u128 {
+        let m = config.max_fee_percent.into();
+        self.base_fee.saturating_mul(m) / 100
+    }
+}
+
+/// The latest block, to pin.
+pub(crate) async fn head<P: Provider>(provider: &P) -> Result<Head, Refusal> {
+    let latest = latest(provider).await?;
+    Ok(Head {
+        hash: latest.hash,
+        number: latest.number,
+        time: latest.timestamp,
+        base_fee: latest.base_fee_per_gas.unwrap_or_default().into(),
+    })
+}
+
 async fn latest<P: Provider>(provider: &P) -> Result<Header, Refusal> {
     let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
     let latest = latest.await.map_err(node)?;
-    Ok(latest.ok_or_else(|| node("no latest block"))?.header.inner)
+    Ok(latest.ok_or_else(|| node("no latest block"))?.header)
 }
 
 /// `tx` run once with `eth_simulateV1` after the latest block, in a block at `time`.

@@ -159,7 +159,7 @@ impl Config {
     }
 
     /// The blocks in `time`, at the chain's block time.
-    pub fn blocks(&self, time: Duration) -> u128 {
+    pub(crate) fn blocks(&self, time: Duration) -> u128 {
         time.as_millis() / self.block_time.as_millis().max(1)
     }
 }

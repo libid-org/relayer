@@ -1,5 +1,6 @@
-//! The sender: requests and their send attempts kept in SQLite, sent by the one
-//! writer of the key's nonces, watched to a receipt, and cancelled at their deadline.
+//! The sender: requests and their send attempts kept in SQLite, sent one at a time
+//! by the one writer of the key's nonces, each at a pinned block, watched to a
+//! receipt, and cancelled when their inclusion window ends.
 
 use std::{
     collections::BTreeSet,
@@ -17,7 +18,6 @@ use std::{
         MutexGuard,
         PoisonError,
     },
-    time::Duration,
 };
 
 use alloy::{
@@ -26,7 +26,6 @@ use alloy::{
         TxEnvelope,
     },
     eips::{
-        BlockNumberOrTag,
         Decodable2718,
         Encodable2718,
     },
@@ -67,7 +66,10 @@ use crate::{
         Request,
     },
     config::Config,
-    gas,
+    gas::{
+        self,
+        Head,
+    },
 };
 
 /// Why the relayer did not start or tick.
@@ -90,8 +92,15 @@ const SCHEMA: &str = "
         included_at INTEGER);
     CREATE TABLE attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
         nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL,
+        block INTEGER NOT NULL, at INTEGER NOT NULL,
         sent_at INTEGER NOT NULL DEFAULT (unixepoch()));
+    CREATE INDEX attempts_nonce ON attempts (nonce);
     CREATE TABLE nonce (next INTEGER NOT NULL);";
+
+/// A request in flight, over `requests r JOIN attempts a` and the key's mined count
+/// `?1`: sent, or ended at a nonce the count no longer covers.
+const IN_FLIGHT: &str =
+    "r.status = 'sent' OR (r.status IN ('included', 'cancelled') AND a.nonce >= ?1)";
 
 /// Where a request stands.
 #[derive(Debug)]
@@ -107,14 +116,7 @@ pub enum Status {
         /// The batch reverted.
         reverted: bool,
     },
-    /// Included at or below the safe head.
-    Confirmed {
-        /// The block of its receipt.
-        block: u64,
-        /// The batch reverted.
-        reverted: bool,
-    },
-    /// Replaced at its deadline by a cancel that landed; not queued again.
+    /// Replaced by a cancel that landed; not queued again.
     Cancelled,
     /// Refused before its first broadcast; queued again when relayed again.
     Failed(Refusal),
@@ -125,7 +127,7 @@ pub enum Status {
 pub struct Report {
     /// Where the request stands.
     pub status: Status,
-    /// Its send, then its cancel if any.
+    /// Its send, then its cancels.
     pub tx_hashes: Vec<B256>,
     /// When each of `tx_hashes` was committed, in unix seconds.
     pub sent_at: Vec<u64>,
@@ -154,6 +156,9 @@ struct Attempt {
     nonce: u64,
     cancel: bool,
     raw: Bytes,
+    /// The number and time of the block it was signed at.
+    block: u64,
+    at: u64,
 }
 
 /// The relayer of one chain and one key, the only writer of the key's nonces
@@ -252,38 +257,47 @@ impl<P: Provider> Relayer<P> {
         Ok(id)
     }
 
-    /// Resolve or rebroadcast every sent request, then send the queued ones unless
-    /// sending paused.
+    /// Resolve or rebroadcast each request in flight, then send the oldest queued one
+    /// when none is in flight and the key's count at the pinned block is the stored
+    /// next nonce. Above it a foreign nonce pauses sending; below it ours is unmined.
     pub async fn tick(&self) -> Result<(), Error> {
+        let head = gas::head(&self.provider).await.map_err(refused)?;
         let mined = self.provider.get_transaction_count(self.config.relayer);
-        let mined = mined.latest().await?;
-        for (id, deadline, cover) in self.in_flight()? {
-            self.watch(id, deadline, cover, mined).await?;
+        let mined = mined.block_id(head.hash.into()).await?;
+        for (id, deadline, cover) in self.in_flight(mined)? {
+            self.watch(id, deadline, cover, &head, mined).await?;
         }
-        for (id, tx, cover, deadline) in self.queued()? {
-            if self.paused.load(Relaxed) {
-                break;
-            }
-            let tx = serde_json::from_str(&tx)?;
-            self.send(id, tx, cover, deadline, mined).await?;
+        let next = self.db().query_row("SELECT next FROM nonce", [], first)?;
+        if mined > next {
+            self.paused.store(true, Relaxed);
         }
-        Ok(())
+        if self.paused.load(Relaxed) || mined < next || !self.in_flight(mined)?.is_empty()
+        {
+            return Ok(());
+        }
+        let Some((id, tx, cover, deadline)) = self.queued()? else {
+            return Ok(());
+        };
+        let tx = serde_json::from_str(&tx)?;
+        self.send(id, tx, cover, deadline, &head, next).await
     }
 
-    /// The sent and included requests: id, deadline, cover.
-    fn in_flight(&self) -> Result<Vec<(B256, u64, Cover)>, Error> {
-        let sql = "SELECT id, deadline, net, l1 FROM requests \
-                   WHERE status IN ('sent', 'included')";
+    /// The requests in flight at the mined count: id, deadline, cover.
+    fn in_flight(&self, mined: u64) -> Result<Vec<(B256, u64, Cover)>, Error> {
+        let sql = format!(
+            "SELECT DISTINCT r.id, r.deadline, r.net, r.l1 FROM requests r \
+             JOIN attempts a ON a.id = r.id WHERE {IN_FLIGHT}"
+        );
         let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?));
-        rows(&self.db(), sql, [], row)
+        rows(&self.db(), &sql, [mined], row)
     }
 
-    /// The queued requests in arrival order: id, transaction, cover, deadline.
-    fn queued(&self) -> Result<Vec<(B256, String, Cover, u64)>, Error> {
+    /// The oldest queued request: id, transaction, cover, deadline.
+    fn queued(&self) -> Result<Option<(B256, String, Cover, u64)>, Error> {
         let sql = "SELECT id, tx, net, l1, deadline FROM requests \
-                   WHERE status = 'queued' ORDER BY rowid";
+                   WHERE status = 'queued' ORDER BY rowid LIMIT 1";
         let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?));
-        rows(&self.db(), sql, [], row)
+        Ok(self.db().query_row(sql, [], row).optional()?)
     }
 
     /// `id`'s status and its transactions.
@@ -318,7 +332,6 @@ impl<P: Provider> Relayer<P> {
             "queued" => Status::Queued,
             "sent" => Status::Sent,
             "included" => Status::Included { block, reverted },
-            "confirmed" => Status::Confirmed { block, reverted },
             "cancelled" => Status::Cancelled,
             _ => Status::Failed(decode_failure(&failure.unwrap_or_default(), detail)),
         };
@@ -336,18 +349,20 @@ impl<P: Provider> Relayer<P> {
         })
     }
 
-    /// Whether sending paused: a foreign nonce, a low balance or a refused first send.
+    /// Whether sending paused: a foreign nonce, a low balance, a refused first send or
+    /// a cancel above the max cancel fee.
     pub async fn paused(&self) -> bool {
         self.paused.load(Relaxed)
     }
 
-    /// Resolve `id` from a receipt of any of its attempts; with none, cancel it at
-    /// its deadline or broadcast its last attempt again.
+    /// Resolve `id` from a receipt of any of its attempts. With none, broadcast its send
+    /// again until its window ends, then cancel it, raising the cancel each new block.
     async fn watch(
         &self,
         id: B256,
         deadline: u64,
         cover: Cover,
+        head: &Head,
         mined: u64,
     ) -> Result<(), Error> {
         let attempts = self.attempts(id)?;
@@ -360,71 +375,90 @@ impl<P: Provider> Relayer<P> {
                 continue;
             };
             let block = receipt.block_number.unwrap_or_default();
-            let safe = self.provider.get_block_by_number(BlockNumberOrTag::Safe);
-            let safe = safe.await?.is_some_and(|s| s.header.number >= block);
-            let status = match (a.cancel, safe) {
-                (true, _) => "cancelled",
-                (false, true) => "confirmed",
-                (false, false) => "included",
-            };
+            let status = if a.cancel { "cancelled" } else { "included" };
             return self.set_status(id, status, Some((block, &receipt)), None);
         }
         self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
-        let Some(last) = attempts.last() else {
+        let (Some(send), Some(last)) = (attempts.first(), attempts.last()) else {
             return Ok(());
         };
-        let now = gas::latest_time(&self.provider).await.map_err(refused)?;
-        if last.cancel || now < deadline {
-            return self.broadcast(last, cover, Some(deadline), mined).await;
+        let late = self.late(send.at);
+        if !last.cancel && head.time < late {
+            let run = Some((deadline, late));
+            return self.broadcast(last, cover, run, head, mined).await;
         }
-        self.cancel(id, last, mined).await
+        if last.cancel && head.number <= last.block {
+            return self.broadcast(last, cover, None, head, mined).await;
+        }
+        if mined > last.nonce {
+            self.paused.store(true, Relaxed); // another sender's at our nonce
+            return Ok(());
+        }
+        self.cancel(id, last, head, mined).await
     }
 
-    /// Sign `tx` at the next nonce with the tip read now, run it again, then commit it
-    /// and broadcast it.
+    /// Sign `tx` at `nonce` with its fee cap at most M × the pinned base fee and the
+    /// tip read now, run it again at the pinned block, then commit and broadcast it.
     async fn send(
         &self,
         id: B256,
         tx: TransactionRequest,
         cover: Cover,
         deadline: u64,
-        mined: u64,
+        head: &Head,
+        nonce: u64,
     ) -> Result<(), Error> {
-        let next = self.db().query_row("SELECT next FROM nonce", [], first)?;
-        if mined > next {
-            self.paused.store(true, Relaxed);
-            return Ok(());
-        }
+        let cap = tx.max_fee_per_gas.unwrap_or_default();
+        let cap = cap.min(head.fee_bound(&self.config));
         let tip = gas::tip(&self.provider, self.config.tip_percentile).await;
-        let tip = tip.map_err(refused)?.min(tx.max_fee_per_gas.unwrap_or(0));
         let tx = tx
             .from(self.config.relayer)
-            .nonce(next)
-            .max_priority_fee_per_gas(tip);
-        let attempt = self.sign(tx, false).await?;
+            .nonce(nonce)
+            .max_fee_per_gas(cap)
+            .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
+        let attempt = self.sign(tx, false, head).await?;
         let worst = affordable(&attempt.raw, cover)?;
-        let balance = self.provider.get_balance(self.config.relayer).await?;
+        let balance = self.provider.get_balance(self.config.relayer);
+        let balance = balance.block_id(head.hash.into()).await?;
         if balance < worst {
             self.paused.store(true, Relaxed);
             let short = format!("balance {balance} below a send's cost {worst}");
             return Err(format!("{short}: sending paused; fund it and restart").into());
         }
-        match self.runs(&attempt.raw, deadline).await {
+        let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
+        match run.await {
             Err(Refusal::Node(e)) => return Err(e.into()),
             Err(refusal) => return self.set_status(id, "failed", None, Some(&refusal)),
             Ok(()) => {}
         }
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, cover, None, mined).await
+        self.broadcast(&attempt, cover, None, head, nonce).await
     }
 
-    /// A 0-value self-send at `sent`'s nonce, both fees at least 1.1× `sent`'s and
-    /// its cap at least twice the base fee.
-    async fn cancel(&self, id: B256, sent: &Attempt, mined: u64) -> Result<(), Error> {
-        let tx = TxEnvelope::decode_2718(&mut &sent.raw[..])?;
+    /// A 0-value self-send at `last`'s nonce, both fees at least 1.1× `last`'s and its
+    /// cap twice the pinned base fee, up to the max cancel fee. Above it sending pauses
+    /// and the last cancel is sent again.
+    async fn cancel(
+        &self,
+        id: B256,
+        last: &Attempt,
+        head: &Head,
+        mined: u64,
+    ) -> Result<(), Error> {
+        let tx = TxEnvelope::decode_2718(&mut &last.raw[..])?;
         let more = |fee: u128| fee.saturating_mul(11).div_ceil(10);
-        let base = gas::fee_floor(&self.provider, &self.config, Duration::ZERO).await;
-        let cap = more(tx.max_fee_per_gas()).max(base.map_err(refused)? * 2);
+        let (least, max) = (more(tx.max_fee_per_gas()), self.config.max_cancel_fee);
+        if least > max {
+            self.paused.store(true, Relaxed);
+            if last.cancel {
+                self.broadcast(last, Default::default(), None, head, mined)
+                    .await?;
+            }
+            let n = last.nonce;
+            let above = format!("the cancel at nonce {n} needs a fee cap above {max}");
+            return Err(format!("{above}: sending paused; raise max_cancel_fee").into());
+        }
+        let cap = least.max(head.base_fee.saturating_mul(2)).min(max);
         let tip = gas::tip(&self.provider, CANCEL_PERCENTILE)
             .await
             .map_err(refused)?;
@@ -433,18 +467,28 @@ impl<P: Provider> Relayer<P> {
         let cancel = TransactionRequest::default()
             .from(relayer)
             .to(relayer)
-            .nonce(sent.nonce)
+            .nonce(last.nonce)
             .gas_limit(21_000)
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.min(cap))
             .with_chain_id(self.config.chain_id);
-        let attempt = self.sign(cancel, true).await?;
+        let attempt = self.sign(cancel, true, head).await?;
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, Default::default(), None, mined)
+        self.broadcast(&attempt, Default::default(), None, head, mined)
             .await
     }
 
-    async fn sign(&self, tx: TransactionRequest, cancel: bool) -> Result<Attempt, Error> {
+    /// The end of the inclusion window of a send signed at `at`.
+    fn late(&self, at: u64) -> u64 {
+        at + self.config.inclusion_window.as_secs()
+    }
+
+    async fn sign(
+        &self,
+        tx: TransactionRequest,
+        cancel: bool,
+        head: &Head,
+    ) -> Result<Attempt, Error> {
         let nonce = tx.nonce.unwrap_or_default();
         let signed = self.provider.fill_and_sign_transaction(tx).await?;
         let (hash, raw) = (*signed.tx_hash(), signed.encoded_2718().into());
@@ -453,26 +497,35 @@ impl<P: Provider> Relayer<P> {
             nonce,
             cancel,
             raw,
+            block: head.number,
+            at: head.time,
         })
     }
 
-    /// `raw`, as it is sent but at any nonce, still runs before `deadline`.
-    async fn runs(&self, raw: &[u8], deadline: u64) -> Result<(), Refusal> {
+    /// `raw`, as it is sent but at any nonce, still runs at `head` and at `late`.
+    async fn runs(
+        &self,
+        raw: &[u8],
+        deadline: u64,
+        head: &Head,
+        late: u64,
+    ) -> Result<(), Refusal> {
         let tx = TxEnvelope::decode_2718(&mut &raw[..]).map_err(node)?;
         let mut tx =
             TransactionRequest::from_transaction_with_sender(tx, self.config.relayer);
         tx.nonce = None;
-        rerun(&self.provider, &self.config, &tx, deadline).await
+        rerun(&self.provider, &tx, deadline, head.hash, late).await
     }
 
     /// Broadcast `a` unless the node has it. Its nonce mined with no receipt of ours
-    /// is another sender's, and sending pauses. With `deadline`, a send that no longer
-    /// runs is left to the deadline's cancel.
+    /// is another sender's, and sending pauses. With `run`, a send's deadline and
+    /// window end, a send that no longer runs at `head` is left to its cancel.
     async fn broadcast(
         &self,
         a: &Attempt,
         cover: Cover,
-        deadline: Option<u64>,
+        run: Option<(u64, u64)>,
+        head: &Head,
         mined: u64,
     ) -> Result<(), Error> {
         if !a.cancel {
@@ -486,8 +539,8 @@ impl<P: Provider> Relayer<P> {
             self.paused.store(true, Relaxed);
             return Ok(());
         }
-        if let Some(deadline) = deadline {
-            match self.runs(&a.raw, deadline).await {
+        if let Some((deadline, late)) = run {
+            match self.runs(&a.raw, deadline, head, late).await {
                 Err(Refusal::Node(e)) => return Err(e.into()),
                 Err(_) => return Ok(()),
                 Ok(()) => {}
@@ -496,13 +549,24 @@ impl<P: Provider> Relayer<P> {
         let Err(e) = self.provider.send_raw_transaction(&a.raw).await else {
             return Ok(());
         };
-        let first = deadline.is_none() && !a.cancel;
-        let known = self.provider.get_transaction_by_hash(a.hash);
-        if !first || e.as_error_resp().is_none() || known.await?.is_some() {
+        // The node may hold `a` unless it answered with an error and has no such hash.
+        let first = run.is_none() && !a.cancel;
+        let rejected = e.as_error_resp().is_some()
+            && self
+                .provider
+                .get_transaction_by_hash(a.hash)
+                .await?
+                .is_none();
+        if !first || !rejected {
             eprintln!("broadcast of {} refused, retried next tick: {e}", a.hash);
             return Ok(());
         }
         self.uncommit(a)?;
+        if e.as_error_resp()
+            .is_some_and(|r| r.message.contains("nonce too low"))
+        {
+            return Ok(()); // checked again from the next tick's block
+        }
         self.paused.store(true, Relaxed);
         Err(format!("the node refused send {}: {e}; sending paused", a.hash).into())
     }
@@ -526,8 +590,17 @@ impl<P: Provider> Relayer<P> {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT INTO attempts (hash, id, nonce, cancel, raw) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![&a.hash[..], &id[..], a.nonce, a.cancel, &a.raw[..]],
+            "INSERT INTO attempts (hash, id, nonce, cancel, raw, block, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                &a.hash[..],
+                &id[..],
+                a.nonce,
+                a.cancel,
+                &a.raw[..],
+                a.block,
+                a.at
+            ],
         )?;
         tx.execute("UPDATE nonce SET next = max(next, ?1)", [a.nonce + 1])?;
         tx.execute(
@@ -574,7 +647,8 @@ impl<P: Provider> Relayer<P> {
 
     fn attempts(&self, id: B256) -> Result<Vec<Attempt>, Error> {
         let sql =
-            "SELECT hash, nonce, cancel, raw FROM attempts WHERE id = ?1 ORDER BY rowid";
+            "SELECT hash, nonce, cancel, raw, block, at FROM attempts WHERE id = ?1 \
+                   ORDER BY rowid";
         rows(&self.db(), sql, [&id[..]], |r| {
             let (hash, nonce, cancel) = (b256(r, 0)?, r.get(1)?, r.get(2)?);
             let raw = r.get::<_, Vec<u8>>(3)?.into();
@@ -583,6 +657,8 @@ impl<P: Provider> Relayer<P> {
                 nonce,
                 cancel,
                 raw,
+                block: r.get(4)?,
+                at: r.get(5)?,
             })
         })
     }
@@ -599,17 +675,21 @@ fn request_id(chain_id: u64, call: &TransactionRequest, value: U256) -> B256 {
     keccak256((U256::from(chain_id), to, input, value).abi_encode_params())
 }
 
-/// `mined` lies between the lowest nonce of an unconfirmed send and the next nonce,
-/// and each stored nonce below it has a receipt for one of its attempts.
+/// `mined` lies between the lowest nonce in flight and the next nonce, and each nonce
+/// in flight below it has a receipt for one of its attempts.
 async fn explained<P: Provider>(
     provider: &P,
     db: &Connection,
     mined: u64,
     next: u64,
 ) -> Result<(), Error> {
-    let sql = "SELECT a.nonce, a.hash FROM attempts a JOIN requests r ON a.id = r.id \
-               WHERE r.status IN ('sent', 'included')";
-    let in_flight = rows(db, sql, [], |r| Ok((r.get::<_, u64>(0)?, b256(r, 1)?)))?;
+    let sql = format!(
+        "SELECT a.nonce, a.hash FROM attempts a JOIN requests r ON a.id = r.id \
+         WHERE {IN_FLIGHT}"
+    );
+    let in_flight = rows(db, &sql, [mined], |r| {
+        Ok((r.get::<_, u64>(0)?, b256(r, 1)?))
+    })?;
     let below = in_flight.iter().filter(|a| a.0 < mined);
     let mut unexplained: BTreeSet<_> = below.clone().map(|a| a.0).collect();
     for (nonce, hash) in below {
