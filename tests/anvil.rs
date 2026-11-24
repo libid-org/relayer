@@ -52,7 +52,10 @@ use relayer::{
         Refusal,
         Request,
     },
-    config::Config,
+    config::{
+        Config,
+        L1Fee,
+    },
 };
 
 const CLAIMED: u128 = 1_000_000_000_000_000_000;
@@ -538,6 +541,14 @@ async fn refuses_before_sending() {
     for request in [o.request(good.clone()), at_bound, at_window] {
         check(&o.relayer, &o.config(), &request).await.unwrap();
     }
+    let op_stack = Config {
+        l1_fee: L1Fee::OpStack,
+        ..o.config()
+    };
+    let refused = check(&o.relayer, &op_stack, &o.request(good.clone()))
+        .await
+        .err();
+    assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
     // A node error that is not a revert is not reported as one.
     o.owner
         .anvil_set_balance(o.relayer_address, U256::ZERO)
