@@ -79,13 +79,17 @@ impl Onboarding {
     }
 
     async fn quote_with(&self, config: &Config, b: &Batch<'_>) -> Quote {
+        self.try_quote(config, b).await.unwrap()
+    }
+
+    async fn try_quote(&self, config: &Config, b: &Batch<'_>) -> Result<Quote, Refusal> {
         let draft = Draft {
             wallet: self.wallet,
             create: self.path().await,
             data: self.authorize(b, None).await,
             below_quorum: b.3.is_some(),
         };
-        quote(&self.relayer, config, &draft).await.unwrap()
+        quote(&self.relayer, config, &draft).await
     }
 
     async fn relay(&self, data: &Bytes, gas_limit: u64) -> Result<Checked, Refusal> {
@@ -316,7 +320,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     };
     let (refund, to_token) = (proof(CLAIMED, leaves[1]), proof(0, leaves[0]));
     let transfer = transferCall::new((o.relayer_address, U256::ONE)).abi_encode();
-    let calls = vec![call(token, U256::ZERO, transfer), o.repay(r)];
+    let calls = vec![call(token, U256::ZERO, transfer.clone()), o.repay(r)];
     let below = |calls, k, proofs| Batch(calls, U256::ZERO, vec![k], Some(proofs));
     let cases = [
         Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None),
@@ -330,6 +334,21 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         let checked = o.relay(&data, q.gas_limit).await.unwrap();
         chain::send(&o.relayer, checked).await.unwrap();
     }
+    // A refund drafted at 0 and signed at R: the quote covers sending value.
+    let at_quorum = |calls| Batch(calls, U256::ZERO, vec![&o.k], None);
+    let q = o
+        .quote_with(&o.config(), &at_quorum(vec![o.repay(U256::ZERO)]))
+        .await;
+    let data = o
+        .authorize(&at_quorum(vec![o.repay(r)]), Some(q.call_gas))
+        .await;
+    o.relay(&data, q.gas_limit).await.unwrap();
+    let unpaid = at_quorum(vec![call(token, U256::ZERO, transfer)]);
+    let refused = o.try_quote(&o.config(), &unpaid).await.err();
+    assert!(
+        matches!(refused, Some(Refusal::RefundMissing)),
+        "{refused:?}"
+    );
 }
 
 #[tokio::test]

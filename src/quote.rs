@@ -35,6 +35,8 @@ use crate::{
 
 /// Calldata gas per byte above a zero byte's (EIP-2028).
 const NONZERO_BYTE: u64 = 12;
+/// A call's extra gas for sending value (`CALL`'s value transfer).
+const CALL_VALUE: u64 = 9_000;
 
 /// A batch to quote: its data carries a well-formed dummy signature for every signer.
 #[derive(Clone, Debug)]
@@ -87,6 +89,9 @@ pub async fn quote<P: Provider>(
     let call_gas = sim.gas_used;
     let below_quorum = draft.below_quorum.then_some(executions.len());
     let refunds = refunds(&executions, config.relayer);
+    if refunds.clone().next().is_none() {
+        return Err(Refusal::RefundMissing);
+    }
     let unmeasured = unmeasured(&authorization, refunds, call_gas, below_quorum);
     let gas_limit = gas::limit(sim.gas_used + unmeasured, call_gas, create.is_some());
     let (tx, l1_fee_bound, min_refund) =
@@ -102,8 +107,8 @@ pub async fn quote<P: Provider>(
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
 /// did not check, the rest of a valid `_verify`, the signed `call_gas` word, the
-/// zero bytes of its signatures and `refunds` as nonzero, and, below quorum, the
-/// rules check of that many calls.
+/// zero bytes of its signatures and `refunds` as nonzero, a value transfer for a
+/// refund drafted at 0, and, below quorum, the rules check of that many calls.
 fn unmeasured(
     authorization: &ExecuteAuthorization,
     refunds: impl Iterator<Item = U256>,
@@ -125,9 +130,16 @@ fn unmeasured(
     // The client fills the signatures and may change R after the quote.
     let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
     let signed = authorization.signatures.iter().map(|s| zeros(&s.signature));
-    let filled =
-        signed.sum::<u64>() + refunds.map(|r| zeros(&r.to_be_bytes::<32>())).sum::<u64>();
+    let (mut filled, mut transfers) = (signed.sum::<u64>(), 0);
+    for r in refunds {
+        filled += zeros(&r.to_be_bytes::<32>());
+        transfers += if r.is_zero() { CALL_VALUE } else { 0 };
+    }
     let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
     let bytes = call_gas_bytes + filled;
-    costs.verify_tail() + NONZERO_BYTE * bytes + unchecked.sum::<u64>() + rules
+    costs.verify_tail()
+        + NONZERO_BYTE * bytes
+        + unchecked.sum::<u64>()
+        + rules
+        + transfers
 }

@@ -170,7 +170,7 @@ fn refund(executions: &[Execution], relayer: Address) -> Option<U256> {
 pub(crate) fn refunds(
     executions: &[Execution],
     relayer: Address,
-) -> impl Iterator<Item = U256> + '_ {
+) -> impl Iterator<Item = U256> + Clone + '_ {
     executions
         .iter()
         .filter(move |e| e.target == relayer && e.callData.is_empty())
