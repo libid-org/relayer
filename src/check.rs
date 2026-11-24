@@ -73,6 +73,8 @@ pub struct Request {
 pub struct Checked {
     /// The transaction that was simulated, as it is sent.
     pub(crate) tx: TransactionRequest,
+    /// How long [`crate::chain::send`] waits for its receipt.
+    pub(crate) timeout: Duration,
 }
 
 /// Why a request is not sent.
@@ -138,7 +140,8 @@ pub async fn check<P: Provider>(
         )
         .with_chain_id(config.chain_id);
     simulate(provider, &tx, late).await?;
-    Ok(Checked { tx })
+    let timeout = config.inclusion_window;
+    Ok(Checked { tx, timeout })
 }
 
 /// The message `data` carries and its batch, both canonical (D4).

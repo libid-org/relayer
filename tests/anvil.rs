@@ -1,6 +1,8 @@
 //! S1 on anvil: K signs link, bind, claim to the wallet and a refund; the relayer checks
 //! and sends `createAndExecute`, or refuses before sending. Needs `anvil` on `PATH`.
 
+use std::time::Duration;
+
 use alloy::{
     consensus::Transaction as _,
     node_bindings::{
@@ -373,7 +375,6 @@ async fn the_relayer_checks_and_lands_the_onboarding() {
         .await
         .unwrap();
     let receipt = chain::send(&o.relayer, checked).await.unwrap();
-    assert!(receipt.status(), "reverted");
     assert_eq!(receipt.to, Some(o.stack.factory));
     o.assert_onboarded(o.refund()).await;
     assert!(
@@ -572,4 +573,33 @@ async fn an_empty_escrow_is_refused_as_nothing_held() {
         (e.name(), e.contracts()),
         ("NothingHeld", vec!["HandleEscrow"])
     );
+}
+
+/// A send mined after its deadline is `Reverted`; one never mined times out.
+#[tokio::test]
+async fn a_send_that_does_not_land_is_an_error() {
+    let o = Onboarding::new(true).await;
+    let config = Config {
+        inclusion_window: Duration::from_secs(1),
+        ..o.config()
+    };
+    let request = o.request_for(&o.onboarding()).await;
+    let checked = check(&o.relayer, &config, &request).await.unwrap();
+    let deadline = o.now().await + 3600;
+    o.owner
+        .anvil_set_next_block_timestamp(deadline + 1)
+        .await
+        .unwrap();
+    let sent = chain::send(&o.relayer, checked.clone()).await;
+    let Err(chain::Error::Reverted { receipt }) = sent else {
+        panic!("{sent:?}")
+    };
+    assert!(!receipt.status());
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let sent = chain::send(&o.relayer, checked).await;
+    let Err(chain::Error::Timeout { hash }) = sent else {
+        panic!("{sent:?}")
+    };
+    let pending = o.owner.get_transaction_by_hash(hash).await.unwrap();
+    assert!(pending.is_some_and(|tx| tx.block_number.is_none()));
 }
