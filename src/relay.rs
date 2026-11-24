@@ -79,16 +79,19 @@ type Cover = (U256, U256);
 /// The fee-history percentile a cancel's tip is read at.
 const CANCEL_PERCENTILE: f64 = 90.0;
 
+/// The schema version, `PRAGMA user_version`, a database must have.
+const VERSION: i32 = 1;
+
 const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS requests (id BLOB PRIMARY KEY, wallet BLOB NOT NULL,
+    CREATE TABLE requests (id BLOB PRIMARY KEY, wallet BLOB NOT NULL,
         tx TEXT NOT NULL, net BLOB NOT NULL, l1 BLOB NOT NULL, deadline INTEGER NOT NULL,
         status TEXT NOT NULL, block INTEGER, reverted INTEGER, failure TEXT, detail BLOB,
         created_at INTEGER NOT NULL DEFAULT (unixepoch()), gas_used INTEGER, gas_price BLOB, l1_fee BLOB,
         included_at INTEGER);
-    CREATE TABLE IF NOT EXISTS attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
+    CREATE TABLE attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
         nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL,
         sent_at INTEGER NOT NULL DEFAULT (unixepoch()));
-    CREATE TABLE IF NOT EXISTS nonce (next INTEGER NOT NULL);";
+    CREATE TABLE nonce (next INTEGER NOT NULL);";
 
 /// Where a request stands.
 #[derive(Debug)]
@@ -111,9 +114,9 @@ pub enum Status {
         /// The batch reverted.
         reverted: bool,
     },
-    /// Replaced at its deadline by a cancel that landed; retriable.
+    /// Replaced at its deadline by a cancel that landed; not queued again.
     Cancelled,
-    /// Refused before its first broadcast; retriable.
+    /// Refused before its first broadcast; queued again when relayed again.
     Failed(Refusal),
 }
 
@@ -164,8 +167,9 @@ pub struct Relayer<P> {
 }
 
 impl<P: Provider> Relayer<P> {
-    /// Lock and open `db`, and check that the stored sends explain the key's mined
-    /// nonce; a fresh database starts at it. `provider` signs with the relayer's key.
+    /// Lock and open `db`, and check its schema version and that the stored sends
+    /// explain the key's mined nonce; a fresh database starts at it. `provider` signs
+    /// with the relayer's key.
     pub async fn start(provider: P, config: Config, db: &Path) -> Result<Self, Error> {
         let mut lock = db.as_os_str().to_owned();
         lock.push(".lock");
@@ -173,8 +177,22 @@ impl<P: Provider> Relayer<P> {
         let file = File::create(&lock)?;
         let held = |_| format!("{} is held by another relayer", lock.display());
         file.try_lock().map_err(held)?;
-        let conn = Connection::open(db)?;
-        conn.execute_batch(SCHEMA)?;
+        let mut conn = Connection::open(db)?;
+        let tables: u64 =
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], first)?;
+        let version: i32 = conn.query_row("PRAGMA user_version", [], first)?;
+        if tables == 0 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", VERSION)?;
+            tx.commit()?;
+        } else if version != VERSION {
+            let old = format!(
+                "{} has schema version {version}, not {VERSION}",
+                db.display()
+            );
+            return Err(format!("{old}: start on a fresh database file").into());
+        }
         let mined = provider.get_transaction_count(config.relayer).latest();
         let (mined, next) = (
             mined.await?,
@@ -194,7 +212,7 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Check `request` and queue it under its id. The same request again returns its
-    /// id; one that failed or was cancelled is queued again under it.
+    /// id; one that failed is queued again under it.
     pub async fn relay(&self, request: &Request) -> Result<B256, Refusal> {
         let (message, ..) = decode(&request.data).ok_or(Refusal::NoncanonicalData)?;
         let (p, c, wallet) = (&self.provider, &self.config, request.wallet);
@@ -607,16 +625,13 @@ async fn explained<P: Provider>(
     Ok(())
 }
 
-/// `id` again when it is stored and not retriable; `WalletBusy` while another batch
+/// `id` again when it is stored and has not failed; `WalletBusy` while another batch
 /// of `wallet` is queued or sent.
 #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
 fn admit(db: &Connection, id: B256, wallet: Address) -> Result<Option<B256>, Refusal> {
     let status = "SELECT status FROM requests WHERE id = ?1";
     let status = db.query_row(status, [&id[..]], first::<String>).optional();
-    if status
-        .map_err(node)?
-        .is_some_and(|s| s != "failed" && s != "cancelled")
-    {
+    if status.map_err(node)?.is_some_and(|s| s != "failed") {
         return Ok(Some(id));
     }
     let busy =

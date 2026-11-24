@@ -48,10 +48,13 @@ impl Onboarding {
     }
 
     /// Sent with automine off, priced out, then at its deadline: still pending.
-    async fn priced_out(&self, r: &Rel) -> (B256, Transaction, Bytes) {
+    async fn priced_out(&self, r: &Rel) -> (B256, Request, Transaction, Bytes) {
         self.owner.anvil_set_auto_mine(false).await.unwrap();
         let deadline = self.now().await + 60;
-        let id = self.onboard(r, 60).await.unwrap();
+        let calls = encode_executions(&self.onboarding());
+        let request =
+            self.request(self.sign_until(calls, self.value, deadline - 60, deadline));
+        let id = r.relay(&request).await.unwrap();
         r.tick().await.unwrap();
         let report = r.status(id).await.unwrap();
         assert!(matches!(report.status, Status::Sent), "{:?}", report.status);
@@ -69,7 +72,7 @@ impl Onboarding {
         at.await.unwrap();
         self.owner.evm_mine(None).await.unwrap();
         assert!(!self.mined(hash).await, "mined above its fee cap");
-        (id, tx, raw.unwrap())
+        (id, request, tx, raw.unwrap())
     }
 }
 
@@ -99,9 +102,10 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     assert!(refused.contains("relayer reconcile"), "{refused}");
 }
 
-/// An instance holds `flock` on `<db>.lock`; any other holder refuses start.
+/// An instance holds `flock` on `<db>.lock`; any other holder refuses start. A
+/// database of another schema version is refused, naming the fix.
 #[tokio::test]
-async fn a_second_instance_is_refused_by_the_lock() {
+async fn a_second_instance_or_an_older_schema_is_refused() {
     let (o, db) = (Onboarding::new(false).await, db("lock"));
     let lock = format!("{}.lock", db.display());
     let r = o.start(&db).await.unwrap();
@@ -112,6 +116,11 @@ async fn a_second_instance_is_refused_by_the_lock() {
     drop(r);
     held.try_lock().unwrap();
     assert!(o.start(&db).await.err().unwrap().contains(&lock));
+    let old = crate::db("schema");
+    let conn = rusqlite::Connection::open(&old).unwrap();
+    conn.execute_batch("CREATE TABLE nonce (next)").unwrap();
+    let refused = o.start(&old).await.err().unwrap();
+    assert!(refused.contains("fresh database file"), "{refused}");
 }
 
 /// A committed raw transaction the node never got is sent again at start, once.
@@ -132,12 +141,13 @@ async fn a_crash_between_commit_and_broadcast_lands_once() {
 }
 
 /// A send priced out by the base fee is replaced at its deadline by a 0-value
-/// self-send at its nonce, +10% on both fees; `cancelled`, and a new batch lands.
+/// self-send at its nonce, +10% on both fees; `cancelled`, its id not queued again,
+/// and a new batch lands.
 #[tokio::test]
 async fn a_send_priced_out_is_cancelled_at_its_deadline() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("cancel")).await.unwrap();
-    let (id, sent, _) = o.priced_out(&r).await;
+    let (id, request, sent, _) = o.priced_out(&r).await;
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
     let cancelled = |s: &Status| matches!(s, Status::Cancelled { .. });
@@ -157,6 +167,10 @@ async fn a_send_priced_out_is_cancelled_at_its_deadline() {
     assert!(tip(&cancel) * 10 >= tip(&sent) * 11);
     o.base_fee(1_000_000_000).await;
     o.owner.evm_mine(None).await.unwrap();
+    assert_eq!(r.relay(&request).await.unwrap(), id);
+    let again = r.status(id).await.unwrap();
+    let kept = cancelled(&again.status) && again.tx_hashes == report.tx_hashes;
+    assert!(kept, "queued again: {:?}", again.status);
     let retry = o.onboard(&r, 1800).await.unwrap();
     o.settle(&r, retry, included).await;
     o.assert_onboarded(o.refund()).await;
@@ -167,7 +181,7 @@ async fn a_send_priced_out_is_cancelled_at_its_deadline() {
 async fn the_original_landing_before_its_cancel_resolves_from_its_receipt() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("race")).await.unwrap();
-    let (id, sent, raw) = o.priced_out(&r).await;
+    let (id, _, sent, raw) = o.priced_out(&r).await;
     r.tick().await.unwrap();
     let hashes = r.status(id).await.unwrap().tx_hashes;
     assert_eq!(hashes.len(), 2, "no cancel at the deadline");
