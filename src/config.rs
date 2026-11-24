@@ -42,7 +42,7 @@ pub struct Config {
     /// The L1 margin `k`, in percent.
     pub l1_margin: u64,
     /// How long a send may take to be included: a batch must still run that
-    /// long after the latest block, and a send waits that long for its receipt.
+    /// long after the latest block.
     pub inclusion_window: Duration,
     /// How long a quote stays valid; its fee covers the base fee's growth meanwhile.
     pub quote_validity: Duration,

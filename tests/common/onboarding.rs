@@ -1,6 +1,15 @@
 // The onboarding fixture, `include!`d by the anvil suites.
 
-use std::time::Duration;
+use std::{
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::atomic::{
+        AtomicUsize,
+        Ordering,
+    },
+};
 
 use alloy::{
     consensus::Transaction as _,
@@ -22,7 +31,11 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
-    rpc::types::TransactionRequest,
+    rpc::types::{
+        Transaction,
+        TransactionReceipt,
+        TransactionRequest,
+    },
     signers::{
         local::PrivateKeySigner,
         SignerSync,
@@ -49,7 +62,6 @@ use libid_contracts::{
     Artifacts,
 };
 use relayer::{
-    chain,
     check::{
         check,
         Create,
@@ -59,6 +71,11 @@ use relayer::{
     config::{
         Config,
         L1Fee,
+    },
+    relay::{
+        Relayer,
+        Report,
+        Status,
     },
 };
 
@@ -311,6 +328,39 @@ impl Onboarding {
         assert!(sent.await.unwrap().get_receipt().await.unwrap().status());
     }
 
+    async fn start(&self, db: &Path) -> Result<Relayer<DynProvider>, String> {
+        let started = Relayer::start(self.relayer.clone(), self.config(), db).await;
+        started.map_err(|e| e.to_string())
+    }
+
+    /// Ticks and mines until `id`'s status is `done`.
+    async fn settle(&self, r: &Relayer<DynProvider>, id: B256, done: fn(&Status) -> bool) -> Report {
+        for _ in 0..50 {
+            r.tick().await.unwrap();
+            self.owner.evm_mine(None).await.unwrap();
+            let report = r.status(id).await.unwrap();
+            if done(&report.status) {
+                return report;
+            }
+        }
+        panic!("unsettled: {:?}", r.status(id).await.unwrap().status);
+    }
+
+    /// `request` relayed by a relayer of its own and settled; its successful receipt.
+    async fn send(&self, request: &Request) -> TransactionReceipt {
+        let r = self.start(&db("send")).await.unwrap();
+        let id = r.relay(request).await.unwrap();
+        let hash = self.settle(&r, id, included).await.tx_hashes[0];
+        let receipt = self.owner.get_transaction_receipt(hash).await.unwrap().unwrap();
+        assert!(receipt.status(), "reverted");
+        receipt
+    }
+
+    async fn tx(&self, hash: B256) -> Transaction {
+        let tx = self.owner.get_transaction_by_hash(hash).await;
+        tx.unwrap().unwrap()
+    }
+
     async fn relayer_nonce(&self) -> u64 {
         let nonce = self.relayer.get_transaction_count(self.relayer_address);
         nonce.await.unwrap()
@@ -360,6 +410,20 @@ impl Onboarding {
             "the wallet's funds"
         );
     }
+}
+
+/// A fresh database path, unique in this run.
+fn db(name: &str) -> PathBuf {
+    static RUN: AtomicUsize = AtomicUsize::new(0);
+    let n = RUN.fetch_add(1, Ordering::Relaxed);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let dir = dir.join(format!("{name}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("relayer.db")
+}
+
+fn included(s: &Status) -> bool {
+    matches!(s, Status::Included { .. } | Status::Confirmed { .. })
 }
 
 /// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the

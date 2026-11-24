@@ -68,13 +68,11 @@ pub struct Request {
     pub gas_limit: u64,
 }
 
-/// A request that passed every check: the only thing [`crate::chain::send`] sends.
+/// A request that passed every check: the only thing the relayer queues.
 #[derive(Clone, Debug)]
 pub struct Checked {
     /// The transaction that was simulated, as it is sent.
     pub(crate) tx: TransactionRequest,
-    /// How long [`crate::chain::send`] waits for its receipt.
-    pub(crate) timeout: Duration,
     /// `R - value`: the most a send may cost the relayer.
     pub(crate) net: U256,
     /// The L1 fee bound with its margin, which the refund covers.
@@ -176,10 +174,8 @@ pub async fn check<P: Provider>(
         .with_max_priority_fee_per_gas(tip)
         .with_chain_id(config.chain_id);
     simulate(provider, &tx, late).await?;
-    let timeout = config.inclusion_window;
     Ok(Checked {
         tx,
-        timeout,
         net,
         l1_fee_bound,
     })

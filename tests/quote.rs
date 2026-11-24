@@ -92,13 +92,18 @@ impl Onboarding {
         quote(&self.relayer, config, &draft).await
     }
 
-    async fn relay(&self, data: &Bytes, gas_limit: u64) -> Result<Checked, Refusal> {
-        let (create, data) = (self.path().await, data.clone());
-        let request = Request {
+    /// The request for `data` on the wallet's current path, priced at `gas_limit`.
+    async fn request_at(&self, data: &Bytes, gas_limit: u64) -> Request {
+        let create = self.path().await;
+        Request {
             create,
             gas_limit,
-            ..self.request(data)
-        };
+            ..self.request(data.clone())
+        }
+    }
+
+    async fn relay(&self, data: &Bytes, gas_limit: u64) -> Result<Checked, Refusal> {
+        let request = self.request_at(data, gas_limit).await;
         check(&self.relayer, &self.config(), &request).await
     }
 
@@ -256,17 +261,11 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
 
     let data = o.authorize(&b, Some(q.call_gas)).await;
     let limit = o.limit(&data, o.value, q.call_gas).await;
-    let checked = o.relay(&data, q.gas_limit).await.unwrap();
-    let hash = chain::send(&o.relayer, checked)
+    let hash = o
+        .send(&o.request_at(&data, q.gas_limit).await)
         .await
-        .unwrap()
         .transaction_hash;
-    let tx = o
-        .owner
-        .get_transaction_by_hash(hash)
-        .await
-        .unwrap()
-        .unwrap();
+    let tx = o.tx(hash).await;
     let sent = tx.inner.gas_limit();
     assert!(
         sent.abs_diff(limit) <= 2,
@@ -341,8 +340,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     };
     let q3 = quote(&o.relayer, &o.config(), &draft).await.unwrap();
     assert_eq!(unreserved(&q3), unreserved(&q));
-    let checked = o.relay(&data, q.gas_limit).await.unwrap();
-    chain::send(&o.relayer, checked).await.unwrap();
+    o.send(&o.request_at(&data, q.gas_limit).await).await;
 
     let proof = |max: u128, leaf| CallProof {
         maxValue: U256::from(max),
@@ -361,8 +359,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         let q = o.quote_with(&o.config(), b).await;
         assert!(r >= q.min_refund, "the fixture underpays");
         let data = o.authorize(b, Some(q.call_gas)).await;
-        let checked = o.relay(&data, q.gas_limit).await.unwrap();
-        chain::send(&o.relayer, checked).await.unwrap();
+        o.send(&o.request_at(&data, q.gas_limit).await).await;
     }
     // A refund drafted at 0 and signed at R: the quote covers sending value.
     let at_quorum = |calls| Batch(calls, U256::ZERO, vec![&o.k], None);
@@ -404,17 +401,11 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
             IWebWallet::InsufficientCallGas::SELECTOR,
             "{e}"
         );
-        let checked = o.relay(&data, limit + 2).await.unwrap();
-        let hash = chain::send(&o.relayer, checked)
+        let hash = o
+            .send(&o.request_at(&data, limit + 2).await)
             .await
-            .unwrap()
             .transaction_hash;
-        let tx = o
-            .owner
-            .get_transaction_by_hash(hash)
-            .await
-            .unwrap()
-            .unwrap();
+        let tx = o.tx(hash).await;
         let sent = tx.inner.gas_limit();
         assert!(
             sent.abs_diff(limit) <= 2,

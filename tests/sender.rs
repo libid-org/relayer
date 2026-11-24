@@ -5,53 +5,14 @@
 
 include!("common/onboarding.rs");
 
-use relayer::relay::*;
-
-type Tx = alloy::rpc::types::Transaction;
-type Db = std::path::PathBuf;
 type Rel = Relayer<DynProvider>;
 
-/// A fresh database path for one test of this run.
-fn db(test: &str) -> Db {
-    let dir = Db::from(env!("CARGO_TARGET_TMPDIR"));
-    let dir = dir.join(format!("sender-{}-{test}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("relayer.db")
-}
-
-fn included(s: &Status) -> bool {
-    matches!(s, Status::Included { .. } | Status::Confirmed { .. })
-}
-
 impl Onboarding {
-    async fn start(&self, db: &Db) -> Result<Rel, String> {
-        let started = Relayer::start(self.relayer.clone(), self.config(), db).await;
-        started.map_err(|e| e.to_string())
-    }
-
     /// The onboarding relayed, signed to expire `secs` after the latest block.
     async fn onboard(&self, r: &Rel, secs: u64) -> Result<B256, Refusal> {
         let (now, calls) = (self.now().await, encode_executions(&self.onboarding()));
         let data = self.sign_until(calls, self.value, now, now + secs);
         r.relay(&self.request(data)).await
-    }
-
-    /// Ticks and mines until `id`'s status is `done`.
-    async fn settle(&self, r: &Rel, id: B256, done: fn(&Status) -> bool) -> Report {
-        for _ in 0..50 {
-            r.tick().await.unwrap();
-            self.owner.evm_mine(None).await.unwrap();
-            let report = r.status(id).await.unwrap();
-            if done(&report.status) {
-                return report;
-            }
-        }
-        panic!("unsettled: {:?}", r.status(id).await.unwrap().status);
-    }
-
-    async fn tx(&self, hash: B256) -> Tx {
-        let tx = self.owner.get_transaction_by_hash(hash).await;
-        tx.unwrap().unwrap()
     }
 
     async fn mined(&self, hash: B256) -> bool {
@@ -95,7 +56,7 @@ impl Onboarding {
     }
 
     /// Sent with automine off, priced out, then past its deadline: still pending.
-    async fn priced_out(&self, r: &Rel) -> (B256, Tx, Bytes) {
+    async fn priced_out(&self, r: &Rel) -> (B256, Transaction, Bytes) {
         self.owner.anvil_set_auto_mine(false).await.unwrap();
         let id = self.onboard(r, 60).await.unwrap();
         r.tick().await.unwrap();
@@ -189,7 +150,7 @@ async fn a_send_priced_out_is_cancelled_at_its_deadline() {
     let to_self = (Some(o.relayer_address), U256::ZERO, s.nonce());
     assert_eq!((c.to(), c.value(), c.nonce()), to_self);
     assert!(c.max_fee_per_gas() * 10 >= s.max_fee_per_gas() * 11);
-    let tip = |t: &Tx| t.inner.max_priority_fee_per_gas().unwrap();
+    let tip = |t: &Transaction| t.inner.max_priority_fee_per_gas().unwrap();
     assert!(tip(&cancel) * 10 >= tip(&sent) * 11);
     o.base_fee(1_000_000_000).await;
     o.owner.evm_mine(None).await.unwrap();
@@ -232,7 +193,7 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     assert!(refused.contains("relayer reconcile"), "{refused}");
 }
 
-/// D5: `getL1Fee(rawTx) > k × U` fails the request `L1FeeAboveBound` with nothing
+/// D5: `getL1Fee(rawTransaction) > k × U` fails the request `L1FeeAboveBound` with nothing
 /// broadcast; at exactly `k × U` it sends, within I1's L1 part.
 #[tokio::test]
 async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
