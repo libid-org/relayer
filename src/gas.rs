@@ -23,6 +23,7 @@ use alloy::{
             SimulatePayload,
         },
         BlockOverrides,
+        FeeHistory,
         Header,
         TransactionRequest,
     },
@@ -50,6 +51,9 @@ use crate::{
 
 /// Calldata gas per byte above a zero byte's (EIP-2028).
 pub(crate) const NONZERO_BYTE: u64 = 12;
+
+/// The blocks of fee history a tip is read over.
+const TIP_BLOCKS: u64 = 10;
 
 /// The OP-stack `GasPriceOracle` predeploy.
 const GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
@@ -125,17 +129,32 @@ pub(crate) async fn fee_floor<P: Provider>(
     Ok(rule.grow(base_fee, config.blocks(time)))
 }
 
-/// The tip at `percentile` of the latest block's, from `eth_feeHistory`.
+/// The tip at `percentile` over the last [`TIP_BLOCKS`], from `eth_feeHistory`.
 pub(crate) async fn tip<P: Provider>(
     provider: &P,
     percentile: f64,
 ) -> Result<u128, Refusal> {
     let percentiles = [percentile];
-    let history = provider.get_fee_history(1, BlockNumberOrTag::Latest, &percentiles);
-    let reward = history.await.map_err(node)?.reward;
-    Ok(reward
-        .and_then(|r| r.last()?.first().copied())
-        .unwrap_or_default())
+    let history =
+        provider.get_fee_history(TIP_BLOCKS, BlockNumberOrTag::Latest, &percentiles);
+    Ok(tip_of(&history.await.map_err(node)?, percentile))
+}
+
+/// `percentile` of the tips at `percentile` of `history`'s blocks that are not
+/// empty; at least 1 wei.
+fn tip_of(history: &FeeHistory, percentile: f64) -> u128 {
+    let blocks = history
+        .gas_used_ratio
+        .iter()
+        .zip(history.reward.iter().flatten());
+    let used = blocks.filter(|(ratio, _)| **ratio > 0.0);
+    let mut tips: Vec<u128> = used.filter_map(|(_, t)| t.first().copied()).collect();
+    tips.sort_unstable();
+    let at = tips.len().saturating_sub(1) as f64 * percentile / 100.0;
+    tips.get(at.round() as usize)
+        .copied()
+        .unwrap_or_default()
+        .max(1)
 }
 
 /// The latest block's timestamp.
@@ -253,5 +272,19 @@ mod tests {
         };
         let id = serde_json::to_value(head.at()).unwrap();
         assert_eq!(id["requireCanonical"], true, "{id}");
+    }
+
+    #[test]
+    fn a_tip_skips_empty_blocks_and_is_at_least_one_wei() {
+        let history = |blocks: &[(f64, u128)]| FeeHistory {
+            gas_used_ratio: blocks.iter().map(|b| b.0).collect(),
+            reward: Some(blocks.iter().map(|b| vec![b.1]).collect()),
+            ..Default::default()
+        };
+        let busy = history(&[(0.3, 10), (0.6, 30), (0.0, 99), (0.9, 20)]);
+        assert_eq!(tip_of(&busy, 75.0), 30);
+        assert_eq!(tip_of(&busy, 50.0), 20);
+        assert_eq!(tip_of(&history(&[(0.0, 9), (0.5, 0)]), 75.0), 1);
+        assert_eq!(tip_of(&history(&[]), 75.0), 1);
     }
 }
