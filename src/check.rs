@@ -1,5 +1,5 @@
 //! The relayer's own preconditions on a request, checked before it sends:
-//! canonical data (D4), the refund (D5), the target (D9) and the deadline.
+//! canonical data, the refund, the target, the deadline and the gas limit.
 
 use std::{
     fmt::Display,
@@ -64,7 +64,7 @@ pub struct Request {
     pub create: Option<Create>,
     /// `execute(AUTHORIZED_MODE, data)`'s `data`, signed.
     pub data: Bytes,
-    /// The gas limit the client's refund was priced for; the send uses D8's, at most this.
+    /// The gas limit the client's refund was priced for; the send's limit is at most this.
     pub gas_limit: u64,
 }
 
@@ -93,7 +93,7 @@ pub enum Refusal {
     },
     /// The signed batch needs a higher gas limit than the one its refund was priced for.
     GasLimitTooLow {
-        /// D8's limit for the batch.
+        /// The limit the batch is sent at.
         required: u64,
     },
     /// The contracts do not vouch for the target.
@@ -112,7 +112,7 @@ pub enum Refusal {
 }
 
 /// Check `request` against `config` on the chain `provider` reads, and set its
-/// gas limit from its simulation (D8).
+/// gas limit from its simulation.
 pub async fn check<P: Provider>(
     provider: &P,
     config: &Config,
@@ -133,34 +133,23 @@ pub async fn check<P: Provider>(
         message.value,
     );
     let call = call.await?;
-    let fees = provider.estimate_eip1559_fees().await.map_err(node)?;
-    let mut tx = gas::priced(call.clone(), request.gas_limit, &fees, config.chain_id);
-    let gas_cost = U256::from(request.gas_limit)
-        .saturating_mul(U256::from(fees.max_fee_per_gas))
-        .saturating_add(gas::l1_fee_bound(provider, config, &tx).await?);
-    if refund
-        .checked_sub(message.value)
-        .is_none_or(|net| net < gas_cost)
-    {
-        let required = message.value.saturating_add(gas_cost);
+    let priced = gas::price(provider, config, call.clone(), request.gas_limit);
+    let (mut tx, _, cost) = priced.await?;
+    let value = message.value;
+    if refund.checked_sub(value).is_none_or(|net| net < cost) {
+        let required = value.saturating_add(cost);
         return Err(Refusal::RefundTooLow { refund, required });
     }
-    let sim = gas::simulate(provider, &call, late).await?;
-    if !sim.status {
-        return Err(reverted(sim.return_data));
-    }
     let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
-    let required = gas::limit(sim.gas_used, call_gas, create.is_some());
-    if required > request.gas_limit {
-        return Err(Refusal::GasLimitTooLow { required });
-    }
-    tx.set_gas_limit(required);
+    let (create, priced_for) = (create.is_some(), request.gas_limit);
+    let limit = relay_limit(provider, &call, late, call_gas, create, priced_for);
+    tx.set_gas_limit(limit.await?);
     simulate(provider, &tx, late).await?;
     let timeout = config.inclusion_window;
     Ok(Checked { tx, timeout })
 }
 
-/// The message `data` carries, its authorization and its batch, all canonical (D4).
+/// The message `data` carries, its authorization and its batch, all canonical.
 pub(crate) fn decode(
     data: &Bytes,
 ) -> Option<(ExecuteMessage, ExecuteAuthorization, Vec<Execution>)> {
@@ -181,6 +170,27 @@ fn refund(executions: &[Execution], relayer: Address) -> Option<U256> {
         .reduce(U256::saturating_add)
 }
 
+/// The gas limit `call` is sent at, from its run at `late`, for its signed
+/// `call_gas` and path; at most the limit its refund was priced for.
+async fn relay_limit<P: Provider>(
+    provider: &P,
+    call: &TransactionRequest,
+    late: u64,
+    call_gas: u64,
+    create: bool,
+    priced_for: u64,
+) -> Result<u64, Refusal> {
+    let sim = gas::simulate(provider, call, late).await?;
+    if !sim.status {
+        return Err(reverted(sim.return_data));
+    }
+    let required = gas::limit(sim.gas_used, call_gas, create);
+    if required > priced_for {
+        return Err(Refusal::GasLimitTooLow { required });
+    }
+    Ok(required)
+}
+
 /// The end of the inclusion window after the latest block, which `deadline` is not before.
 async fn unexpired<P: Provider>(
     provider: &P,
@@ -197,7 +207,7 @@ async fn unexpired<P: Provider>(
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, when the contracts
-/// vouch for the wallet (D9); a 7702 account only with no value (D5a).
+/// vouch for the wallet; a 7702 account only with no value.
 pub(crate) async fn target<P: Provider>(
     provider: &P,
     config: &Config,

@@ -1,11 +1,8 @@
-//! What a send needs in gas (D7, D8) and in L1 fee (D5), from one simulation.
+//! What a send needs in gas and in L1 fee, from one simulation.
 
 use alloy::{
     consensus::SignableTransaction,
-    eips::{
-        eip1559::Eip1559Estimation,
-        BlockNumberOrTag,
-    },
+    eips::BlockNumberOrTag,
     network::TransactionBuilder,
     primitives::{
         address,
@@ -57,19 +54,26 @@ pub(crate) fn limit(gas: u64, call_gas: u64, create: bool) -> u64 {
     u64::try_from(run.div_ceil(4) + reserve).unwrap_or(u64::MAX)
 }
 
-/// `call` sent at `gas_limit` and `fees`: the tip at most the fee cap.
-pub(crate) fn priced(
+/// `call` priced at `gas_limit` and the node's fees, the tip at most the fee cap; its
+/// L1 fee bound; and the most it costs the relayer, `gas_limit × max fee + L1 bound`.
+pub(crate) async fn price<P: Provider>(
+    provider: &P,
+    config: &Config,
     call: TransactionRequest,
     gas_limit: u64,
-    fees: &Eip1559Estimation,
-    chain_id: u64,
-) -> TransactionRequest {
-    call.with_gas_limit(gas_limit)
-        .with_max_fee_per_gas(fees.max_fee_per_gas)
-        .with_max_priority_fee_per_gas(
-            fees.max_priority_fee_per_gas.min(fees.max_fee_per_gas),
-        )
-        .with_chain_id(chain_id)
+) -> Result<(TransactionRequest, U256, U256), Refusal> {
+    let fees = provider.estimate_eip1559_fees().await.map_err(node)?;
+    let max_fee_per_gas = fees.max_fee_per_gas;
+    let tx = call
+        .with_gas_limit(gas_limit)
+        .with_max_fee_per_gas(max_fee_per_gas)
+        .with_max_priority_fee_per_gas(fees.max_priority_fee_per_gas.min(max_fee_per_gas))
+        .with_chain_id(config.chain_id);
+    let l1_fee_bound = l1_fee_bound(provider, config, &tx).await?;
+    let cost = U256::from(gas_limit)
+        .saturating_mul(U256::from(max_fee_per_gas))
+        .saturating_add(l1_fee_bound);
+    Ok((tx, l1_fee_bound, cost))
 }
 
 /// The latest block's timestamp.
@@ -114,8 +118,8 @@ pub(crate) async fn simulate<P: Provider>(
     Ok(call)
 }
 
-/// `k × getL1FeeUpperBound` of `tx`'s unsigned size: the L1 fee a refund covers (D5).
-pub(crate) async fn l1_fee_bound<P: Provider>(
+/// `k × getL1FeeUpperBound` of `tx`'s unsigned size: the L1 fee a refund covers.
+async fn l1_fee_bound<P: Provider>(
     provider: &P,
     config: &Config,
     tx: &TransactionRequest,
