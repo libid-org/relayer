@@ -30,9 +30,6 @@ use serde_json::{
     Value,
 };
 
-/// A key whose hex holds a marker no output may carry.
-const MARKER: &str = "5ec7e75ec7e7";
-
 /// A server on random ports, and every body it answered.
 struct Server {
     url: String,
@@ -319,48 +316,4 @@ async fn a_wallet_budget_trips_before_the_global_pause() {
     let requests = [("included".to_owned(), 1), ("reverted".to_owned(), 1)];
     assert_eq!(stats.requests, BTreeMap::from(requests));
     assert_eq!(stats.profit, -first - second, "not charged its loss");
-}
-
-/// A relayer whose hex key holds a marker: no log line of this suite, at every
-/// level, and no response carries it.
-#[tokio::test]
-async fn the_signer_key_is_in_no_log_line_or_response() {
-    let logs = crate::db("logs").with_extension("log");
-    let file = Mutex::new(std::fs::File::create(&logs).unwrap());
-    let subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE);
-    // Global: a thread's own subscriber misses events once other tests cached them.
-    let subscriber = subscriber.with_writer(file).finish();
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-    let mut o = Onboarding::new(true).await;
-    let key: PrivateKeySigner = format!("0x{}0123", MARKER.repeat(5)).parse().unwrap();
-    let url = o._anvil.endpoint_url();
-    o.relayer = ProviderBuilder::new()
-        .wallet(key.clone())
-        .connect_http(url)
-        .erased();
-    o.relayer_address = key.address();
-    o.set_balance(key.address(), U256::from(CLAIMED)).await;
-    let s =
-        Server::start(&o, o.config(), &db("marker"), Duration::from_millis(100)).await;
-
-    assert_eq!(
-        s.call("/v1/config", None).await.1["relayer"],
-        json!(key.address())
-    );
-    let request = o.request_for(&o.onboarding()).await;
-    s.call("/v1/quote", Some(wire(&request))).await;
-    let (_, accepted) = s.relay(&request).await;
-    s.settle(&o, &accepted["id"], "included").await;
-    s.relay(&o.request_for(&o.batch(o.repay(o.value))).await)
-        .await;
-    for path in ["/health", "/metrics", "/nowhere"] {
-        s.call(path, None).await;
-    }
-    let logs = std::fs::read_to_string(logs).unwrap();
-    assert!(logs.contains("relayer listening on"), "no log captured");
-    let seen = s.seen.lock().unwrap().clone();
-    assert!(seen.contains("RefundTooLow"), "no refusal answered");
-    for (what, text) in [("a log line", logs), ("a response", seen)] {
-        assert!(!text.to_lowercase().contains(MARKER), "the key in {what}");
-    }
 }

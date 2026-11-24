@@ -6,6 +6,7 @@ use alloy::primitives::{
     Address,
     U256,
 };
+use serde::Deserialize;
 
 /// The send-to-inclusion window a production chain is configured with. The fee
 /// covers the base fee's growth over it and the quote's validity: ×1.49 on Base.
@@ -27,7 +28,8 @@ const UNLIMITED: Budget = Budget {
 };
 
 /// How the relayer bounds the L1 data fee of a send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum L1Fee {
     /// An OP-stack chain: `getL1FeeUpperBound` of the gas price oracle.
     OpStack,
@@ -37,7 +39,8 @@ pub enum L1Fee {
 
 /// A chain's EIP-1559 base fee rule: each block's base fee grows at most
 /// `(elasticity - 1) / denominator`, and is never below `min_base_fee`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Eip1559 {
     /// The base fee change denominator.
     pub denominator: u32,
@@ -94,8 +97,10 @@ impl Eip1559 {
     }
 }
 
-/// Where the relayer reads a chain's base fee rule, at each fee it computes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where the relayer reads a chain's base fee rule, at each fee it computes:
+/// `"header"`, or `{ fixed = { denominator, elasticity, min_base_fee } }`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FeeParams {
     /// The latest OP-stack header's `extraData`.
     Header,
@@ -104,11 +109,13 @@ pub enum FeeParams {
 }
 
 /// At most `wei` lost over any `window`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budget {
     /// The loss that trips the budget, in wei.
     pub wei: U256,
     /// How far back losses count.
+    #[serde(with = "humantime_serde")]
     pub window: Duration,
 }
 

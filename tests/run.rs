@@ -1,0 +1,262 @@
+//! `relayer run` and its configuration: the example file with its overrides, each
+//! startup check's refusal, and the binary served from a file whose key and RPC URL
+//! carry markers no output may. Needs `anvil` on `PATH`.
+
+#![allow(dead_code, unused_imports)]
+
+include!("common/onboarding.rs");
+
+use std::{
+    process::{
+        Command,
+        Stdio,
+    },
+    time::Duration,
+};
+
+use relayer::{
+    config::FeeParams,
+    settings::Settings,
+    startup::check,
+};
+use serde_json::{
+    json,
+    Value,
+};
+
+const KEY_MARKER: &str = "5ec7e75ec7e7";
+const URL_MARKER: &str = "a11ce5ec7e7";
+const EXAMPLE: &str = include_str!("../relayer.example.toml");
+
+/// `text` as `relayer.toml` in a fresh directory, and the file's path.
+fn write(name: &str, text: &str) -> PathBuf {
+    let path = db(name).with_file_name("relayer.toml");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// The example, with the environment's overrides; an unknown key and a network file on
+/// another chain refused.
+#[test]
+fn the_example_loads_with_its_overrides() {
+    let load = |text: &str, env: &dyn Fn(&str) -> Option<String>| {
+        Settings::load(&write("example", text), env).map_err(|e| e.to_string())
+    };
+    let port = |value: &'static str| {
+        move |n: &str| (n != "RELAYER_RPC_URL").then(|| value.into())
+    };
+    let refused = load(EXAMPLE, &port("x")).err().unwrap();
+    assert_eq!(refused, "RELAYER_PORT: invalid digit found in string");
+    let s = load(EXAMPLE, &port("7")).unwrap();
+    let url = "https://sepolia.base.org";
+    assert_eq!(
+        (s.rpc_url.unwrap(), s.signer.unwrap()),
+        (url.into(), "7".into())
+    );
+    assert_eq!(
+        (s.port, s.metrics_port, s.config.chain_id),
+        (7, 9090, 84532)
+    );
+    assert_eq!(s.config.fee_params, FeeParams::Header);
+    assert_eq!(s.config.wallet_budget.window, Duration::from_secs(3600));
+    assert!(s.db.ends_with("relayer.db") && s.db.is_absolute());
+
+    let limit = "concurrency_limit = 64";
+    let unknown = EXAMPLE.replace(limit, &format!("{limit}\ncolour = 1"));
+    let line = unknown.lines().position(|l| l == "colour = 1").unwrap() + 1;
+    let e = load(&unknown, &|_| None).err().unwrap();
+    let at = format!("line {line}, column 1: unknown field `colour`");
+    assert!(e.contains(&at), "{e}");
+    let other = write("network", "[network]\nchain_id = 1\nname = \"other\"\n");
+    let file = format!(
+        "chain_id = 84532\nnetwork_file = {:?}",
+        other.display().to_string()
+    );
+    let e = load(&EXAMPLE.replace("chain_id = 84532", &file), &|_| None)
+        .err()
+        .unwrap();
+    assert!(e.ends_with("name the same chain"), "{e}");
+}
+
+/// A configuration, code planted at an address, and the hint refused with; none when it
+/// passes.
+type Case<'a> = (Config, Option<(Address, &'a str)>, &'a str);
+
+/// Each check refuses its case with its fix; the code planted for a case is restored.
+#[tokio::test]
+async fn each_startup_check_refuses_with_its_hint() {
+    let o = Onboarding::new(true).await;
+    let (ok, at) = (o.config(), Address::repeat_byte(0x0c));
+    let with = |change: &dyn Fn(&mut Config)| {
+        let mut config = ok.clone();
+        change(&mut config);
+        config
+    };
+    let (one, revert, zero) = ("600160005260206000f3", "60006000fd", "60206000f3");
+    let l1_block =
+        alloy::primitives::address!("4200000000000000000000000000000000000015");
+    let (ep, implementation) = (o.stack.entry_point, o.stack.release.implementation);
+    let missing_ep = format!("no EntryPoint v0.9 at {ep}");
+    let op = with(&|c| c.l1_fee = L1Fee::OpStack);
+    #[rustfmt::skip]
+    let rows: Vec<Case> = vec![
+        (ok.clone(), None, ""),
+        (with(&|c| c.chain_id = 1), None, "point rpc_url at it"),
+        (with(&|c| c.relayer = at), None, "set address to the signer's"),
+        (with(&|c| c.factory = at), None, "[contracts] factory"),
+        (with(&|c| c.forwarder = at), None, "[contracts] forwarder"),
+        (with(&|c| c.forwarder = at), Some((at, one)), "set this factory's forwarder"),
+        (ok.clone(), Some((implementation, one)), "set the factory that published it"),
+        (ok.clone(), Some((ep, "")), &missing_ep),
+        (with(&|c| c.supported_releases = vec![2]), None, "run a relayer that decodes"),
+        (with(&|c| c.min_balance = U256::MAX), None, "fund"),
+        (with(&|c| c.wallet_budget.wei = U256::ONE), None, "wallet_budget 1 is below"),
+        (op.clone(), Some((l1_block, one)), "operator fee is on"),
+        (op.clone(), Some((l1_block, revert)), ""),
+        (op.clone(), Some((l1_block, zero)), ""),
+        (op, None, ""),
+    ];
+    for (config, planted, hint) in rows {
+        let (at, hex) = planted.unwrap_or((Address::ZERO, "")); // no code at zero
+        let kept = o.owner.get_code_at(at).await.unwrap();
+        o.set_code(at, hex).await;
+        match check(&o.relayer, &config, o.relayer_address).await {
+            Ok(()) => assert_eq!(hint, "", "passed"),
+            Err(e) => assert!(!hint.is_empty() && e.to_string().contains(hint), "{e}"),
+        }
+        o.owner.anvil_set_code(at, kept).await.unwrap();
+    }
+}
+
+/// `relayer` started from a file, its key and RPC URL marked: help, a missing file, a
+/// mangled key and a wrong chain exit with their hints; `run` serves `/health`,
+/// `/v1/config`, a quote and a relay; with the node gone, its errors log the URL
+/// redacted; an interrupt stops it. No output carries a marker.
+#[tokio::test]
+async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
+    let mut o = Onboarding::new(true).await;
+    let key = format!("0x{}0123", KEY_MARKER.repeat(5));
+    let signer: PrivateKeySigner = key.parse().unwrap();
+    o.relayer_address = signer.address();
+    o.set_balance(signer.address(), U256::from(CLAIMED)).await;
+    let port = o._anvil.port();
+    let rpc = format!("http://user:{URL_MARKER}@127.0.0.1:{port}/?key={URL_MARKER}");
+    let fixed = "{ fixed = { denominator = 8, elasticity = 2, min_base_fee = 0 } }";
+    let file = |chain_id: u64| {
+        let chain = chain_id.to_string();
+        let anvil = [
+            ("84532", chain.as_str()),
+            ("\"op-stack\"", "\"none\""),
+            ("\"header\"", fixed),
+            ("max_fee_percent = 200", "max_fee_percent = 181"),
+            ("\"200ms\"", "\"1s\""),
+            ("poll_interval = \"1s\"", "poll_interval = \"100ms\""),
+            ("\"10s\"", "\"5s\""),
+            ("port = 8080", "port = 0"),
+            ("metrics_port = 9090", "metrics_port = 0"),
+            ("\"1000000000000000\"", "\"1000000000000000000\""),
+        ];
+        let mut text = anvil
+            .iter()
+            .fold(EXAMPLE.to_owned(), |t, (a, b)| t.replace(a, b));
+        for at in [o.stack.factory, o.stack.forwarder, signer.address()] {
+            text = text.replacen(&Address::ZERO.to_string(), &at.to_string(), 1);
+        }
+        write("run", &text)
+    };
+    let relayer = |config: &Path, signer: &str, args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_relayer"));
+        let env = [
+            ("RUST_LOG", "trace"),
+            ("RELAYER_SIGNER", signer),
+            ("RELAYER_RPC_URL", &rpc),
+        ];
+        command.arg("--config").arg(config).args(args).envs(env);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+    };
+    let mut seen = String::new();
+    let (good, wrong, mangled) = (file(o.chain_id), file(1), format!("{KEY_MARKER}0"));
+    let nowhere = PathBuf::from("nowhere.toml");
+    #[rustfmt::skip]
+    let exits = [
+        (&good, &key, &["--help"][..], ""),
+        (&good, &key, &["run", "--help"], ""),
+        (&nowhere, &key, &["run"], "--config or RELAYER_CONFIG"),
+        (&good, &mangled, &["run"], "fix RELAYER_SIGNER"),
+        (&wrong, &key, &["run"], "point rpc_url at it"),
+    ];
+    for (config, signer, args, hint) in exits {
+        let out = relayer(config, signer, args).output().unwrap();
+        let text =
+            String::from_utf8_lossy(&[out.stdout, out.stderr].concat()).into_owned();
+        assert_eq!(out.status.success(), hint.is_empty(), "{text}");
+        assert!(text.contains(hint), "{hint}: {text}");
+        seen.push_str(&text);
+    }
+
+    let log = good.with_file_name("relayer.log");
+    let stdout = std::fs::File::create(&log).unwrap();
+    let mut child = relayer(&good, &key, &["run"])
+        .stdout(stdout)
+        .spawn()
+        .unwrap();
+    let logs = || std::fs::read_to_string(&log).unwrap();
+    let mut ports = vec![];
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some((_, at)) = logs().split_once("relayer listening on ") {
+            let at = at.lines().next().unwrap().split(", metrics on ");
+            ports.extend(at.map(|a| a.rsplit(':').next().unwrap().to_owned()));
+            break;
+        }
+    }
+    let url = |i: usize, path: &str| format!("http://127.0.0.1:{}{path}", ports[i]);
+    let http = reqwest::Client::new();
+    let call = async |i: usize, path: &str, body: Option<&Value>| {
+        let request = match body {
+            Some(body) => http.post(url(i, path)).json(body),
+            None => http.get(url(i, path)),
+        };
+        let response = request.send().await.unwrap();
+        (response.status().as_u16(), response.text().await.unwrap())
+    };
+    for _ in 0..50 {
+        if call(0, "/health", None).await.0 == 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let config: Value =
+        serde_json::from_str(&call(0, "/v1/config", None).await.1).unwrap();
+    assert_eq!(config["relayer"], json!(signer.address()));
+    assert_eq!(config["registry"], json!(o.stack.wallet_registry));
+    let request = o.request_for(&o.onboarding()).await;
+    let c = request.create.unwrap();
+    let create =
+        json!({"platformId": c.platform_id, "idNode": c.id_node, "salt": c.salt});
+    let wire = json!({"wallet": request.wallet, "create": create, "data": request.data,
+                      "gasLimit": request.gas_limit});
+    let quoted = call(0, "/v1/quote", Some(&wire)).await;
+    let relayed = call(0, "/v1/relay", Some(&wire)).await;
+    assert_eq!((quoted.0, relayed.0), (200, 202), "{quoted:?} {relayed:?}");
+    let mut answered = [quoted.1, relayed.1, call(1, "/metrics", None).await.1].concat();
+
+    drop(o); // the node gone: ticks and quotes meet node errors naming its URL
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let unreachable = call(0, "/v1/quote", Some(&wire)).await;
+    assert_eq!(unreachable.0, 503, "{unreachable:?}");
+    answered.push_str(&unreachable.1);
+    let pid = child.id().to_string();
+    Command::new("kill").args(["-INT", &pid]).status().unwrap();
+    assert!(child.wait().unwrap().success(), "not shut down");
+    let (logs, all) = (logs(), [logs(), seen, answered].concat().to_lowercase());
+    for marker in [KEY_MARKER, URL_MARKER] {
+        assert!(!all.contains(marker), "{marker} in an output: {all}");
+    }
+    assert!(
+        logs.contains(&format!("127.0.0.1:{port}/…")),
+        "no node error: {logs}"
+    );
+    assert!(logs.contains("shutting down"), "{logs}");
+}
