@@ -258,3 +258,72 @@ async fn a_request_expired_before_its_send_fails_unsent() {
         "sent"
     );
 }
+
+/// A landed send's receipt cost goes on its request row, seen after it was queued.
+#[tokio::test]
+async fn a_landed_send_records_its_receipt_cost() {
+    let o = Onboarding::new(true).await;
+    let r = o.start(&db("ledger")).await.unwrap();
+    let id = o.onboard(&r, 3600).await.unwrap();
+    let report = o.settle(&r, id, included).await;
+    let receipt = o.owner.get_transaction_receipt(report.tx_hashes[0]).await;
+    let receipt = receipt.unwrap().unwrap();
+    let paid = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
+    let cost = report.cost.expect("no cost recorded");
+    assert_eq!(U256::from(cost.gas_used) * cost.gas_price, paid);
+    assert_eq!(cost.l1_fee, U256::ZERO, "an L1 fee on anvil");
+    let (created, sent) = (report.created_at, report.sent_at[0]);
+    assert!(created > 0 && sent >= created && cost.included_at >= sent);
+}
+
+/// A balance below a send's worst cost leaves it queued with no nonce, and pauses.
+#[tokio::test]
+async fn an_underfunded_relayer_pauses_before_its_send() {
+    let o = Onboarding::new(true).await;
+    let r = o.start(&db("underfunded")).await.unwrap();
+    let id = o.onboard(&r, 3600).await.unwrap();
+    // The send's gas at its cap is above `R - value - GAS_LIMIT`.
+    let short = o.refund() - U256::from(GAS_LIMIT);
+    o.set_balance(o.relayer_address, short).await;
+    let refused = r.tick().await.expect_err("sent underfunded").to_string();
+    assert!(refused.contains("below a send's cost"), "{refused}");
+    assert!(r.paused().await, "no pause");
+    let report = r.status(id).await.unwrap();
+    assert!(
+        matches!(report.status, Status::Queued),
+        "{:?}",
+        report.status
+    );
+    assert!(
+        report.tx_hashes.is_empty() && o.relayer_nonce().await == 0,
+        "sent"
+    );
+}
+
+/// A first send the node refuses is uncommitted, queued again, and pauses.
+#[tokio::test]
+async fn a_refused_first_send_is_queued_again_and_pauses() {
+    let o = Onboarding::new(true).await;
+    let r = o.start(&db("refused")).await.unwrap();
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    // A pending transaction at nonce 0 that the send cannot replace.
+    let gwei = 1_000_000_000;
+    let ahead = TransactionRequest::default()
+        .with_to(o.relayer_address)
+        .with_max_fee_per_gas(1000 * gwei)
+        .with_max_priority_fee_per_gas(100 * gwei);
+    let _pending = o.relayer.send_transaction(ahead).await.unwrap();
+    let id = o.onboard(&r, 3600).await.unwrap();
+    let refused = r.tick().await.expect_err("refusal unreported").to_string();
+    assert!(refused.contains("refused"), "{refused}");
+    let report = r.status(id).await.unwrap();
+    assert!(
+        matches!(report.status, Status::Queued),
+        "{:?}",
+        report.status
+    );
+    assert!(
+        report.tx_hashes.is_empty() && r.paused().await,
+        "sent or unpaused"
+    );
+}

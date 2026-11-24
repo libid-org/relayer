@@ -31,7 +31,11 @@ use alloy::{
         Decodable2718,
         Encodable2718,
     },
-    network::TransactionBuilder,
+    network::{
+        AnyTransactionReceipt,
+        ReceiptResponse,
+        TransactionBuilder,
+    },
     primitives::{
         keccak256,
         Address,
@@ -79,9 +83,12 @@ const CANCEL_PERCENTILE: f64 = 90.0;
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS requests (id BLOB PRIMARY KEY, wallet BLOB NOT NULL,
         tx TEXT NOT NULL, net BLOB NOT NULL, l1 BLOB NOT NULL, deadline INTEGER NOT NULL,
-        status TEXT NOT NULL, block INTEGER, reverted INTEGER, failure TEXT, detail BLOB);
+        status TEXT NOT NULL, block INTEGER, reverted INTEGER, failure TEXT, detail BLOB,
+        created_at INTEGER NOT NULL DEFAULT (unixepoch()), gas_used INTEGER, gas_price BLOB, l1_fee BLOB,
+        included_at INTEGER);
     CREATE TABLE IF NOT EXISTS attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
-        nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL);
+        nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL,
+        sent_at INTEGER NOT NULL DEFAULT (unixepoch()));
     CREATE TABLE IF NOT EXISTS nonce (next INTEGER NOT NULL);";
 
 /// Where a request stands.
@@ -118,6 +125,25 @@ pub struct Report {
     pub status: Status,
     /// Its send, then its cancel if any.
     pub tx_hashes: Vec<B256>,
+    /// When each of `tx_hashes` was committed, in unix seconds.
+    pub sent_at: Vec<u64>,
+    /// When it was last queued, in unix seconds.
+    pub created_at: u64,
+    /// What its attempt with a receipt cost.
+    pub cost: Option<Cost>,
+}
+
+/// A receipt's cost, in wei: `gas_used × gas_price + l1_fee`.
+#[derive(Debug)]
+pub struct Cost {
+    /// The receipt's gas used.
+    pub gas_used: u64,
+    /// The receipt's effective gas price.
+    pub gas_price: U256,
+    /// The receipt's `l1Fee`; 0 on a chain without one.
+    pub l1_fee: U256,
+    /// When the relayer first saw the receipt, in unix seconds.
+    pub included_at: u64,
 }
 
 /// A signed transaction, committed at its nonce before it is broadcast.
@@ -248,20 +274,31 @@ impl<P: Provider> Relayer<P> {
 
     /// `id`'s status and its transactions.
     pub async fn status(&self, id: B256) -> Result<Report, Error> {
-        let sql =
-            "SELECT status, block, reverted, failure, detail FROM requests WHERE id = ?1";
+        let sql = "SELECT status, block, reverted, failure, detail, created_at, \
+                   gas_used, gas_price, l1_fee, included_at FROM requests WHERE id = ?1";
         let row = |r: &Row| {
             let (block, reverted) =
                 (r.get::<_, Option<_>>(1)?, r.get::<_, Option<_>>(2)?);
             let failure = (r.get::<_, Option<String>>(3)?, r.get(4)?);
+            let cost = match r.get::<_, Option<u64>>(6)? {
+                None => None,
+                Some(gas_used) => Some(Cost {
+                    gas_used,
+                    gas_price: u256(r, 7)?,
+                    l1_fee: u256(r, 8)?,
+                    included_at: r.get(9)?,
+                }),
+            };
             Ok((
                 first::<String>(r)?,
                 block.unwrap_or(0),
                 reverted.unwrap_or(false),
                 failure,
+                r.get(5)?,
+                cost,
             ))
         };
-        let (status, block, reverted, (failure, detail)) =
+        let (status, block, reverted, (failure, detail), created_at, cost) =
             self.db().query_row(sql, [&id[..]], row)?;
         let status = match &status[..] {
             "queued" => Status::Queued,
@@ -271,11 +308,21 @@ impl<P: Provider> Relayer<P> {
             "cancelled" => Status::Cancelled,
             _ => Status::Failed(decode_failure(&failure.unwrap_or_default(), detail)),
         };
-        let tx_hashes = self.attempts(id)?.iter().map(|a| a.hash).collect();
-        Ok(Report { status, tx_hashes })
+        let sql = "SELECT hash, sent_at FROM attempts WHERE id = ?1 ORDER BY rowid";
+        let sent = rows(&self.db(), sql, [&id[..]], |r| {
+            Ok((b256(r, 0)?, r.get::<_, u64>(1)?))
+        })?;
+        let (tx_hashes, sent_at) = sent.into_iter().unzip();
+        Ok(Report {
+            status,
+            tx_hashes,
+            sent_at,
+            created_at,
+            cost,
+        })
     }
 
-    /// Whether sending paused on a nonce another sender took.
+    /// Whether sending paused: a foreign nonce, a low balance or a refused first send.
     pub async fn paused(&self) -> bool {
         self.paused.load(Relaxed)
     }
@@ -291,8 +338,11 @@ impl<P: Provider> Relayer<P> {
     ) -> Result<(), Error> {
         let attempts = self.attempts(id)?;
         for a in &attempts {
-            let Some(receipt) = self.provider.get_transaction_receipt(a.hash).await?
-            else {
+            // Read as any receipt, which keeps an OP-stack `l1Fee`.
+            let get = self
+                .provider
+                .raw_request("eth_getTransactionReceipt".into(), (a.hash,));
+            let Some(receipt): Option<AnyTransactionReceipt> = get.await? else {
                 continue;
             };
             let block = receipt.block_number.unwrap_or_default();
@@ -303,7 +353,7 @@ impl<P: Provider> Relayer<P> {
                 (false, true) => "confirmed",
                 (false, false) => "included",
             };
-            return self.set_status(id, status, Some((block, !receipt.status())), None);
+            return self.set_status(id, status, Some((block, &receipt)), None);
         }
         self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
         let Some(last) = attempts.last() else {
@@ -338,7 +388,13 @@ impl<P: Provider> Relayer<P> {
             .nonce(next)
             .max_priority_fee_per_gas(tip);
         let attempt = self.sign(tx, false).await?;
-        affordable(&attempt.raw, cover)?;
+        let worst = affordable(&attempt.raw, cover)?;
+        let balance = self.provider.get_balance(self.config.relayer).await?;
+        if balance < worst {
+            self.paused.store(true, Relaxed);
+            let short = format!("balance {balance} below a send's cost {worst}");
+            return Err(format!("{short}: sending paused; fund it and restart").into());
+        }
         let gate = async {
             self.runs(&attempt.raw, deadline).await?;
             let raw = attempt.raw.clone();
@@ -428,9 +484,32 @@ impl<P: Provider> Relayer<P> {
                 Ok(()) => {}
             }
         }
-        // A refused broadcast is tried again at the next tick.
-        let _ = self.provider.send_raw_transaction(&a.raw).await;
-        Ok(())
+        let Err(e) = self.provider.send_raw_transaction(&a.raw).await else {
+            return Ok(());
+        };
+        let first = deadline.is_none() && !a.cancel;
+        let known = self.provider.get_transaction_by_hash(a.hash);
+        if !first || e.as_error_resp().is_none() || known.await?.is_some() {
+            eprintln!("broadcast of {} refused, retried next tick: {e}", a.hash);
+            return Ok(());
+        }
+        self.uncommit(a)?;
+        self.paused.store(true, Relaxed);
+        Err(format!("the node refused send {}: {e}; sending paused", a.hash).into())
+    }
+
+    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, queue it again.
+    fn uncommit(&self, a: &Attempt) -> Result<(), Error> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE requests SET status = 'queued' \
+             WHERE id = (SELECT id FROM attempts WHERE hash = ?1)",
+            [&a.hash[..]],
+        )?;
+        tx.execute("DELETE FROM attempts WHERE hash = ?1", [&a.hash[..]])?;
+        tx.execute("UPDATE nonce SET next = ?1 WHERE next = ?1 + 1", [a.nonce])?;
+        Ok(tx.commit()?)
     }
 
     /// Store `a` and the next nonce past it, and mark `id` sent, in one transaction.
@@ -453,15 +532,33 @@ impl<P: Provider> Relayer<P> {
         &self,
         id: B256,
         status: &str,
-        receipt: Option<(u64, bool)>,
+        receipt: Option<(u64, &AnyTransactionReceipt)>,
         failed: Option<&Refusal>,
     ) -> Result<(), Error> {
-        let (block, reverted) = receipt.unzip();
+        let (block, receipt) = receipt.unzip();
         let (failure, detail) = failed.map(encode_failure).unzip();
+        let l1 = receipt.and_then(|r| r.other.get_deserialized::<U256>("l1Fee"));
+        let l1 = l1.transpose()?.unwrap_or_default().to_be_bytes::<32>();
+        let wei = |r: &AnyTransactionReceipt| U256::from(r.effective_gas_price);
+        let (gas, price) = (receipt.map(|r| r.gas_used), receipt.map(wei));
+        let (reverted, l1) = (receipt.map(|r| !r.status()), receipt.map(|_| l1));
+        let price = price.map(|p| p.to_be_bytes::<32>());
         self.db().execute(
             "UPDATE requests SET status = ?2, block = ?3, reverted = ?4, failure = ?5, \
-             detail = ?6 WHERE id = ?1",
-            params![&id[..], status, block, reverted, failure, detail],
+             detail = ?6, gas_used = ?7, gas_price = ?8, l1_fee = ?9, included_at = \
+             CASE WHEN ?3 IS NULL THEN NULL ELSE coalesce(included_at, unixepoch()) END \
+             WHERE id = ?1",
+            params![
+                &id[..],
+                status,
+                block,
+                reverted,
+                failure,
+                detail,
+                gas,
+                price,
+                l1
+            ],
         )?;
         Ok(())
     }
@@ -541,13 +638,14 @@ fn admit(db: &Connection, id: B256, wallet: Address) -> Result<Option<B256>, Ref
 }
 
 /// The send `raw` costs at most `R - value`: its gas at its cap plus the L1 bound.
-fn affordable(raw: &[u8], (net, l1): Cover) -> Result<(), Error> {
+/// Returns that cost plus its value, the most it takes from the balance.
+fn affordable(raw: &[u8], (net, l1): Cover) -> Result<U256, Error> {
     let tx = TxEnvelope::decode_2718(&mut &raw[..])?;
     let worst = U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1;
     if worst > net {
         return Err(format!("a send costs up to {worst}, above R - value {net}").into());
     }
-    Ok(())
+    Ok(worst + tx.value())
 }
 
 /// A failure as stored: its name and its fields.
