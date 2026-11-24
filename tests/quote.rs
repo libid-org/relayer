@@ -297,8 +297,9 @@ async fn the_create_path_lands_at_the_d8_limit() {
 }
 
 /// An existing wallet: two admin signers at quorum are quoted within the 1.25 gas
-/// margin of the gas they use. Below quorum, a native refund's first spend, and an
-/// ERC-20 transfer's first spend before one, each land at their quoted limit.
+/// margin of the gas they use. They, one signer, and below quorum a native refund's
+/// first spend and an ERC-20 transfer's first spend before one, each land at their
+/// quoted limit.
 #[tokio::test]
 async fn session_batches_are_quoted_within_the_gas_margin() {
     let o = Onboarding::new(true).await;
@@ -313,6 +314,8 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         4 * used <= 5 * estimate && 4 * estimate <= 5 * used,
         "{estimate} for {used}"
     );
+    let checked = o.relay(&data, q.gas_limit).await.unwrap();
+    chain::send(&o.relayer, checked).await.unwrap();
 
     let refund = CallProof {
         maxValue: U256::from(CLAIMED),
@@ -325,6 +328,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     let transfer = transferCall::new((o.relayer_address, U256::ONE)).abi_encode();
     let calls = vec![call(token, U256::ZERO, transfer), o.repay(r)];
     let cases = [
+        Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None),
         Batch(
             vec![o.repay(r)],
             U256::ZERO,
