@@ -148,6 +148,16 @@ async fn refuses_before_sending() {
     o.owner.anvil_set_code(gauge, code.into()).await.unwrap();
     let mut starved = o.onboarding();
     starved.insert(0, call(gauge, U256::ZERO, vec![]));
+    // Both: reverts only by the window's end at the limit sent.
+    let both = Address::repeat_byte(0x7f);
+    let code = format!(
+        "67{:016x}4211622625a05a1016601657005b5f80fd",
+        now + window - 1
+    );
+    let code = alloy::hex::decode(code).unwrap();
+    o.owner.anvil_set_code(both, code.into()).await.unwrap();
+    let mut late_starved = o.onboarding();
+    late_starved.insert(0, call(both, U256::ZERO, vec![]));
 
     #[rustfmt::skip]
     let cases: Vec<Case> = vec![
@@ -170,6 +180,7 @@ async fn refuses_before_sending() {
         ("deadline inside the window", o.request(sign_at(o.value, now, now + window - 1)), expired),
         ("fails by the window's end", o.request_for(&late).await, failed_call),
         ("fails at the limit sent", o.request_for(&starved).await, failed_call),
+        ("fails at the limit sent by the window's end", o.request_for(&late_starved).await, failed_call),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
         ("account with value", on(account, good.clone()), unknown),
@@ -221,6 +232,15 @@ async fn refuses_before_sending() {
     // A node error that is not a revert is not reported as one.
     o.owner
         .anvil_set_balance(o.relayer_address, U256::ZERO)
+        .await
+        .unwrap();
+    let refused = check(&o.relayer, &o.config(), &o.request(good.clone()))
+        .await
+        .err();
+    assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
+    // The value but not the gas: only the priced call fails, and not as a revert.
+    o.owner
+        .anvil_set_balance(o.relayer_address, o.value)
         .await
         .unwrap();
     let refused = check(&o.relayer, &o.config(), &o.request(good)).await.err();

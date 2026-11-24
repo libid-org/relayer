@@ -211,17 +211,25 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
 
     let above = o.authorize(&b, Some(2 * q.call_gas)).await;
     let expected = o.limit(&above, o.value, 2 * q.call_gas).await;
+    let mut required = 0;
     for gas_limit in [q.gas_limit, expected - 3] {
         let refused = o.relay(&above, gas_limit).await.err();
-        let Some(Refusal::GasLimitTooLow { required }) = refused else {
+        let Some(Refusal::GasLimitTooLow { required: r }) = refused else {
             panic!("{refused:?}")
         };
         assert!(
-            required.abs_diff(expected) <= 2,
-            "required {required}, expected {expected}"
+            r.abs_diff(expected) <= 2,
+            "required {r}, expected {expected}"
         );
+        required = r;
     }
-    o.relay(&above, expected + 2).await.unwrap();
+    // A limit priced for exactly the required one passes; one gas less does not.
+    let refused = o.relay(&above, required - 1).await.err();
+    assert!(
+        matches!(refused, Some(Refusal::GasLimitTooLow { .. })),
+        "{refused:?}"
+    );
+    o.relay(&above, required).await.unwrap();
 
     let data = o.authorize(&b, Some(q.call_gas)).await;
     let limit = o.limit(&data, o.value, q.call_gas).await;
@@ -249,6 +257,16 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     );
     let got = slot(1).await.unwrap();
     assert!(got >= U256::from(q.call_gas), "it got less than callGas");
+    // The batch again, on the wallet it created: a draft whose call fails is no quote.
+    let draft = Draft {
+        wallet: o.wallet,
+        create: None,
+        data: o.authorize(&b, None).await,
+        below_quorum: false,
+    };
+    let refused = quote(&o.relayer, &o.config(), &draft).await.err();
+    let spent = |r: &Refusal| reverted(r, "DigestSpent"); // the link's, spent by its landing
+    assert!(refused.as_ref().is_some_and(spent), "{refused:?}");
 }
 
 /// An existing wallet: two admin signers at quorum are quoted within the 1.25 gas
@@ -269,6 +287,26 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         4 * used <= 5 * estimate && 4 * estimate <= 5 * used,
         "{estimate} for {used}"
     );
+    // Signed with a refund of fewer zero bytes than quoted: the quote overshoots the
+    // run by exactly the zero bytes left in R and the signatures, at 12 gas × 1.25.
+    let signed_r = r + U256::from(0x0101_0101_0101u64);
+    let signed = Batch(vec![o.repay(signed_r)], U256::ZERO, vec![&o.k, &k2], None);
+    let data = o.authorize(&signed, Some(q.call_gas)).await;
+    let (_, authorization) = ExecuteMessage::from_authorized_data(&data).unwrap();
+    let zeros = |b: &[u8]| b.iter().filter(|&&b| b == 0).count() as u64;
+    let sigs = authorization.signatures.iter().map(|s| zeros(&s.signature));
+    let filled = zeros(&signed_r.to_be_bytes::<32>()) + sigs.sum::<u64>();
+    let run = o.limit(&data, U256::ZERO, q.call_gas).await;
+    let overshoot = q.gas_limit.saturating_sub(run);
+    // 1 for rounding, 15 for a zero byte inside `call_gas`.
+    assert!(
+        overshoot.abs_diff(15 * filled) <= 16,
+        "{overshoot} for {filled}"
+    );
+    // R's zero bytes leave the quote unchanged: the draft runs them cheaper by as much.
+    let q2 = o.quote_with(&o.config(), &signed).await;
+    let unreserved = |q: &Quote| q.gas_limit - reserve(q.call_gas, false);
+    assert_eq!(unreserved(&q2), unreserved(&q));
     let checked = o.relay(&data, q.gas_limit).await.unwrap();
     chain::send(&o.relayer, checked).await.unwrap();
 
