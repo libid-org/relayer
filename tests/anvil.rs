@@ -1,9 +1,7 @@
-//! S1 on anvil: K signs link, bind, claim to the wallet and a refund; the relayer checks
-//! and sends `createAndExecute`, or refuses before sending. Needs `anvil` on `PATH`.
+//! Onboarding on anvil: K signs link, bind, claim to the wallet and a refund; the relayer
+//! checks and sends `createAndExecute`, or refuses before sending. Needs `anvil` on `PATH`.
 
 include!("common/onboarding.rs");
-
-use libid_contracts::gas::CALL_OVERHEAD;
 
 type Case = (&'static str, Request, fn(&Refusal) -> bool);
 
@@ -11,12 +9,7 @@ type Case = (&'static str, Request, fn(&Refusal) -> bool);
 #[tokio::test]
 async fn the_onboarding_batch_lands_when_sent_directly() {
     let o = Onboarding::new(true).await;
-    let data = o.sign(&o.onboarding()).await;
-    let factory = WalletFactory::new(o.stack.factory, &o.relayer);
-    let (c, value) = (o.create, o.value);
-    let send =
-        factory.createAndExecute(c.platform_id, c.id_node, c.salt, AUTHORIZED_MODE, data);
-    mined!(send.value(value).gas(GAS_LIMIT));
+    o.land(&o.sign(&o.onboarding()).await, o.value).await;
     o.assert_onboarded(o.refund()).await;
 }
 
@@ -50,21 +43,21 @@ async fn the_relayer_checks_and_lands_the_onboarding() {
         (sent.platformId, sent.idNode, sent.salt),
         (c.platform_id, c.id_node, c.salt)
     );
-    assert_eq!((sent.mode, sent.data), (AUTHORIZED_MODE, data), "I7, D4");
+    assert_eq!(
+        (sent.mode, sent.data),
+        (AUTHORIZED_MODE, data),
+        "the signed data"
+    );
     assert_eq!(tx.inner.value(), o.value);
-    // D8: `ceil(1.25 × gasUsed) + (callGas + CALL_OVERHEAD) × (64/63)²` on the create path.
-    let reserve = ((CALL_GAS + CALL_OVERHEAD) * 64 * 64).div_ceil(63 * 63);
-    let d8 = (receipt.gas_used * 5).div_ceil(4) + reserve;
+    // Sent at `ceil(1.25 × gasUsed)` plus the create path's reserve.
+    let limit = (receipt.gas_used * 5).div_ceil(4) + reserve(CALL_GAS, true);
+    let gas_limit = tx.inner.gas_limit();
     assert!(
-        tx.inner.gas_limit().abs_diff(d8) <= 2,
-        "sent at {}, D8 {d8}",
-        tx.inner.gas_limit()
+        gas_limit.abs_diff(limit) <= 2,
+        "sent at {gas_limit}, expected {limit}"
     );
-    let worst = U256::from(tx.inner.gas_limit()) * U256::from(tx.inner.max_fee_per_gas());
-    assert!(
-        worst <= o.refund() - o.value,
-        "I1: {worst} exceeds R - value"
-    );
+    let worst = U256::from(gas_limit) * U256::from(tx.inner.max_fee_per_gas());
+    assert!(worst <= o.refund() - o.value, "{worst} exceeds R - value");
 }
 
 /// Each case changes one thing of the passing request and is refused with
@@ -234,7 +227,7 @@ async fn refuses_before_sending() {
     assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
 }
 
-/// D2: a step already done fails as a decoded revert. With nothing escrowed
+/// A step already done fails as a decoded revert. With nothing escrowed
 /// the claim reverts `NothingHeld`, which the check names before sending.
 #[tokio::test]
 async fn an_empty_escrow_is_refused_as_nothing_held() {

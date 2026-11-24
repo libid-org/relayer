@@ -1,4 +1,4 @@
-// The S1 onboarding fixture, `include!`d by the anvil suites.
+// The onboarding fixture, `include!`d by the anvil suites.
 
 use std::time::Duration;
 
@@ -15,12 +15,14 @@ use alloy::{
         B256,
         U256,
     },
+    network::TransactionBuilder,
     providers::{
         ext::AnvilApi,
         DynProvider,
         Provider,
         ProviderBuilder,
     },
+    rpc::types::TransactionRequest,
     signers::{
         local::PrivateKeySigner,
         SignerSync,
@@ -41,6 +43,7 @@ use libid_contracts::{
         Operation,
         OPERATIONS_DOMAIN,
     },
+    gas::CALL_OVERHEAD,
     testing::*,
     wallet_target::RELEASE_SLOT,
     Artifacts,
@@ -280,6 +283,34 @@ impl Onboarding {
         self.request(self.sign(calls).await)
     }
 
+    /// `None` once the wallet exists: then the relayer calls `execute` on it.
+    async fn path(&self) -> Option<Create> {
+        let code = self.owner.get_code_at(self.wallet).await.unwrap();
+        code.is_empty().then_some(self.create)
+    }
+
+    /// The relayer's call of `data` with `value`, sent without the relayer's check.
+    async fn outer(&self, data: &Bytes, value: U256) -> TransactionRequest {
+        let (c, mode, data) = (self.create, AUTHORIZED_MODE, data.clone());
+        let tx = match self.path().await {
+            Some(_) => WalletFactory::new(self.stack.factory, &self.relayer)
+                .createAndExecute(c.platform_id, c.id_node, c.salt, mode, data)
+                .into_transaction_request(),
+            None => IWebWallet::new(self.wallet, &self.relayer)
+                .execute(mode, data)
+                .into_transaction_request(),
+        };
+        tx.with_from(self.relayer_address)
+            .with_value(value)
+            .with_gas_limit(10_000_000)
+    }
+
+    /// `data` sent directly, and mined successfully.
+    async fn land(&self, data: &Bytes, value: U256) {
+        let sent = self.relayer.send_transaction(self.outer(data, value).await);
+        assert!(sent.await.unwrap().get_receipt().await.unwrap().status());
+    }
+
     async fn relayer_nonce(&self) -> u64 {
         let nonce = self.relayer.get_transaction_count(self.relayer_address);
         nonce.await.unwrap()
@@ -329,6 +360,13 @@ impl Onboarding {
             "the wallet's funds"
         );
     }
+}
+
+/// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 2 on the
+/// create path and 1 otherwise.
+fn reserve(call_gas: u64, create: bool) -> u64 {
+    let d = if create { 2 } else { 1 };
+    ((call_gas + CALL_OVERHEAD) * 64u64.pow(d)).div_ceil(63u64.pow(d))
 }
 
 fn reverted(r: &Refusal, name: &str) -> bool {
