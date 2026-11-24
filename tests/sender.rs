@@ -1,5 +1,6 @@
-//! S3 on anvil: a real SQLite file and `flock` under `CARGO_TARGET_TMPDIR`; a restart
-//! drops the instance and starts another on the same file. Needs `anvil` on `PATH`.
+//! The relayer on anvil: a real SQLite file and `flock` under `CARGO_TARGET_TMPDIR`; a
+//! restart drops the instance and starts another on the same file. Needs `anvil` on
+//! `PATH`.
 
 #![allow(dead_code, unused_imports, clippy::unneeded_struct_pattern)]
 
@@ -25,14 +26,17 @@ impl Onboarding {
         next.await.unwrap();
     }
 
-    /// I1 on each send attempt: `gasLimit × maxFeePerGas + l1 ≤ R − value`. A
-    /// cancel, a self-send, is outside it.
-    async fn assert_i1(&self, hashes: &[B256], l1: U256) {
+    /// The refund covers each send attempt: `gasLimit × maxFeePerGas + l1 ≤ R − value`.
+    /// A cancel, a self-send, is outside it.
+    async fn assert_within_refund(&self, hashes: &[B256], l1: U256) {
         for hash in hashes {
             let t = self.tx(*hash).await.inner;
             let fee = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
             let send = t.to() != Some(self.relayer_address);
-            assert!(!send || fee + l1 <= self.refund() - self.value, "I1: {fee}");
+            assert!(
+                !send || fee + l1 <= self.refund() - self.value,
+                "above R - value: {fee}"
+            );
         }
     }
 
@@ -49,10 +53,7 @@ impl Onboarding {
             [bound, fee].map(|v| alloy::hex::encode(v.to_be_bytes::<32>()));
         let (head, mid) = ("60003560e01c8063f1c7a58b147f", "02906349948e0e147f");
         let code = format!("{head}{bound}{mid}{fee}020160005260206000f3");
-        let code = alloy::hex::decode(code).unwrap().into();
-        let oracle =
-            alloy::primitives::address!("420000000000000000000000000000000000000F");
-        self.owner.anvil_set_code(oracle, code).await.unwrap();
+        self.set_code(ORACLE, &code).await;
     }
 
     /// Sent with automine off, priced out, then past its deadline: still pending.
@@ -63,7 +64,7 @@ impl Onboarding {
         let hash = r.status(id).await.unwrap().tx_hashes[0];
         let raw = self.owner.get_raw_transaction_by_hash(hash).await.unwrap();
         let tx = self.tx(hash).await;
-        self.assert_i1(&[hash], U256::ZERO).await;
+        self.assert_within_refund(&[hash], U256::ZERO).await;
         self.base_fee(tx.inner.max_fee_per_gas() * 100).await;
         self.owner.evm_mine(None).await.unwrap();
         r.tick().await.unwrap(); // priced out, but before its deadline
@@ -76,7 +77,7 @@ impl Onboarding {
     }
 }
 
-/// D14, D13: one id and one transaction for a request delivered twice, across a restart
+/// One id and one transaction for a request delivered twice, across a restart
 /// too; another batch for the busy wallet is refused; a foreign nonce refuses start.
 #[tokio::test]
 async fn the_same_request_twice_is_one_id_and_one_transaction() {
@@ -88,7 +89,7 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     let busy = matches!(o.onboard(&r, 1800).await, Err(Refusal::WalletBusy { .. }));
     assert!(busy, "another batch for a busy wallet");
     let report = o.settle(&r, id, included).await;
-    o.assert_i1(&report.tx_hashes, U256::ZERO).await;
+    o.assert_within_refund(&report.tx_hashes, U256::ZERO).await;
     drop(r);
     let r = o.start(&db).await.unwrap(); // latest = stored next, with our receipt
     let again = r.relay(&request).await.unwrap();
@@ -102,7 +103,7 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     assert!(refused.contains("relayer reconcile"), "{refused}");
 }
 
-/// D13, I3: an instance holds `flock` on `<db>.lock`; any other holder refuses start.
+/// An instance holds `flock` on `<db>.lock`; any other holder refuses start.
 #[tokio::test]
 async fn a_second_instance_is_refused_by_the_lock() {
     let (o, db) = (Onboarding::new(false).await, db("lock"));
@@ -117,7 +118,7 @@ async fn a_second_instance_is_refused_by_the_lock() {
     assert!(o.start(&db).await.err().unwrap().contains(&lock));
 }
 
-/// D13, I4: a committed raw transaction the node never got is sent again at start, once.
+/// A committed raw transaction the node never got is sent again at start, once.
 #[tokio::test]
 async fn a_crash_between_commit_and_broadcast_lands_once() {
     let (o, db) = (Onboarding::new(true).await, db("crash"));
@@ -134,7 +135,7 @@ async fn a_crash_between_commit_and_broadcast_lands_once() {
     o.assert_onboarded(o.refund()).await;
 }
 
-/// D15, I6: a send priced out by the base fee is replaced at its deadline by a 0-value
+/// A send priced out by the base fee is replaced at its deadline by a 0-value
 /// self-send at its nonce, +10% on both fees; `cancelled`, and a new batch lands.
 #[tokio::test]
 async fn a_send_priced_out_is_cancelled_at_its_deadline() {
@@ -159,7 +160,7 @@ async fn a_send_priced_out_is_cancelled_at_its_deadline() {
     o.assert_onboarded(o.refund()).await;
 }
 
-/// D15: the original wins the nonce over its cancel: resolved from its receipt, no pause.
+/// The original wins the nonce over its cancel: resolved from its receipt, no pause.
 #[tokio::test]
 async fn the_original_landing_before_its_cancel_resolves_from_its_receipt() {
     let o = Onboarding::new(true).await;
@@ -177,7 +178,7 @@ async fn the_original_landing_before_its_cancel_resolves_from_its_receipt() {
     assert!(!r.paused().await, "an alarm on our own receipt");
 }
 
-/// D15, D13: a foreign nonce pauses sending, and our stored nonce under it refuses start.
+/// A foreign nonce pauses sending, and our stored nonce under it refuses start.
 #[tokio::test]
 async fn a_foreign_nonce_at_runtime_pauses_sending() {
     let (o, db) = (Onboarding::new(true).await, db("pause"));
@@ -193,8 +194,8 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     assert!(refused.contains("relayer reconcile"), "{refused}");
 }
 
-/// D5: `getL1Fee(rawTransaction) > k × U` fails the request `L1FeeAboveBound` with nothing
-/// broadcast; at exactly `k × U` it sends, within I1's L1 part.
+/// `getL1Fee(rawTx) > k × U` fails the request `L1FeeAboveBound` with nothing
+/// broadcast; at exactly `k × U` it sends, within the refund's L1 part.
 #[tokio::test]
 async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
     let o = Onboarding::new(true).await;
@@ -206,7 +207,7 @@ async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
     let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
     let r = r.unwrap();
     let above = |r: &Refusal| matches!(r, Refusal::L1FeeAboveBound { .. });
-    // Refused at relay (§4) or failed before the first broadcast (I6).
+    // Refused at relay or failed before the first broadcast.
     match o.onboard(&r, 3600).await {
         Err(e) => assert!(above(&e), "{e:?}"),
         Ok(id) => {
@@ -219,11 +220,11 @@ async fn the_l1_gate_refuses_a_fee_above_k_times_the_bound() {
     assert_eq!(o.relayer_nonce().await, 0, "broadcast above the bound");
     o.oracle(bound, k_u).await;
     let id = o.onboard(&r, 1800).await.unwrap();
-    o.assert_i1(&o.settle(&r, id, included).await.tx_hashes, k_u)
+    o.assert_within_refund(&o.settle(&r, id, included).await.tx_hashes, k_u)
         .await;
 }
 
-/// D16: a transaction removed by `evm_revert` is sent again, the same raw transaction.
+/// A transaction removed by `evm_revert` is sent again, the same raw transaction.
 #[tokio::test]
 async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     let o = Onboarding::new(true).await;
@@ -240,7 +241,7 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     assert_eq!(r.status(id).await.unwrap().tx_hashes, hashes);
 }
 
-/// D15: a request whose deadline no longer covers the window fails unsent at its send.
+/// A request whose deadline no longer covers the window fails unsent at its send.
 #[tokio::test]
 async fn a_request_expired_before_its_send_fails_unsent() {
     let o = Onboarding::new(true).await;

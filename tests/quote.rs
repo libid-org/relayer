@@ -102,7 +102,8 @@ impl Onboarding {
         }
     }
 
-    async fn relay(&self, data: &Bytes, gas_limit: u64) -> Result<Checked, Refusal> {
+    /// The relayer's check of `data` at `gas_limit`, without sending.
+    async fn check_at(&self, data: &Bytes, gas_limit: u64) -> Result<Checked, Refusal> {
         let request = self.request_at(data, gas_limit).await;
         check(&self.relayer, &self.config(), &request).await
     }
@@ -136,8 +137,7 @@ impl Onboarding {
         self.land(&self.sign(&self.onboarding()).await, self.value)
             .await;
         let token = Address::repeat_byte(0x70); // returns true to any call
-        let code = alloy::hex::decode("600160005260206000f3").unwrap();
-        self.owner.anvil_set_code(token, code.into()).await.unwrap();
+        self.set_code(token, "600160005260206000f3").await;
         let leaf = |to: Address, selector: [u8; 4], max: u128| {
             let leaf = (to, B256::right_padding_from(&selector), U256::from(max));
             keccak256(keccak256(leaf.abi_encode()))
@@ -209,11 +209,7 @@ async fn anvil_simulates_a_draft_to_execution_not_signed() {
 async fn the_create_path_lands_at_the_relay_time_limit() {
     let o = Onboarding::new(true).await;
     let swallower = Address::repeat_byte(0x5a);
-    let code = alloy::hex::decode(SWALLOWER).unwrap();
-    o.owner
-        .anvil_set_code(swallower, code.into())
-        .await
-        .unwrap();
+    o.set_code(swallower, SWALLOWER).await;
     let mut calls = o.onboarding();
     calls.push(call(swallower, U256::ZERO, vec![]));
     let b = Batch(calls, o.value, vec![&o.k], None);
@@ -225,7 +221,7 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     let allowance = 15 * fillable(&above, &[o.refund()]);
     let mut required = 0;
     for gas_limit in [q.gas_limit, expected - 3] {
-        let refused = o.relay(&above, gas_limit).await.err();
+        let refused = o.check_at(&above, gas_limit).await.err();
         let Some(Refusal::GasLimitTooLow { required: r }) = refused else {
             panic!("{refused:?}")
         };
@@ -237,12 +233,12 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     }
     // A limit priced for exactly the batch's passes; one gas less does not.
     let exact = required - allowance;
-    let refused = o.relay(&above, exact - 1).await.err();
+    let refused = o.check_at(&above, exact - 1).await.err();
     assert!(
         matches!(refused, Some(Refusal::GasLimitTooLow { .. })),
         "{refused:?}"
     );
-    o.relay(&above, exact).await.unwrap();
+    o.check_at(&above, exact).await.unwrap();
     // Re-signed with fewer zero bytes in R, at the `required` reported, it passes.
     let refunding = |r| {
         let mut calls = o.batch(o.repay(r));
@@ -251,13 +247,13 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     };
     let round = U256::from(1u64 << 58);
     let zeroed = o.authorize(&refunding(round), Some(2 * q.call_gas)).await;
-    let refused = o.relay(&zeroed, q.gas_limit).await.err();
+    let refused = o.check_at(&zeroed, q.gas_limit).await.err();
     let Some(Refusal::GasLimitTooLow { required }) = refused else {
         panic!("{refused:?}")
     };
     let filled = refunding(round + U256::from(0x0101_0101_0101_0101u64));
     let filled = o.authorize(&filled, Some(2 * q.call_gas)).await;
-    o.relay(&filled, required).await.unwrap();
+    o.check_at(&filled, required).await.unwrap();
 
     let data = o.authorize(&b, Some(q.call_gas)).await;
     let limit = o.limit(&data, o.value, q.call_gas).await;
@@ -369,7 +365,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     let data = o
         .authorize(&at_quorum(vec![o.repay(r)]), Some(q.call_gas))
         .await;
-    o.relay(&data, q.gas_limit).await.unwrap();
+    o.check_at(&data, q.gas_limit).await.unwrap();
     let unpaid = at_quorum(vec![call(token, U256::ZERO, transfer)]);
     let refused = o.try_quote(&o.config(), &unpaid).await.err();
     assert!(

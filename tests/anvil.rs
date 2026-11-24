@@ -130,29 +130,23 @@ async fn refuses_before_sending() {
     };
     let below_bound = o.request_for(&o.batch(o.repay(bound - U256::ONE))).await;
     let window = o.config().inclusion_window.as_secs();
+    // Pushes now + window - 1 and the timestamp, for a comparison.
+    let end = format!("67{:016x}42", now + window - 1);
+    // The onboarding after a call to `code` deployed at `byte`'s address.
+    let first_call = async |byte, code: String| {
+        let at = Address::repeat_byte(byte);
+        o.set_code(at, &code).await;
+        let mut calls = o.onboarding();
+        calls.insert(0, call(at, U256::ZERO, vec![]));
+        calls
+    };
     // Reverts once the timestamp passes now + window - 1: the window's end is simulated.
-    let clock = Address::repeat_byte(0x7e);
-    let code = format!("67{:016x}4211600f57005b5f80fd", now + window - 1);
-    let code = alloy::hex::decode(code).unwrap();
-    o.owner.anvil_set_code(clock, code.into()).await.unwrap();
-    let mut late = o.onboarding();
-    late.insert(0, call(clock, U256::ZERO, vec![]));
+    let late = first_call(0x7e, format!("{end}11600f57005b5f80fd")).await;
     // Reverts with under 2.5M gas left: it runs unbounded, not at the limit sent.
-    let gauge = Address::repeat_byte(0x9a);
-    let code = alloy::hex::decode("622625a05a10600a57005b5f80fd").unwrap();
-    o.owner.anvil_set_code(gauge, code.into()).await.unwrap();
-    let mut starved = o.onboarding();
-    starved.insert(0, call(gauge, U256::ZERO, vec![]));
+    let starved = first_call(0x9a, "622625a05a10600a57005b5f80fd".into()).await;
     // Both: reverts only by the window's end at the limit sent.
-    let both = Address::repeat_byte(0x7f);
-    let code = format!(
-        "67{:016x}4211622625a05a1016601657005b5f80fd",
-        now + window - 1
-    );
-    let code = alloy::hex::decode(code).unwrap();
-    o.owner.anvil_set_code(both, code.into()).await.unwrap();
-    let mut late_starved = o.onboarding();
-    late_starved.insert(0, call(both, U256::ZERO, vec![]));
+    let both = format!("{end}11622625a05a1016601657005b5f80fd");
+    let late_starved = first_call(0x7f, both).await;
 
     #[rustfmt::skip]
     let cases: Vec<Case> = vec![
@@ -212,11 +206,7 @@ async fn refuses_before_sending() {
         ..o.config()
     };
     // An oracle whose `getL1FeeUpperBound` is 1 ether: the refund must cover 1.3 ether more.
-    let oracle = "0x420000000000000000000000000000000000000F"
-        .parse()
-        .unwrap();
-    let code = alloy::hex::decode("670de0b6b3a76400005f5260205ff3").unwrap();
-    o.owner.anvil_set_code(oracle, code.into()).await.unwrap();
+    o.set_code(ORACLE, "670de0b6b3a76400005f5260205ff3").await;
     let refused = check(&o.relayer, &op_stack, &o.request(good.clone()))
         .await
         .err();
@@ -225,19 +215,13 @@ async fn refuses_before_sending() {
     };
     assert_eq!(required, bound + U256::from(CLAIMED * 13 / 10));
     // A node error that is not a revert is not reported as one.
-    o.owner
-        .anvil_set_balance(o.relayer_address, U256::ZERO)
-        .await
-        .unwrap();
+    o.set_balance(o.relayer_address, U256::ZERO).await;
     let refused = check(&o.relayer, &o.config(), &o.request(good.clone()))
         .await
         .err();
     assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
     // The value but not the gas: only the priced call fails, and not as a revert.
-    o.owner
-        .anvil_set_balance(o.relayer_address, o.value)
-        .await
-        .unwrap();
+    o.set_balance(o.relayer_address, o.value).await;
     let refused = check(&o.relayer, &o.config(), &o.request(good)).await.err();
     assert!(matches!(refused, Some(Refusal::Node(_))), "{refused:?}");
 }

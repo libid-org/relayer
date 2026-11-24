@@ -79,6 +79,9 @@ use relayer::{
     },
 };
 
+/// The OP Stack `GasPriceOracle` predeploy.
+const ORACLE: Address =
+    alloy::primitives::address!("420000000000000000000000000000000000000F");
 const CLAIMED: u128 = 1_000_000_000_000_000_000;
 /// The paid stub's Notary Fee: the link pays it, from the value the relayer fronts.
 const LINK_FEE: u128 = CLAIMED / 1000;
@@ -334,7 +337,12 @@ impl Onboarding {
     }
 
     /// Ticks and mines until `id`'s status is `done`.
-    async fn settle(&self, r: &Relayer<DynProvider>, id: B256, done: fn(&Status) -> bool) -> Report {
+    async fn settle(
+        &self,
+        r: &Relayer<DynProvider>,
+        id: B256,
+        done: fn(&Status) -> bool,
+    ) -> Report {
         for _ in 0..50 {
             r.tick().await.unwrap();
             self.owner.evm_mine(None).await.unwrap();
@@ -351,7 +359,8 @@ impl Onboarding {
         let r = self.start(&db("send")).await.unwrap();
         let id = r.relay(request).await.unwrap();
         let hash = self.settle(&r, id, included).await.tx_hashes[0];
-        let receipt = self.owner.get_transaction_receipt(hash).await.unwrap().unwrap();
+        let receipt = self.owner.get_transaction_receipt(hash).await;
+        let receipt = receipt.unwrap().unwrap();
         assert!(receipt.status(), "reverted");
         receipt
     }
@@ -359,6 +368,16 @@ impl Onboarding {
     async fn tx(&self, hash: B256) -> Transaction {
         let tx = self.owner.get_transaction_by_hash(hash).await;
         tx.unwrap().unwrap()
+    }
+
+    /// Deploys `hex`, runtime code, at `at`.
+    async fn set_code(&self, at: Address, hex: &str) {
+        let code = alloy::hex::decode(hex).unwrap();
+        self.owner.anvil_set_code(at, code.into()).await.unwrap();
+    }
+
+    async fn set_balance(&self, at: Address, balance: U256) {
+        self.owner.anvil_set_balance(at, balance).await.unwrap();
     }
 
     async fn relayer_nonce(&self) -> u64 {
@@ -370,10 +389,8 @@ impl Onboarding {
     async fn impostor(&self) -> Address {
         let fake = Address::repeat_byte(0xfa);
         let (platform, id) = (self.create.platform_id, self.create.id_node);
-        let code =
-            alloy::hex::decode(format!("7f{platform:x}6000527f{id:x}60205260606000f3"))
-                .unwrap();
-        self.owner.anvil_set_code(fake, code.into()).await.unwrap();
+        let code = format!("7f{platform:x}6000527f{id:x}60205260606000f3");
+        self.set_code(fake, &code).await;
         let g = IWebWallet::new(fake, &self.owner)
             .genesisIdentity()
             .call()
