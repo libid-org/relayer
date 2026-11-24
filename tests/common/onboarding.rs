@@ -1,0 +1,350 @@
+// The S1 onboarding fixture, `include!`d by the anvil suites.
+
+use std::time::Duration;
+
+use alloy::{
+    consensus::Transaction as _,
+    node_bindings::{
+        Anvil,
+        AnvilInstance,
+    },
+    primitives::{
+        aliases::U48,
+        Address,
+        Bytes,
+        B256,
+        U256,
+    },
+    providers::{
+        ext::AnvilApi,
+        DynProvider,
+        Provider,
+        ProviderBuilder,
+    },
+    signers::{
+        local::PrivateKeySigner,
+        SignerSync,
+    },
+    sol_types::{
+        SolCall,
+        SolValue,
+    },
+};
+use libid_contracts::{
+    bindings::{
+        ceremony::CeremonyProofVerifier,
+        escrow::HandleEscrow,
+        identity::IdentityRegistry,
+        wallet::*,
+    },
+    operation_list::{
+        Operation,
+        OPERATIONS_DOMAIN,
+    },
+    testing::*,
+    wallet_target::RELEASE_SLOT,
+    Artifacts,
+};
+use relayer::{
+    chain,
+    check::{
+        check,
+        Create,
+        Refusal,
+        Request,
+    },
+    config::{
+        Config,
+        L1Fee,
+    },
+};
+
+const CLAIMED: u128 = 1_000_000_000_000_000_000;
+/// The paid stub's Notary Fee: the link pays it, from the value the relayer fronts.
+const LINK_FEE: u128 = CLAIMED / 1000;
+const GAS_LIMIT: u64 = 3_000_000;
+const CALL_GAS: u64 = 200_000;
+/// What the refund pays for gas: 100 gwei a unit, far above anvil's base fee.
+const GAS_BUDGET: u128 = GAS_LIMIT as u128 * 100_000_000_000;
+
+macro_rules! mined {
+    ($call:expr) => {
+        assert!($call
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .status())
+    };
+}
+
+/// A stack on a fresh anvil, a paid verifier as X's version 2, and K's
+/// not-yet-created wallet, its handle escrowed for unless `escrowed` is false.
+struct Onboarding {
+    _anvil: AnvilInstance,
+    owner: DynProvider,
+    relayer: DynProvider,
+    relayer_address: Address,
+    stack: WalletStack,
+    chain_id: u64,
+    k: PrivateKeySigner,
+    create: Create,
+    wallet: Address,
+    handle: B256,
+    /// `HandleEscrow.NATIVE`, the escrowed token.
+    native: Address,
+    list: Bytes,
+    /// `WalletRegistry.quote(X, 2)`: the link fee, which the batch's `value` fronts.
+    value: U256,
+}
+
+impl Onboarding {
+    async fn new(escrowed: bool) -> Self {
+        let anvil = Anvil::new().spawn();
+        let connect = |i: usize| {
+            let key = PrivateKeySigner::from(anvil.keys()[i].clone());
+            ProviderBuilder::new()
+                .wallet(key)
+                .connect_http(anvil.endpoint_url())
+                .erased()
+        };
+        let (owner, relayer, depositor) = (connect(0), connect(1), connect(2));
+        let relayer_address = anvil.addresses()[1];
+        let chain_id = anvil.chain_id();
+        let artifacts = Artifacts::embedded();
+        let stack = deploy_wallet_stack(&owner, &artifacts, anvil.addresses()[0])
+            .await
+            .unwrap();
+        let fee = U256::from(LINK_FEE);
+        let paid =
+            deploy_stub_platform_verifier(&owner, &artifacts, stack.platform, fee, None);
+        let paid = paid.await.unwrap();
+        let verifiers = CeremonyProofVerifier::new(stack.proof_verifier, &owner);
+        mined!(verifiers.setVerifier(stack.platform, 2, paid));
+        let (id_node, handle) = (B256::repeat_byte(0xa1), B256::repeat_byte(0xb2));
+        mined!(StubPlatformVerifier::new(paid, &owner).setNodes(id_node, handle));
+        let escrow = HandleEscrow::new(stack.escrow, &depositor);
+        let native = escrow.NATIVE().call().await.unwrap();
+        if escrowed {
+            let amount = U256::from(CLAIMED);
+            mined!(escrow
+                .deposit(stack.platform, handle, native, amount)
+                .value(amount));
+        }
+        let create = Create {
+            platform_id: stack.platform,
+            id_node,
+            salt: U256::ZERO,
+        };
+        let factory = WalletFactory::new(stack.factory, &owner);
+        let wallet = factory.walletAddress(stack.platform, id_node, U256::ZERO);
+        let wallet = wallet.call().await.unwrap();
+        let registry = WalletRegistry::new(stack.wallet_registry, &owner);
+        let value = registry.quote(stack.platform, 2).call().await.unwrap();
+        assert!(value > U256::ZERO, "the relayer fronts no value");
+        let k = PrivateKeySigner::random();
+        let link = transaction_data(chain_id, wallet, wallet, &key_of(&k), &admin());
+        let operations = vec![
+            Operation::bind(wallet),
+            Operation {
+                domain: LINK_IDENTITY_DOMAIN,
+                data: link,
+            },
+        ];
+        let list = stub_payload(&StubPayload {
+            ceremonyVersion: 1,
+            operationDomain: OPERATIONS_DOMAIN,
+            authorizationNonce: B256::repeat_byte(1),
+            transactionData: operations.abi_encode().into(),
+        });
+        Self {
+            _anvil: anvil,
+            owner,
+            relayer,
+            relayer_address,
+            stack,
+            chain_id,
+            k,
+            create,
+            wallet,
+            handle,
+            native,
+            list,
+            value,
+        }
+    }
+
+    fn config(&self) -> Config {
+        Config::anvil(
+            self.chain_id,
+            self.stack.factory,
+            self.stack.forwarder,
+            self.relayer_address,
+        )
+    }
+
+    /// Link, bind, claim to the wallet, then `refund`.
+    fn batch(&self, refund: Execution) -> Vec<Execution> {
+        let (platform, list) = (self.stack.platform, self.list.clone());
+        let link =
+            IWebWallet::linkIdentityCall::new((platform, 2, list.clone(), admin()));
+        let bind = (platform, 2, list, U256::ZERO, Address::ZERO);
+        let bind = IdentityRegistry::bindPrivatelyCall::new(bind);
+        let claim =
+            HandleEscrow::claimCall::new((self.handle, vec![self.native], self.wallet));
+        vec![
+            call(self.wallet, self.value, link.abi_encode()),
+            call(self.stack.identities, U256::ZERO, bind.abi_encode()),
+            call(self.stack.escrow, U256::ZERO, claim.abi_encode()),
+            refund,
+        ]
+    }
+
+    /// The refund a well-priced batch carries: the fronted value plus the gas budget.
+    fn refund(&self) -> U256 {
+        self.value + U256::from(GAS_BUDGET)
+    }
+
+    /// The batch that onboards: link, bind, claim, then the well-priced refund.
+    fn onboarding(&self) -> Vec<Execution> {
+        self.batch(self.repay(self.refund()))
+    }
+
+    fn repay(&self, amount: U256) -> Execution {
+        call(self.relayer_address, amount, vec![])
+    }
+
+    async fn now(&self) -> u64 {
+        self.owner
+            .get_block_by_number(Default::default())
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .timestamp
+    }
+
+    /// K signs `execution_calldata` and `value`, nonce 0, from `at` until `deadline`.
+    fn sign_until(
+        &self,
+        execution_calldata: Bytes,
+        value: U256,
+        at: u64,
+        deadline: u64,
+    ) -> Bytes {
+        let message = ExecuteMessage {
+            execution_calldata,
+            value,
+            at: U48::from(at),
+            nonce: U256::ZERO,
+            deadline: U48::from(deadline),
+            call_gas: U256::from(CALL_GAS),
+        };
+        // A wallet without code signs under release 1's domain, salt `wallet_salt(0, 0)`.
+        let salt = wallet_salt(B256::ZERO, 0);
+        let digest =
+            message.digest(self.chain_id, self.wallet, self.stack.release.version, salt);
+        let signature = self.k.sign_hash_sync(&digest).unwrap();
+        message.authorized_data(ExecuteAuthorization {
+            signatures: vec![SessionSignature {
+                key: key_of(&self.k),
+                signature: signature.as_bytes().to_vec().into(),
+            }],
+            ..Default::default()
+        })
+    }
+
+    async fn sign(&self, calls: &[Execution]) -> Bytes {
+        let now = self.now().await;
+        self.sign_until(encode_executions(calls), self.value, now, now + 3600)
+    }
+
+    fn request(&self, data: Bytes) -> Request {
+        Request {
+            wallet: self.wallet,
+            create: Some(self.create),
+            data,
+            gas_limit: GAS_LIMIT,
+        }
+    }
+
+    /// The create-path request for `calls`, signed by K.
+    async fn request_for(&self, calls: &[Execution]) -> Request {
+        self.request(self.sign(calls).await)
+    }
+
+    async fn relayer_nonce(&self) -> u64 {
+        let nonce = self.relayer.get_transaction_count(self.relayer_address);
+        nonce.await.unwrap()
+    }
+
+    /// A contract answering `genesisIdentity()` with the wallet's genesis identity.
+    async fn impostor(&self) -> Address {
+        let fake = Address::repeat_byte(0xfa);
+        let (platform, id) = (self.create.platform_id, self.create.id_node);
+        let code =
+            alloy::hex::decode(format!("7f{platform:x}6000527f{id:x}60205260606000f3"))
+                .unwrap();
+        self.owner.anvil_set_code(fake, code.into()).await.unwrap();
+        let g = IWebWallet::new(fake, &self.owner)
+            .genesisIdentity()
+            .call()
+            .await
+            .unwrap();
+        assert_eq!((g.platformId, g.idNode, g.salt), (platform, id, U256::ZERO));
+        fake
+    }
+
+    /// K is the wallet's admin session and the escrow paid the wallet.
+    async fn assert_onboarded(&self, refund: U256) {
+        let wallet = IWebWallet::new(self.wallet, &self.owner);
+        assert!(wallet.hadSession().call().await.unwrap(), "no session");
+        assert!(
+            wallet
+                .sessionOf(key_of(&self.k))
+                .call()
+                .await
+                .unwrap()
+                .admin,
+            "K not admin"
+        );
+        let escrow = HandleEscrow::new(self.stack.escrow, &self.owner);
+        let left = escrow
+            .escrowed(self.handle, self.native)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(left, U256::ZERO, "left in escrow");
+        let expected = U256::from(CLAIMED) - refund;
+        assert_eq!(
+            self.owner.get_balance(self.wallet).await.unwrap(),
+            expected,
+            "the wallet's funds"
+        );
+    }
+}
+
+fn reverted(r: &Refusal, name: &str) -> bool {
+    matches!(r, Refusal::Reverted { error: Some(e), .. } if e.name() == name)
+}
+
+fn admin() -> Policy {
+    Policy {
+        admin: true,
+        ..Default::default()
+    }
+}
+
+fn key_of(k: &PrivateKeySigner) -> Bytes {
+    k.address().to_vec().into()
+}
+
+fn call(target: Address, value: U256, data: Vec<u8>) -> Execution {
+    Execution {
+        target,
+        value,
+        callData: data.into(),
+    }
+}
