@@ -102,6 +102,13 @@ pub enum Refusal {
     },
     /// The contracts do not vouch for the target.
     UnknownWallet,
+    /// An EIP-7702 account's batch carries value, which the relayer does not front.
+    ValueNotAllowed,
+    /// The target runs a release outside the configured supported set.
+    UnsupportedRelease {
+        /// The target's release version.
+        version: u64,
+    },
     /// The batch's deadline falls before the inclusion window ends.
     Expired,
     /// The simulation reverted, decoded on the wallet route where it can be.
@@ -261,7 +268,7 @@ fn covered(deadline: u64, late: u64) -> Result<u64, Refusal> {
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, when the contracts
-/// vouch for the wallet; a 7702 account only with no value.
+/// vouch for the wallet on a supported release; a 7702 account only with no value.
 pub(crate) async fn target<P: Provider>(
     provider: &P,
     config: &Config,
@@ -285,10 +292,15 @@ pub(crate) async fn target<P: Provider>(
         return Ok(call.with_to(config.factory).with_input(input));
     }
     let vouched = check_target(provider, config.factory, config.forwarder, wallet);
-    match vouched.await.map_err(node)? {
-        Some(Target::FactoryWallet(_)) => {}
-        Some(Target::Account(_)) if value.is_zero() => {}
-        _ => return Err(Refusal::UnknownWallet),
+    let release = match vouched.await.map_err(node)? {
+        Some(Target::FactoryWallet(release)) => release,
+        Some(Target::Account(release)) if value.is_zero() => release,
+        Some(Target::Account(_)) => return Err(Refusal::ValueNotAllowed),
+        None => return Err(Refusal::UnknownWallet),
+    };
+    let version = release.version;
+    if !config.supported_releases.contains(&version) {
+        return Err(Refusal::UnsupportedRelease { version });
     }
     let input = IWebWallet::executeCall::new((AUTHORIZED_MODE, data)).abi_encode();
     Ok(call.with_to(wallet).with_input(input))

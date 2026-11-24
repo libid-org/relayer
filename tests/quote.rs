@@ -1,10 +1,13 @@
-//! The quote and the relay-time gas limit on anvil. Needs `anvil` on `PATH`.
+//! The quote and the relay-time gas limit on anvil, on the create path, factory
+//! wallets and EIP-7702 accounts. Needs `anvil` on `PATH`.
 
 #![allow(dead_code, unused_imports)]
 
 include!("common/onboarding.rs");
 
 use alloy::{
+    eips::eip7702::Authorization,
+    network::TransactionBuilder7702,
     primitives::keccak256,
     rpc::types::simulate::{
         SimBlock,
@@ -423,6 +426,111 @@ fn fillable(data: &Bytes, refunds: &[U256]) -> u64 {
     let refunds = refunds.iter().map(|r| zeros(&r.to_be_bytes::<32>()));
     let stamps = [message.at, message.deadline].map(|t| zeros(&t.to_be_bytes::<6>()));
     signatures.sum::<u64>() + refunds.sum::<u64>() + stamps.iter().sum::<u64>()
+}
+
+/// A key delegated to the forwarder by a real EIP-7702 authorization, reset into the
+/// factory's release with K linked, relays as a wallet. A release outside the supported
+/// set is refused, for it and for a factory wallet. Re-delegated to code that skips the
+/// refund after its send is broadcast, it costs the relayer only that send's gas.
+#[tokio::test]
+async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
+    let mut o = Onboarding::new(true).await;
+    let key = PrivateKeySigner::random();
+    o.set_balance(key.address(), U256::from(CLAIMED)).await;
+    o.linking(key.address(), false);
+    let link = (o.stack.platform, 2, o.list.clone(), admin());
+    let link = IWebWallet::linkIdentityCall::new(link).abi_encode();
+    // `identityOf(platformId, idNode)`.
+    let identity = keccak256((o.create.platform_id, o.create.id_node).abi_encode());
+    let add = IWebWallet::addSessionCall::new((identity, key_of(&o.k), admin()));
+    let (wallet, value) = (o.wallet, o.value);
+    let link = [
+        call(wallet, value, link),
+        call(wallet, U256::ZERO, add.abi_encode()),
+    ];
+    let link = encode_executions(&link);
+    let account = ProviderBuilder::new()
+        .wallet(key.clone())
+        .connect_http(o._anvil.endpoint_url());
+    let nonce = account.get_transaction_count(key.address()).await.unwrap();
+    let authorization = Authorization {
+        chain_id: U256::from(o.chain_id),
+        address: o.stack.forwarder,
+        nonce: nonce + 1, // the key's own transaction takes `nonce`
+    };
+    let signature = key.sign_hash_sync(&authorization.signature_hash()).unwrap();
+    let reset = TransactionRequest::default()
+        .with_to(key.address())
+        .with_input(IWebWallet::resetCall::new((link,)).abi_encode())
+        .with_authorization_list(vec![authorization.into_signed(signature)])
+        .with_gas_limit(GAS_LIMIT);
+    let sent = account.send_transaction(reset).await.unwrap();
+    assert!(sent.get_receipt().await.unwrap().status(), "reset reverted");
+    o.owner.anvil_increase_time(2).await.unwrap(); // K's session is active
+    o.owner.anvil_mine(Some(1), None).await.unwrap();
+
+    let refund = o.repay(U256::from(CLAIMED / 100));
+    let b = Batch(vec![refund], U256::ZERO, vec![&o.k], None);
+    let q = o.quote_with(&o.config(), &b).await;
+    let data = o.authorize(&b, Some(q.call_gas)).await;
+    let request = o.request_at(&data, q.gas_limit).await;
+    assert_eq!(request.create, None);
+    let factory = WalletFactory::new(o.stack.factory, &o.owner);
+    let id_node = B256::repeat_byte(0xa2);
+    let wallet = factory.walletAddress(o.stack.platform, id_node, U256::ZERO);
+    let wallet = wallet.call().await.unwrap();
+    mined!(factory.createWallet(o.stack.platform, id_node, U256::ZERO));
+    let version = o.stack.release.version;
+    let unsupported = Config {
+        supported_releases: vec![version + 1],
+        ..o.config()
+    };
+    for wallet in [o.wallet, wallet] {
+        let request = Request {
+            wallet,
+            ..request.clone()
+        };
+        let refused = request.check(&o.relayer, &unsupported).await.err();
+        let named = matches!(refused, Some(Refusal::UnsupportedRelease { version: v }) if v == version);
+        assert!(named, "{wallet}: {refused:?}");
+    }
+    o.send(&request).await;
+
+    // The same batch at the account's next nonce.
+    let data = o.authorize(&b, Some(q.call_gas)).await;
+    let r = o.start(&db("redelegate")).await.unwrap();
+    let id = r
+        .relay(&o.request_at(&data, q.gas_limit).await)
+        .await
+        .unwrap();
+    let (before, held) = (
+        o.owner.get_balance(o.relayer_address).await.unwrap(),
+        o.owner.get_balance(o.wallet).await.unwrap(),
+    );
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    r.tick().await.unwrap();
+    let sent = matches!(r.status(id).await.unwrap().status, Status::Sent);
+    assert!(sent, "not broadcast before the re-delegation");
+    let stop = Address::repeat_byte(0x5f);
+    o.set_code(stop, "00").await;
+    o.set_code(o.wallet, &format!("ef0100{stop:x}")).await;
+    let report = o.settle(&r, id, included).await; // lands, without the refund
+    let tx = o.tx(report.tx_hashes[0]).await;
+    assert_eq!(tx.inner.value(), U256::ZERO, "value fronted");
+    let receipt = o.owner.get_transaction_receipt(report.tx_hashes[0]).await;
+    let receipt = receipt.unwrap().unwrap();
+    let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
+    let after = o.owner.get_balance(o.relayer_address).await.unwrap();
+    assert_eq!(
+        before - after,
+        gas,
+        "the relayer paid more than the send's gas"
+    );
+    assert_eq!(
+        o.owner.get_balance(o.wallet).await.unwrap(),
+        held,
+        "the refund was paid"
+    );
 }
 
 #[tokio::test]

@@ -192,10 +192,17 @@ impl Onboarding {
         self.create.salt = salt;
         let (c, factory) = (self.create, WalletFactory::new(self.stack.factory, &self.owner));
         let wallet = factory.walletAddress(c.platform_id, c.id_node, salt);
-        self.wallet = wallet.call().await.unwrap();
+        self.linking(wallet.call().await.unwrap(), true);
+    }
+
+    /// A fresh K, and a proof list that links the identity into `wallet`, with K's
+    /// session when `session`.
+    fn linking(&mut self, wallet: Address, session: bool) {
+        self.wallet = wallet;
         self.k = PrivateKeySigner::random();
+        let key = if session { key_of(&self.k) } else { Bytes::new() };
         let (chain_id, wallet) = (self.chain_id, self.wallet);
-        let link = transaction_data(chain_id, wallet, wallet, &key_of(&self.k), &admin());
+        let link = transaction_data(chain_id, wallet, wallet, &key, &admin());
         let operations = vec![
             Operation::bind(wallet),
             Operation {

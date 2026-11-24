@@ -107,6 +107,9 @@ pub struct Config {
     pub factory: Address,
     /// `WalletForwarder`, which EIP-7702 accounts delegate to.
     pub forwarder: Address,
+    /// The release versions a target may run: the ones whose AUTHORIZED data layout
+    /// the relayer decodes.
+    pub supported_releases: Vec<u64>,
     /// The sending key's address, which every refund must pay.
     pub relayer: Address,
     /// The L1 fee model.
@@ -145,7 +148,8 @@ impl Config {
     /// An anvil chain's configuration: no L1 fee, and a 5 s inclusion window,
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
-    /// ticks of node errors on a request, and receipts up to 10 blocks behind.
+    /// ticks of node errors on a request, receipts up to 10 blocks behind, and release
+    /// 1, the one the contracts' test stack publishes.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -156,6 +160,7 @@ impl Config {
             chain_id,
             factory,
             forwarder,
+            supported_releases: vec![1],
             relayer,
             l1_fee: L1Fee::None,
             l1_margin: L1_MARGIN,
