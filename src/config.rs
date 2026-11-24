@@ -4,15 +4,16 @@ use std::time::Duration;
 
 use alloy::primitives::Address;
 
-/// The send-to-inclusion window a production chain is configured with.
-pub const INCLUSION_WINDOW: Duration = Duration::from_secs(20);
+/// The send-to-inclusion window a production chain is configured with. The fee
+/// covers the base fee's growth over it and the quote's validity: ×1.49 on Base.
+pub const INCLUSION_WINDOW: Duration = Duration::from_secs(10);
 
 /// The L1 margin `k` of a production chain, in percent: the L1 fee bound a
 /// refund covers is `k × getL1FeeUpperBound`, sized to the inclusion window.
 pub const L1_MARGIN: u64 = 130;
 
 /// How long a quote stays valid on a production chain.
-pub const QUOTE_VALIDITY: Duration = Duration::from_secs(30);
+pub const QUOTE_VALIDITY: Duration = Duration::from_secs(10);
 
 /// The fee-history percentile a send's tip is read at, between 50 and 90.
 pub const TIP_PERCENTILE: f64 = 75.0;
