@@ -172,7 +172,7 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     drop(r);
     o.foreign().await;
     let refused = o.start(&db).await.err().unwrap();
-    assert!(refused.contains("relayer reconcile"), "{refused}");
+    assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
 /// An instance holds `flock` on `<db>.lock`; any other holder refuses start. A
@@ -194,6 +194,13 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
     conn.execute_batch("CREATE TABLE nonce (next)").unwrap();
     let refused = o.start(&old).await.err().unwrap();
     assert!(refused.contains("fresh database file"), "{refused}");
+    let short = Config {
+        inclusion_window: o.config().block_time,
+        ..o.config()
+    };
+    let refused = Relayer::start(o.relayer.clone(), short, &crate::db("short")).await;
+    let refused = refused.err().unwrap().to_string();
+    assert!(refused.contains("inclusion_window"), "{refused}");
 }
 
 /// A send left pending at a restart holds the queue: its stored raw transaction is
@@ -328,7 +335,7 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     assert_eq!(o.relayer_nonce().await, 1, "sent while paused");
     drop(r);
     let refused = o.start(&db).await.err().unwrap();
-    assert!(refused.contains("relayer reconcile"), "{refused}");
+    assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
 /// A foreign transaction mined at a stored send's nonce pauses its rebroadcast,
@@ -348,7 +355,7 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     assert!(r.paused().await, "no pause on a taken nonce");
     drop(r);
     let refused = o.start(&db).await.err().unwrap();
-    assert!(refused.contains("relayer reconcile"), "{refused}");
+    assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
 /// On an OP-stack chain a balance of exactly `gasLimit × maxFeePerGas + k × U + value`

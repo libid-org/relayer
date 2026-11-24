@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use alloy::{
     consensus::SignableTransaction,
-    eips::BlockNumberOrTag,
+    eips::{
+        BlockId,
+        BlockNumberOrTag,
+    },
     network::TransactionBuilder,
     primitives::{
         address,
@@ -149,6 +152,11 @@ pub(crate) struct Head {
 }
 
 impl Head {
+    /// Its block, which a read fails at once it leaves the canonical chain.
+    pub(crate) fn at(&self) -> BlockId {
+        BlockId::hash_canonical(self.hash)
+    }
+
     /// M × its base fee: the most a send's fee cap is.
     pub(crate) fn fee_bound(&self, config: &Config) -> u128 {
         let m = config.max_fee_percent.into();
@@ -229,4 +237,21 @@ async fn l1_fee_bound<P: Provider>(
     let bound = oracle.getL1FeeUpperBound(U256::from(size));
     let bound = bound.call().await.map_err(node)?;
     Ok(bound.saturating_mul(U256::from(config.l1_margin)) / U256::from(100))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pinned_read_requires_the_canonical_block() {
+        let head = Head {
+            hash: B256::ZERO,
+            number: 0,
+            time: 0,
+            base_fee: 0,
+        };
+        let id = serde_json::to_value(head.at()).unwrap();
+        assert_eq!(id["requireCanonical"], true, "{id}");
+    }
 }

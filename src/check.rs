@@ -288,11 +288,11 @@ pub(crate) async fn rerun<P: Provider>(
     provider: &P,
     tx: &TransactionRequest,
     deadline: u64,
-    at: B256,
+    at: BlockId,
     late: u64,
 ) -> Result<(), Refusal> {
     let late = covered(deadline, late)?;
-    simulate(provider, tx, Some(at.into()), late).await
+    simulate(provider, tx, Some(at), late).await
 }
 
 /// `tx` runs without reverting after `block`, latest by default, and with its

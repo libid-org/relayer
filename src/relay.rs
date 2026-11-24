@@ -176,6 +176,7 @@ impl<P: Provider> Relayer<P> {
     /// explain the key's mined nonce; a fresh database starts at it. `provider` signs
     /// with the relayer's key.
     pub async fn start(provider: P, config: Config, db: &Path) -> Result<Self, Error> {
+        config.validate()?;
         let mut lock = db.as_os_str().to_owned();
         lock.push(".lock");
         let lock = PathBuf::from(lock);
@@ -263,7 +264,7 @@ impl<P: Provider> Relayer<P> {
     pub async fn tick(&self) -> Result<(), Error> {
         let head = gas::head(&self.provider).await.map_err(refused)?;
         let mined = self.provider.get_transaction_count(self.config.relayer);
-        let mined = mined.block_id(head.hash.into()).await?;
+        let mined = mined.block_id(head.at()).await?;
         for (id, deadline, cover) in self.in_flight(mined)? {
             self.watch(id, deadline, cover, &head, mined).await?;
         }
@@ -419,7 +420,7 @@ impl<P: Provider> Relayer<P> {
         let attempt = self.sign(tx, false, head).await?;
         let worst = affordable(&attempt.raw, cover)?;
         let balance = self.provider.get_balance(self.config.relayer);
-        let balance = balance.block_id(head.hash.into()).await?;
+        let balance = balance.block_id(head.at()).await?;
         if balance < worst {
             self.paused.store(true, Relaxed);
             let short = format!("balance {balance} below a send's cost {worst}");
@@ -514,7 +515,7 @@ impl<P: Provider> Relayer<P> {
         let mut tx =
             TransactionRequest::from_transaction_with_sender(tx, self.config.relayer);
         tx.nonce = None;
-        rerun(&self.provider, &tx, deadline, head.hash, late).await
+        rerun(&self.provider, &tx, deadline, head.at(), late).await
     }
 
     /// Broadcast `a` unless the node has it. Its nonce mined with no receipt of ours
@@ -700,7 +701,9 @@ async fn explained<P: Provider>(
     let lowest = in_flight.iter().map(|a| a.0).min().unwrap_or(next);
     if mined < lowest || mined > next || !unexplained.is_empty() {
         let drift = format!("nonce drift: mined {mined}, stored next {next}");
-        return Err(format!("{drift}: run `relayer reconcile`").into());
+        let fix =
+            "wait for or inspect the key's nonce, then start on a fresh database file";
+        return Err(format!("{drift}: {fix}").into());
     }
     Ok(())
 }

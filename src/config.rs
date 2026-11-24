@@ -158,6 +158,18 @@ impl Config {
         config
     }
 
+    /// Refuses settings the sender cannot keep: an inclusion window shorter than
+    /// two blocks.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.inclusion_window < 2 * self.block_time {
+            let (w, b) = (self.inclusion_window, self.block_time);
+            return Err(format!(
+                "inclusion_window {w:?} is under twice block_time {b:?}; raise it"
+            ));
+        }
+        Ok(())
+    }
+
     /// The blocks in `time`, at the chain's block time.
     pub(crate) fn blocks(&self, time: Duration) -> u128 {
         time.as_millis() / self.block_time.as_millis().max(1)
