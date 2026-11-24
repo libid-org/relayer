@@ -1,0 +1,43 @@
+# The relayer on compose.yaml's anvil, written by examples/deploy_local.rs.
+# Dev only: see relayer.example.toml for what each key means.
+
+[chain]
+rpc_url = "{rpc_url}"
+chain_id = {chain_id}
+block_time = "1s"
+poll_interval = "200ms"
+
+[contracts]
+factory = "{factory}"
+forwarder = "{forwarder}"
+
+[key]
+address = "{relayer}"
+
+[fees]
+inclusion_window = "5s"
+quote_validity = "10s"
+tip_percentile = 75.0
+l1_fee = "none"
+l1_margin_percent = 130
+max_fee_percent = 200
+max_cancel_fee_percent = 1000
+fee_params = { fixed = { denominator = 8, elasticity = 2, min_base_fee = 0 } }
+
+[state]
+db = "/var/lib/relayer/relayer.db"
+
+[http]
+port = 8080
+metrics_port = 9090
+request_timeout = "30s"
+concurrency_limit = 64
+
+[limits]
+wallet_budget = { wei = "1000000000000000000", window = "1h" }
+global_budget = { wei = "10000000000000000000", window = "1h" }
+max_gas_limit = 5000000
+supported_releases = [{release}]
+node_error_ticks = 5
+receipt_lag_blocks = 10
+min_balance = "1000000000000000000"
