@@ -447,8 +447,9 @@ fn db(name: &str) -> PathBuf {
     dir.join("relayer.db")
 }
 
+/// Included, not reverted.
 fn included(s: &Status) -> bool {
-    matches!(s, Status::Included { .. })
+    matches!(s, Status::Included { reverted: false, .. })
 }
 
 /// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the

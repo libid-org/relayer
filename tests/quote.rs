@@ -215,6 +215,10 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     calls.push(call(swallower, U256::ZERO, vec![]));
     let b = Batch(calls, o.value, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &b).await;
+    let latest = o.owner.get_block_by_number(Default::default()).await;
+    let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
+    // Above the base fee grown over the quote's validity and the window: 15 blocks.
+    assert!(q.max_fee_per_gas > relayer::config::Eip1559::L1.grow(base.into(), 15));
 
     let above = o.authorize(&b, Some(2 * q.call_gas)).await;
     let expected = o.limit(&above, o.value, 2 * q.call_gas).await;

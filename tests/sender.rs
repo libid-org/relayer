@@ -67,7 +67,8 @@ impl Onboarding {
 
     /// Sent with automine off at a fresh block, then priced out by the base fee: still
     /// pending as its window ends, and not cancelled before.
-    async fn priced_out(&self, r: &Rel) -> (B256, Request, Transaction, Bytes) {
+    /// Its cap is `m` percent of the pinned base fee, at least the window's growth.
+    async fn priced_out(&self, r: &Rel, m: u128) -> (B256, Request, Transaction, Bytes) {
         self.owner.anvil_set_auto_mine(false).await.unwrap();
         let request = self.request_for(&self.onboarding()).await;
         let id = r.relay(&request).await.unwrap();
@@ -81,9 +82,9 @@ impl Onboarding {
         let raw = self.owner.get_raw_transaction_by_hash(hash).await.unwrap();
         let tx = self.tx(hash).await;
         self.assert_within_refund(&[hash], U256::ZERO).await;
-        let m = u128::from(self.config().max_fee_percent);
-        let bound = u128::from(pinned.base_fee_per_gas.unwrap()) * m / 100;
-        assert!(tx.inner.max_fee_per_gas() <= bound, "above M × base");
+        let base = u128::from(pinned.base_fee_per_gas.unwrap());
+        let bound = (base * m / 100).max(relayer::config::Eip1559::L1.grow(base, 5));
+        assert_eq!(tx.inner.max_fee_per_gas(), bound, "not M × base");
         self.base_fee(tx.inner.max_fee_per_gas() * 100).await;
         for at in [late - 1, late] {
             let early = r.status(id).await.unwrap().tx_hashes;
@@ -98,12 +99,15 @@ impl Onboarding {
 }
 
 /// Fails `eth_sendRawTransaction` once when armed: `RACE` mines a transaction of the
-/// key first, `ECHO` sends the transaction, then answers with an error.
+/// key first, `ECHO` sends the transaction, then answers with an error. `STALL` and
+/// `BROKE` make every `eth_call` a node error: a wrong chain id, and no funds.
 #[derive(Clone)]
 struct Racing(DynProvider, std::sync::Arc<std::sync::atomic::AtomicU8>);
 
 const RACE: u8 = 1;
 const ECHO: u8 = 2;
+const STALL: u8 = 3;
+const BROKE: u8 = 4;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -121,6 +125,17 @@ impl Provider for Racing {
         'a: 'b,
     {
         Box::pin(self.0.fill_and_sign_transaction(tx))
+    }
+
+    fn call(
+        &self,
+        tx: TransactionRequest,
+    ) -> alloy::providers::EthCall<alloy::network::Ethereum, Bytes> {
+        self.0.call(match self.1.load(Ordering::Relaxed) {
+            STALL => tx.with_chain_id(1),
+            BROKE => tx.from(Address::repeat_byte(2)),
+            _ => tx,
+        })
     }
 
     fn send_raw_transaction<'a, 'b, 'c>(
@@ -176,7 +191,8 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
 }
 
 /// An instance holds `flock` on `<db>.lock`; any other holder refuses start. A
-/// database of another schema version is refused, naming the fix.
+/// database of another schema version is refused, naming the fix, and so are settings
+/// under the least the sender keeps.
 #[tokio::test]
 async fn a_second_instance_or_an_older_schema_is_refused() {
     let (o, db) = (Onboarding::new(false).await, db("lock"));
@@ -210,6 +226,15 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
         let refused = refused.err().unwrap().to_string();
         assert!(refused.contains(setting), "{refused}");
     }
+    let least = Config {
+        inclusion_window: 2 * o.config().block_time,
+        max_fee_percent: 100,
+        max_cancel_fee_percent: 110,
+        ..o.config()
+    };
+    Relayer::start(o.relayer.clone(), least, &crate::db("least"))
+        .await
+        .unwrap();
 }
 
 /// A send left pending at a restart holds the queue: its stored raw transaction is
@@ -270,7 +295,8 @@ async fn colliding_batches_are_sent_one_at_a_time() {
 async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let (o, path) = (Onboarding::new(true).await, db("cancel"));
     let r = o.start(&path).await.unwrap();
-    let (id, request, sent, _) = o.priced_out(&r).await;
+    let m = o.config().max_fee_percent.into();
+    let (id, request, sent, _) = o.priced_out(&r, m).await;
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
     let hashes = r.status(id).await.unwrap().tx_hashes;
@@ -346,7 +372,8 @@ async fn a_lost_send_that_no_longer_runs_is_cancelled_at_once() {
 async fn the_original_landing_before_its_cancel_resolves_from_its_receipt() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("race")).await.unwrap();
-    let (id, _, sent, raw) = o.priced_out(&r).await;
+    let m = o.config().max_fee_percent.into();
+    let (id, _, sent, raw) = o.priced_out(&r, m).await;
     r.tick().await.unwrap();
     let hashes = r.status(id).await.unwrap().tx_hashes;
     assert_eq!(hashes.len(), 2, "no cancel at the window's end");
@@ -378,15 +405,18 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
 
 /// A foreign transaction mined at a stored send's nonce after its window pauses sending
 /// once our receipt is still missing `receipt_lag_blocks` later, with no cancel signed,
-/// and stays paused; the stored send without a receipt refuses start.
+/// and stays paused, another wallet's batch held; the stored send without a receipt
+/// refuses start.
 #[tokio::test]
 async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
-    let (o, db) = (Onboarding::new(true).await, db("taken"));
+    let (mut o, db) = (Onboarding::new(true).await, db("taken"));
     o.owner.anvil_set_auto_mine(false).await.unwrap();
     let r = o.start(&db).await.unwrap();
     let id = o.onboard(&r, 3600).await.unwrap();
     r.tick().await.unwrap();
     let hash = r.status(id).await.unwrap().tx_hashes[0];
+    o.wallet_at(U256::ONE).await;
+    let next = o.queue(&r).await;
     o.owner.anvil_drop_transaction(hash).await.unwrap();
     let late = o.now().await + o.config().inclusion_window.as_secs();
     o.owner.anvil_set_next_block_timestamp(late).await.unwrap();
@@ -403,6 +433,8 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     r.tick().await.unwrap();
     assert!(r.paused().await, "no pause on a taken nonce");
     assert_eq!(r.status(id).await.unwrap().tx_hashes, [hash], "cancelled");
+    let held = r.status(next).await.unwrap().status;
+    assert!(matches!(held, Status::Queued), "sent past it: {held:?}");
     drop(r);
     let refused = o.start(&db).await.err().unwrap();
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
@@ -422,20 +454,23 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
         o.set_code(ORACLE, &format!("7f{wei:064x}5f5260205ff3"))
             .await
     };
-    let (gwei, ether) = (1_000_000_000u128, 1_000_000_000_000_000_000u128);
+    let gwei = 1_000_000_000u128;
+    // `k × U` a gwei under `R - value`: a cap far below the floor.
+    let short = (u128::try_from(o.refund() - o.value).unwrap() - gwei) * 10 / 13;
     oracle(10 * gwei).await;
     let k_u = U256::from(13 * gwei);
     let r = Relayer::start(o.relayer.clone(), config, &db("l1")).await;
     let (r, request) = (r.unwrap(), o.request_for(&o.onboarding()).await);
     let id = r.relay(&request).await.unwrap();
-    oracle(ether).await;
+    oracle(short).await;
     let pinned = o.owner.get_block_by_number(Default::default()).await;
     let base = u128::from(pinned.unwrap().unwrap().header.base_fee_per_gas.unwrap());
     r.tick().await.unwrap();
     let status = r.status(id).await.unwrap().status;
-    let Status::Failed(Refusal::RefundTooLow { required, .. }) = status else {
+    let Status::Failed(Refusal::RefundTooLow { refund, required }) = status else {
         panic!("{status:?}")
     };
+    assert_eq!(refund, o.refund());
     oracle(10 * gwei).await;
     assert_eq!(r.relay(&request).await.unwrap(), id);
     oracle(20 * gwei).await;
@@ -459,7 +494,7 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let cap = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
     assert_eq!(worst, cap + k_u * U256::from(2) + o.value);
     let floor = U256::from(relayer::config::Eip1559::L1.grow(base, 5));
-    let l1 = U256::from(ether * 13 / 10);
+    let l1 = U256::from(short * 13 / 10);
     assert_eq!(required, o.value + U256::from(t.gas_limit()) * floor + l1);
 }
 
@@ -569,12 +604,17 @@ async fn a_request_expired_before_its_send_fails_unsent() {
     );
 }
 
-/// A landed send's receipt cost goes on its request row, seen after it was queued.
+/// A landed send's receipt cost goes on its request row, seen after it was queued,
+/// across a restart before its receipt was read.
 #[tokio::test]
 async fn a_landed_send_records_its_receipt_cost() {
-    let o = Onboarding::new(true).await;
-    let r = o.start(&db("ledger")).await.unwrap();
+    let (o, path) = (Onboarding::new(true).await, db("ledger"));
+    let r = o.start(&path).await.unwrap();
     let id = o.onboard(&r, 3600).await.unwrap();
+    r.tick().await.unwrap();
+    o.owner.evm_mine(None).await.unwrap(); // mined, its receipt unread
+    drop(r);
+    let r = o.start(&path).await.unwrap();
     let report = o.settle(&r, id, included).await;
     let receipt = o.owner.get_transaction_receipt(report.tx_hashes[0]).await;
     let receipt = receipt.unwrap().unwrap();
@@ -673,4 +713,45 @@ async fn a_first_send_the_node_holds_despite_an_error_keeps_its_commit() {
     let id = o.queue(&r).await;
     o.settle(&r, id, included).await; // unsettled if uncommitted
     o.assert_onboarded(o.refund()).await;
+}
+
+/// A node error on a send's run holds the queue for `node_error_ticks` ticks, then
+/// fails it unsent as `Node`; one naming funds fails it at once.
+#[tokio::test]
+async fn a_node_error_on_a_run_fails_its_send_after_its_ticks() {
+    let o = Onboarding::new(true).await;
+    for (mode, ticks) in [(STALL, o.config().node_error_ticks), (BROKE, 1)] {
+        let path = db("node");
+        let id = o.queue(&o.start(&path).await.unwrap()).await;
+        let failing = Racing(o.relayer.clone(), std::sync::Arc::new(mode.into()));
+        let r = Relayer::start(failing, o.config(), &path).await.unwrap();
+        for _ in 1..ticks {
+            r.tick().await.expect_err("no node error");
+            let held = r.status(id).await.unwrap().status;
+            assert!(matches!(held, Status::Queued), "{held:?}");
+        }
+        r.tick().await.unwrap();
+        let report = r.status(id).await.unwrap();
+        let node = matches!(report.status, Status::Failed(Refusal::Node(_)));
+        assert!(node && report.tx_hashes.is_empty(), "{:?}", report.status);
+    }
+}
+
+/// With the max cancel fee under twice the base fee, a cancel's cap is that max.
+#[tokio::test]
+async fn a_cancel_is_capped_at_the_max_cancel_fee() {
+    let o = Onboarding::new(true).await;
+    let config = Config {
+        max_fee_percent: 100,
+        max_cancel_fee_percent: 150,
+        ..o.config()
+    };
+    let r = Relayer::start(o.relayer.clone(), config, &db("max-cancel")).await;
+    let r = r.unwrap();
+    let (id, ..) = o.priced_out(&r, 100).await;
+    let latest = o.owner.get_block_by_number(Default::default()).await;
+    let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
+    let report = r.status(id).await.unwrap();
+    let cancel = o.tx(report.tx_hashes[1]).await.inner;
+    assert_eq!(cancel.max_fee_per_gas(), u128::from(base) * 3 / 2);
 }

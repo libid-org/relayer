@@ -895,3 +895,19 @@ fn cover(row: &Row) -> rusqlite::Result<Cover> {
 fn refused(refusal: Refusal) -> Error {
     format!("{refusal:?}").into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_send_costing_exactly_its_cover_is_affordable() {
+        let mut tx = alloy::consensus::TxEip1559::default();
+        (tx.gas_limit, tx.max_fee_per_gas, tx.value) = (100, 7, U256::from(5));
+        let signature = alloy::primitives::Signature::test_signature();
+        let raw = TxEnvelope::new_unhashed(tx.into(), signature).encoded_2718();
+        let (net, l1) = (U256::from(703), U256::from(3));
+        assert_eq!(affordable(&raw, (net, l1)).unwrap(), U256::from(708));
+        assert!(affordable(&raw, (net - U256::ONE, l1)).is_err());
+    }
+}
