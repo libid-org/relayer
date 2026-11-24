@@ -148,14 +148,15 @@ pub(crate) async fn tip<P: Provider>(
 }
 
 /// `percentile` of the tips at `percentile` of `history`'s blocks that are not
-/// empty; at least 1 wei.
+/// empty, and not 0 as in an OP-stack block of only its deposit; at least 1 wei.
 fn tip_of(history: &FeeHistory, percentile: f64) -> u128 {
     let blocks = history
         .gas_used_ratio
         .iter()
         .zip(history.reward.iter().flatten());
     let used = blocks.filter(|(ratio, _)| **ratio > 0.0);
-    let mut tips: Vec<u128> = used.filter_map(|(_, t)| t.first().copied()).collect();
+    let tips = used.filter_map(|(_, t)| t.first().copied().filter(|t| *t > 0));
+    let mut tips: Vec<u128> = tips.collect();
     tips.sort_unstable();
     let at = tips.len().saturating_sub(1) as f64 * percentile / 100.0;
     tips.get(at.round() as usize)
@@ -296,7 +297,7 @@ mod tests {
             reward: Some(blocks.iter().map(|b| vec![b.1]).collect()),
             ..Default::default()
         };
-        let busy = history(&[(0.3, 10), (0.6, 30), (0.0, 99), (0.9, 20)]);
+        let busy = history(&[(0.3, 10), (0.6, 30), (0.0, 99), (0.9, 20), (0.1, 0)]);
         assert_eq!(tip_of(&busy, 75.0), 30);
         assert_eq!(tip_of(&busy, 50.0), 20);
         assert_eq!(tip_of(&history(&[(0.0, 9), (0.5, 0)]), 75.0), 1);
