@@ -102,7 +102,12 @@ struct Onboarding {
 
 impl Onboarding {
     async fn new(escrowed: bool) -> Self {
-        let anvil = Anvil::new().spawn();
+        Self::on(Anvil::new(), escrowed).await
+    }
+
+    /// The fixture on the node `anvil` configures.
+    async fn on(anvil: Anvil, escrowed: bool) -> Self {
+        let anvil = anvil.spawn();
         let connect = |i: usize| {
             let key = PrivateKeySigner::from(anvil.keys()[i].clone());
             ProviderBuilder::new()
