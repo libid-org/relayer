@@ -28,7 +28,12 @@ pub struct Config {
 
 impl Config {
     /// An anvil chain's configuration: no L1 fee, default margins.
-    pub fn anvil(chain_id: u64, factory: Address, forwarder: Address, relayer: Address) -> Self {
+    pub fn anvil(
+        chain_id: u64,
+        factory: Address,
+        forwarder: Address,
+        relayer: Address,
+    ) -> Self {
         let _ = (chain_id, factory, forwarder, relayer);
         unimplemented!("S1")
     }

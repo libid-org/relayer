@@ -1,6 +1,9 @@
 //! Sending a checked request.
 
-use alloy::{providers::Provider, rpc::types::TransactionReceipt};
+use alloy::{
+    providers::Provider,
+    rpc::types::TransactionReceipt,
+};
 
 use crate::check::Checked;
 

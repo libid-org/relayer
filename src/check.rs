@@ -2,7 +2,12 @@
 //! canonical data (D4), the refund (D5), the target (D9) and the deadline.
 
 use alloy::{
-    primitives::{Address, Bytes, B256, U256},
+    primitives::{
+        Address,
+        Bytes,
+        B256,
+        U256,
+    },
     providers::Provider,
 };
 use libid_contracts::WalletRegistryError;
