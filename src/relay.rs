@@ -56,6 +56,8 @@ use crate::{
         check,
         decode,
         node,
+        rerun,
+        reverted,
         target,
         Refusal,
         Request,
@@ -76,7 +78,7 @@ const CANCEL_PERCENTILE: f64 = 90.0;
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS requests (id BLOB PRIMARY KEY, wallet BLOB NOT NULL,
         tx TEXT NOT NULL, net BLOB NOT NULL, l1 BLOB NOT NULL, deadline INTEGER NOT NULL,
-        status TEXT NOT NULL, block INTEGER, reverted INTEGER, detail BLOB);
+        status TEXT NOT NULL, block INTEGER, reverted INTEGER, failure TEXT, detail BLOB);
     CREATE TABLE IF NOT EXISTS attempts (hash BLOB PRIMARY KEY, id BLOB NOT NULL,
         nonce INTEGER NOT NULL, cancel INTEGER NOT NULL, raw BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS nonce (next INTEGER NOT NULL);";
@@ -215,35 +217,38 @@ impl<P: Provider> Relayer<P> {
         for (id, deadline, cover) in sent {
             self.watch(id, deadline, cover, mined).await?;
         }
-        let queued = "SELECT id, tx, net, l1 FROM requests WHERE status = 'queued' \
+        let queued =
+            "SELECT id, tx, net, l1, deadline FROM requests WHERE status = 'queued' \
                       ORDER BY rowid";
-        let row = |r: &Row| Ok((b256(r, 0)?, r.get::<_, String>(1)?, cover(r)?));
+        let row =
+            |r: &Row| Ok((b256(r, 0)?, r.get::<_, String>(1)?, cover(r)?, r.get(4)?));
         let queued = rows(&self.db(), queued, [], row)?;
-        for (id, tx, cover) in queued {
+        for (id, tx, cover, deadline) in queued {
             if self.paused.load(Relaxed) {
                 break;
             }
-            self.send(id, serde_json::from_str(&tx)?, cover, mined)
-                .await?;
+            let tx = serde_json::from_str(&tx)?;
+            self.send(id, tx, cover, deadline, mined).await?;
         }
         Ok(())
     }
 
     /// `id`'s status and its transactions.
     pub async fn status(&self, id: B256) -> Result<Report, Error> {
-        let sql = "SELECT status, block, reverted, detail FROM requests WHERE id = ?1";
+        let sql =
+            "SELECT status, block, reverted, failure, detail FROM requests WHERE id = ?1";
         let row = |r: &Row| {
             let (block, reverted) =
                 (r.get::<_, Option<_>>(1)?, r.get::<_, Option<_>>(2)?);
-            let detail = r.get::<_, Option<Vec<u8>>>(3)?.unwrap_or(vec![0; 64]);
+            let failure = (r.get::<_, Option<String>>(3)?, r.get(4)?);
             Ok((
                 first::<String>(r)?,
                 block.unwrap_or(0),
                 reverted.unwrap_or(false),
-                detail,
+                failure,
             ))
         };
-        let (status, block, reverted, detail) =
+        let (status, block, reverted, (failure, detail)) =
             self.db().query_row(sql, [&id[..]], row)?;
         let status = match &status[..] {
             "queued" => Status::Queued,
@@ -251,10 +256,7 @@ impl<P: Provider> Relayer<P> {
             "included" => Status::Included { block, reverted },
             "confirmed" => Status::Confirmed { block, reverted },
             "cancelled" => Status::Cancelled,
-            _ => Status::Failed(Refusal::L1FeeAboveBound {
-                fee: U256::from_be_slice(&detail[..32]),
-                bound: U256::from_be_slice(&detail[32..]),
-            }),
+            _ => Status::Failed(failed(&failure.unwrap_or_default(), detail)),
         };
         let tx_hashes = self.attempts(id)?.iter().map(|a| a.hash).collect();
         Ok(Report { status, tx_hashes })
@@ -296,18 +298,19 @@ impl<P: Provider> Relayer<P> {
         };
         let now = gas::latest_time(&self.provider).await.map_err(refused)?;
         if last.cancel || now < deadline {
-            return self.broadcast(last, cover, mined).await;
+            return self.broadcast(last, cover, Some(deadline), mined).await;
         }
         self.cancel(id, last, mined).await
     }
 
-    /// Sign `tx` at the next nonce with the tip read now, gate its L1 fee, commit it
-    /// and broadcast it.
+    /// Sign `tx` at the next nonce with the tip read now, run it again and gate its
+    /// L1 fee, then commit it and broadcast it.
     async fn send(
         &self,
         id: B256,
         tx: TransactionRequest,
         cover: Cover,
+        deadline: u64,
         mined: u64,
     ) -> Result<(), Error> {
         let next = self.db().query_row("SELECT next FROM nonce", [], first)?;
@@ -323,17 +326,18 @@ impl<P: Provider> Relayer<P> {
             .max_priority_fee_per_gas(tip);
         let attempt = self.sign(tx, false).await?;
         affordable(&attempt.raw, cover)?;
-        let gate =
-            gas::l1_gate(&self.provider, &self.config, attempt.raw.clone(), cover.1);
+        let gate = async {
+            self.runs(&attempt.raw, deadline).await?;
+            let raw = attempt.raw.clone();
+            gas::l1_gate(&self.provider, &self.config, raw, cover.1).await
+        };
         match gate.await {
-            Err(Refusal::L1FeeAboveBound { fee, bound }) => {
-                let detail = [fee.to_be_bytes::<32>(), bound.to_be_bytes::<32>()];
-                return self.set(id, "failed", None, Some(detail.concat()));
-            }
-            gate => gate.map_err(refused)?,
+            Err(Refusal::Node(e)) => return Err(e.into()),
+            Err(refusal) => return self.set(id, "failed", None, Some(&refusal)),
+            Ok(()) => {}
         }
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, cover, mined).await
+        self.broadcast(&attempt, cover, None, mined).await
     }
 
     /// A 0-value self-send at `sent`'s nonce, both fees at least 1.1× `sent`'s and
@@ -358,7 +362,8 @@ impl<P: Provider> Relayer<P> {
             .with_chain_id(self.config.chain_id);
         let attempt = self.sign(cancel, true).await?;
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, Default::default(), mined).await
+        self.broadcast(&attempt, Default::default(), None, mined)
+            .await
     }
 
     async fn sign(&self, tx: TransactionRequest, cancel: bool) -> Result<Attempt, Error> {
@@ -373,12 +378,23 @@ impl<P: Provider> Relayer<P> {
         })
     }
 
+    /// `raw`, as it is sent but at any nonce, still runs before `deadline`.
+    async fn runs(&self, raw: &[u8], deadline: u64) -> Result<(), Refusal> {
+        let tx = TxEnvelope::decode_2718(&mut &raw[..]).map_err(node)?;
+        let mut tx =
+            TransactionRequest::from_transaction_with_sender(tx, self.config.relayer);
+        tx.nonce = None;
+        rerun(&self.provider, &self.config, &tx, deadline).await
+    }
+
     /// Broadcast `a` unless the node has it. Its nonce mined with no receipt of ours
-    /// is another sender's, and sending pauses.
+    /// is another sender's, and sending pauses. With `deadline`, a send that no longer
+    /// runs is left to the deadline's cancel.
     async fn broadcast(
         &self,
         a: &Attempt,
         cover: Cover,
+        deadline: Option<u64>,
         mined: u64,
     ) -> Result<(), Error> {
         if !a.cancel {
@@ -391,6 +407,13 @@ impl<P: Provider> Relayer<P> {
         if mined > a.nonce {
             self.paused.store(true, Relaxed);
             return Ok(());
+        }
+        if let Some(deadline) = deadline {
+            match self.runs(&a.raw, deadline).await {
+                Err(Refusal::Node(e)) => return Err(e.into()),
+                Err(_) => return Ok(()),
+                Ok(()) => {}
+            }
         }
         // A refused broadcast is tried again at the next tick.
         let _ = self.provider.send_raw_transaction(&a.raw).await;
@@ -418,13 +441,14 @@ impl<P: Provider> Relayer<P> {
         id: B256,
         status: &str,
         receipt: Option<(u64, bool)>,
-        detail: Option<Vec<u8>>,
+        failed: Option<&Refusal>,
     ) -> Result<(), Error> {
         let (block, reverted) = receipt.unzip();
+        let (failure, detail) = failed.map(failure).unzip();
         self.db().execute(
-            "UPDATE requests SET status = ?2, block = ?3, reverted = ?4, detail = ?5 \
-             WHERE id = ?1",
-            params![&id[..], status, block, reverted, detail],
+            "UPDATE requests SET status = ?2, block = ?3, reverted = ?4, failure = ?5, \
+             detail = ?6 WHERE id = ?1",
+            params![&id[..], status, block, reverted, failure, detail],
         )?;
         Ok(())
     }
@@ -504,6 +528,31 @@ fn affordable(raw: &[u8], (net, l1): Cover) -> Result<(), Error> {
         return Err(format!("a send costs up to {worst}, above R - value {net}").into());
     }
     Ok(())
+}
+
+/// A failure as stored: its name and its fields.
+fn failure(refusal: &Refusal) -> (String, Vec<u8>) {
+    match refusal {
+        Refusal::L1FeeAboveBound { fee, bound } => {
+            let words = [fee.to_be_bytes::<32>(), bound.to_be_bytes::<32>()];
+            ("L1FeeAboveBound".into(), words.concat())
+        }
+        Refusal::Reverted { data, .. } => ("Reverted".into(), data.to_vec()),
+        other => (format!("{other:?}"), vec![]),
+    }
+}
+
+/// The failure [`failure`] stored: what a send's L1 gate or run refuses.
+fn failed(name: &str, detail: Option<Vec<u8>>) -> Refusal {
+    let detail = detail.unwrap_or_default();
+    match name {
+        "L1FeeAboveBound" => Refusal::L1FeeAboveBound {
+            fee: U256::from_be_slice(&detail[..32]),
+            bound: U256::from_be_slice(&detail[32..]),
+        },
+        "Reverted" => reverted(detail.into()),
+        _ => Refusal::Expired,
+    }
 }
 
 fn rows<T>(

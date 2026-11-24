@@ -278,3 +278,21 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     assert!(o.mined(hashes[0]).await, "not sent again");
     assert_eq!(r.status(id).await.unwrap().tx_hashes, hashes);
 }
+
+/// D15: a request whose deadline no longer covers the window fails unsent at its send.
+#[tokio::test]
+async fn a_request_expired_before_its_send_fails_unsent() {
+    let o = Onboarding::new(true).await;
+    let r = o.start(&db("stale")).await.unwrap();
+    let id = o.onboard(&r, 60).await.unwrap();
+    o.owner.anvil_increase_time(58).await.unwrap();
+    o.owner.evm_mine(None).await.unwrap();
+    r.tick().await.unwrap();
+    let report = r.status(id).await.unwrap();
+    let expired = matches!(report.status, Status::Failed(Refusal::Expired));
+    assert!(expired, "{:?}", report.status);
+    assert!(
+        report.tx_hashes.is_empty() && o.relayer_nonce().await == 0,
+        "sent"
+    );
+}

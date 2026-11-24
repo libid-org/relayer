@@ -286,6 +286,17 @@ pub(crate) async fn target<P: Provider>(
     Ok(call.with_to(wallet).with_input(input))
 }
 
+/// `tx`, as it is sent, still runs before `deadline` until the inclusion window ends.
+pub(crate) async fn rerun<P: Provider>(
+    provider: &P,
+    config: &Config,
+    tx: &TransactionRequest,
+    deadline: u64,
+) -> Result<(), Refusal> {
+    let late = unexpired(provider, deadline, config.inclusion_window).await?;
+    simulate(provider, tx, late).await
+}
+
 /// `tx` runs without reverting on the latest block, and with its timestamp at `late`.
 async fn simulate<P: Provider>(
     provider: &P,
