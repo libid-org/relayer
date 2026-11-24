@@ -20,6 +20,7 @@ use libid_contracts::{
         WalletGas,
     },
 };
+use serde::Deserialize;
 
 use crate::{
     check::{
@@ -41,15 +42,18 @@ use crate::{
 const CALL_VALUE: u64 = 9_000;
 
 /// A batch to quote: its data carries a well-formed dummy signature for every signer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Draft {
     /// The wallet that runs the batch.
     pub wallet: Address,
     /// Set when the wallet is created in the same transaction.
+    #[serde(default)]
     pub create: Option<Create>,
     /// `execute(AUTHORIZED_MODE, data)`'s `data`, with dummy signatures.
     pub data: Bytes,
     /// The client's hint that its signers fall short of quorum: the rules check runs.
+    #[serde(default)]
     pub below_quorum: bool,
 }
 

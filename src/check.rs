@@ -39,6 +39,7 @@ use libid_contracts::{
     },
     WalletRegistryError,
 };
+use serde::Deserialize;
 
 use crate::{
     config::Config,
@@ -46,7 +47,8 @@ use crate::{
 };
 
 /// The create path's wallet: `WalletFactory.createAndExecute(platformId, idNode, salt, …)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Create {
     /// The genesis identity's platform.
     pub platform_id: B256,
@@ -57,11 +59,13 @@ pub struct Create {
 }
 
 /// A signed batch to relay. Its `value` is the one `data` carries.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Request {
     /// The wallet that runs the batch.
     pub wallet: Address,
     /// Set when the wallet is created in the same transaction.
+    #[serde(default)]
     pub create: Option<Create>,
     /// `execute(AUTHORIZED_MODE, data)`'s `data`, signed.
     pub data: Bytes,
