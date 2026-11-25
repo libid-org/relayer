@@ -191,16 +191,12 @@ async fn each_startup_check_refuses_with_its_hint() {
     let worst = &worst[..worst.find(',').unwrap()];
     let exact = budget(worst.parse().unwrap());
     check(&o.relayer, &exact, o.relayer_address).await.unwrap();
-    // A value cap counts in the worst loss.
-    let capped = |max| Config {
-        max_value: Some(max),
-        ..exact.clone()
+    // A batch's value is not a loss: a value cap adds none.
+    let capped = Config {
+        max_value: Some(U256::MAX),
+        ..exact
     };
-    let e = check(&o.relayer, &capped(U256::ONE), o.relayer_address).await;
-    assert!(e.unwrap_err().to_string().contains("plus max_value"));
-    let mut room = capped(U256::ONE);
-    room.wallet_budget.wei += U256::ONE;
-    check(&o.relayer, &room, o.relayer_address).await.unwrap();
+    check(&o.relayer, &capped, o.relayer_address).await.unwrap();
 }
 
 /// A binary's exit: its file, its environment, its arguments and its hint; none when

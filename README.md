@@ -60,7 +60,7 @@ the RPC URL's scheme, host and port only.
 - the signer's balance is under `min_balance`;
 - `wallet_budget` is under one request's worst loss: `max_gas_limit` at
   `max_fee_percent` of the base fee, plus the L1 fee bound of `max_gas_limit`
-  of zero-byte calldata, plus `max_value` when set;
+  of zero-byte calldata, at most 128 KiB;
 - the OP-stack operator fee is on;
 - another relayer holds the ledger's lock (`<db>.lock`);
 - the chain's nonce of the key disagrees with the ledger's.

@@ -189,7 +189,7 @@ struct Attempt {
     /// The number and time of the block it was signed at.
     block: u64,
     at: u64,
-    /// The most it takes from the balance, at the L1 bound it was sent with.
+    /// The most it costs, at the L1 bound it was sent with.
     worst: U256,
 }
 
@@ -566,7 +566,7 @@ impl<P: Provider> Relayer<P> {
     /// What `a`'s receipt cost the relayer: its gas and L1 fee, plus its value unless it
     /// reverted, less R when the key's balance over its block rose by at least
     /// `R - value - cost`. `None` while the balances are unread, until
-    /// `receipt_lag_blocks` past its block, then charged as no refund.
+    /// `receipt_lag_blocks` past its block, then charged its gas and L1 fee.
     async fn loss(
         &self,
         a: &Attempt,
@@ -591,7 +591,7 @@ impl<P: Provider> Relayer<P> {
             }
             Err(e) => {
                 tracing::warn!("{} charged as unrefunded: {e}", a.hash);
-                cost + value
+                cost
             }
         }))
     }
@@ -722,7 +722,7 @@ impl<P: Provider> Relayer<P> {
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
         let attempt = self.sign(tx, false, head, now).await?;
-        let required = affordable(&attempt.raw, (net, now))?;
+        let required = affordable(&attempt.raw, (net, now))? + value;
         if balance < required {
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }
@@ -1103,19 +1103,16 @@ fn admit(
 /// The send `raw` costs at most `R - value`: its gas at its cap plus the L1 bound.
 /// Returns its [`most`].
 fn affordable(raw: &[u8], (net, l1): Cover) -> Result<U256, Error> {
-    let tx = TxEnvelope::decode_2718(&mut &raw[..])?;
-    let most = most(&tx, l1);
-    let worst = most - tx.value();
+    let worst = most(&TxEnvelope::decode_2718(&mut &raw[..])?, l1);
     if worst > net {
         return Err(format!("a send costs up to {worst}, above R - value {net}").into());
     }
-    Ok(most)
+    Ok(worst)
 }
 
-/// The most `tx` takes from the balance at the L1 bound `l1`: its gas at its cap,
-/// `l1` and its value.
+/// The most `tx` costs at the L1 bound `l1`: its gas at its cap and `l1`.
 fn most(tx: &TxEnvelope, l1: U256) -> U256 {
-    U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1 + tx.value()
+    U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1
 }
 
 /// A node error that the same run meets again: one naming fees, gas or funds.
@@ -1239,7 +1236,7 @@ mod tests {
         let signature = alloy::primitives::Signature::test_signature();
         let raw = TxEnvelope::new_unhashed(tx.into(), signature).encoded_2718();
         let (net, l1) = (U256::from(703), U256::from(3));
-        assert_eq!(affordable(&raw, (net, l1)).unwrap(), U256::from(708));
+        assert_eq!(affordable(&raw, (net, l1)).unwrap(), U256::from(703));
         assert!(affordable(&raw, (net - U256::ONE, l1)).is_err());
     }
 

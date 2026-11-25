@@ -71,8 +71,8 @@ concurrency_limit = 64
 [limits]
 # What one wallet may cost in unrefunded sends before it is rate limited: at least
 # max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of that
-# much calldata, plus max_value when set, which start checks: 8M gas at 210% of a
-# 0.1 gwei base fee is 1.68e15 wei.
+# much calldata, which start checks: 8M gas at 210% of a 0.1 gwei base fee is
+# 1.68e15 wei.
 wallet_budget = { wei = "2000000000000000", window = "1h" }
 # What all wallets may cost before sending pauses.
 global_budget = { wei = "20000000000000000", window = "1h" }

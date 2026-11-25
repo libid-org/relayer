@@ -179,18 +179,13 @@ pub async fn check<P: Provider>(
     let l1 = gas::l1_bound(provider, config, size, head.at());
     let l1 = l1.await.map_err(refused)?;
     let gas = U256::from(config.max_gas_limit) * U256::from(head.fee_bound(config));
-    let value = config.max_value.unwrap_or_default();
-    let worst = gas.saturating_add(l1).saturating_add(value);
+    let worst = gas.saturating_add(l1);
     let budget = config.wallet_budget.wei;
     if budget < worst {
-        let value = match config.max_value {
-            Some(_) => "plus max_value",
-            None => "and no batch value, as max_value is unset",
-        };
         return fail(format!(
             "[limits] wallet_budget {budget} is below one request's worst loss {worst}, \
              max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of \
-             that much calldata, {value}: raise it"
+             that much calldata: raise it"
         ));
     }
     operator_fee(provider, config).await

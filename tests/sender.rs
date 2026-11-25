@@ -564,7 +564,7 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
 /// no longer covers fails a send for `value + limit × floor + k × U`; one it covers
 /// sends. A balance below a send's worst cost fails it unpaused, and one of exactly
 /// `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part, and
-/// is the charge when its receipt does not parse.
+/// less its value is the charge when its receipt does not parse.
 #[tokio::test]
 async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let o = Onboarding::new(true).await;
@@ -622,7 +622,7 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let hashes = r.status(id).await.unwrap().tx_hashes;
     assert_eq!(
         left - r.budget_left().unwrap(),
-        worst,
+        worst - o.value,
         "not the send's L1 bound"
     );
     o.assert_within_refund(&hashes, k_u * U256::from(2)).await;
@@ -946,7 +946,7 @@ async fn a_cancel_is_capped_at_the_max_cancel_fee() {
 
 /// A balance the node cannot serve at a receipt's block leaves its loss pending, out of
 /// the budgets and its wallet busy: charged once read, a dust transfer in its block
-/// still refunded, or as unrefunded `receipt_lag_blocks` later.
+/// still refunded, or as its gas unrefunded `receipt_lag_blocks` later.
 #[tokio::test]
 async fn a_loss_is_pending_until_its_balances_are_read() {
     for read in [true, false] {
@@ -988,7 +988,7 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         r.tick().await.unwrap();
         assert_eq!(pending(), 0, "uncharged");
         let cost = report.cost.unwrap();
-        let unrefunded = U256::from(cost.gas_used) * cost.gas_price + o.value;
+        let unrefunded = U256::from(cost.gas_used) * cost.gas_price;
         assert_eq!(lost(), if read { U256::ZERO } else { unrefunded }, "{read}");
     }
 }
@@ -1027,7 +1027,7 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let node = matches!(report.status, Status::Failed(Refusal::Node(_)));
     assert!(node, "{:?}", report.status);
     let t = o.tx(hash).await.inner;
-    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + t.value();
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
     assert_eq!(lost(&r), worst, "not charged at its worst");
     let profit = relayer::stats::stats(&path).unwrap().profit;
     assert_eq!(profit, -alloy::primitives::I256::try_from(worst).unwrap());
@@ -1146,7 +1146,7 @@ async fn an_unparsed_receipt_of_a_pending_loss_is_charged_after_its_ticks() {
     r.tick().await.unwrap();
     let stats = relayer::stats::stats(&path).unwrap();
     let t = o.tx(report.tx_hashes[0]).await.inner;
-    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + t.value();
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
     let worst = alloy::primitives::I256::try_from(worst).unwrap();
     assert_eq!((stats.pending, stats.profit), (0, -worst));
     assert!(included(&r.status(id).await.unwrap().status));
