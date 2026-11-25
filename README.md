@@ -183,4 +183,5 @@ cargo test
 
 CI (`.github/workflows/ci.yml`) runs the vendor script, then formatting,
 clippy and the tests, on the Foundry and Rust versions it pins; its `e2e` job
-runs the e2e test against the compose stack.
+runs the client's checks, then the Rust and the client's e2e tests against the
+compose stack.

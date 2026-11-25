@@ -80,7 +80,8 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
-  # One onboarding through compose.yaml's stack, over HTTP. The test itself
+  # Onboardings through compose.yaml's stack, over HTTP: the Rust test's, and
+  # the TypeScript client's (ts/), whose checks run here too. The Rust test
   # compiles the contracts crate, so it vendors like the `rust` job.
   e2e:
     name: E2E (compose)
@@ -116,11 +117,46 @@ jobs:
         if: steps.vendored.outputs.cache-hit != 'true'
         run: scripts/vendor-contracts.sh
 
+      # The client's @libid/contracts, whose dist/ the script puts in the same
+      # checkout; it depends only on the pin and the Foundry version. The e2e
+      # tests compile their swap mocks with forge too.
+      - name: Restore the contracts' TypeScript build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/git/checkouts/libid-contracts-*/*/ts/packages/contracts/dist
+          key: libid-contracts-ts-${{ runner.os }}-${{ env.FOUNDRY_VERSION }}-${{ hashFiles('Cargo.lock') }}
+
+      # pnpm before setup-node: `cache: pnpm` shells out to pnpm.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: ts/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ts/pnpm-lock.yaml
+
+      - name: Build and install the client
+        run: |
+          scripts/vendor-contracts-ts.sh
+          pnpm -C ts install --frozen-lockfile
+
+      - name: Client checks
+        run: |
+          pnpm -C ts fmt:check
+          pnpm -C ts lint
+          pnpm -C ts typecheck
+          pnpm -C ts test
+
       - name: Bring up the stack
         run: docker compose up -d --wait --build
 
       - name: Onboard through the stack
         run: cargo test --locked --test e2e -- --ignored --nocapture
+
+      - name: Onboard through the client
+        run: pnpm -C ts test:e2e
 
       - name: Logs
         if: failure()
