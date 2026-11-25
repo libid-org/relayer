@@ -131,7 +131,8 @@ than its run showed, made dearer by an earlier call or swallowing a failure
 deep down, may be starved by whoever sends the signed batch. A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
 once its row is dropped (see [Ledger](#ledger)) the request is
 `404 UnknownRequest`. Relaying the same request again answers its current
-status; a failed one is checked and queued again. A batch whose signed transaction would be over 128 KiB, which node
+status; a failed one is checked and queued again. A later request of the same
+identity replaces a failed one, and the failed id is then `UnknownRequest`. A batch whose signed transaction would be over 128 KiB, which node
 pools refuse, is `TooLarge`; `/v1/config` gives that bound as
 `maxTransactionBytes`. A first send the node's pool refuses, naming in whole
 words a replacement, an underpriced or oversized transaction, a full pool

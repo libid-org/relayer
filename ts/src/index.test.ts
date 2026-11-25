@@ -298,10 +298,10 @@ describe('waitFor', () => {
     })
   })
 
-  test('once dropped, waits while the wallet has no code or no admin key', async () => {
+  test('once dropped, throws RequestDropped while the wallet has no code or no admin key', async () => {
     for (const client of [chain('0x', true), chain('0x01', false)]) {
       relayer({ [`/v1/relay/${ID}`]: Array(100).fill(unknown) })
-      await expect(wait(client)).rejects.toThrow('did not settle')
+      await expect(wait(client)).rejects.toMatchObject({ status: 404, name: 'RequestDropped' })
     }
   })
 

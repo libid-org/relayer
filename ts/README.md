@@ -88,7 +88,9 @@ swap and the refund. The relayer drops a paid request `receipt_lag_blocks`
 after its receipt: polled later, the id is `UnknownRequest`, and `waitFor`
 with `client` and the onboarding reads the chain instead, settled once the
 wallet has code and `key` is its admin session (at the latest block, with no
-`txHashes`).
+`txHashes`). While it is not, `waitFor` throws `RequestDropped` at once: the
+request failed and a later one of the identity replaced it, or it was
+dropped. Relay again.
 
 A refusal throws `RelayerError` with the HTTP `status` and the relayer's
 `name`, `message` and `args`; `IdentityBusy` carries the request in flight as
@@ -144,6 +146,12 @@ and `IQuoterV2` of [Uniswap/v3-periphery](https://github.com/Uniswap/v3-peripher
 The fee tiers are the ones QuoterV2 priced best for 0.001 ETH when the routes
 were added. `test/swap.fork.test.ts` runs every route on a fork of
 `BASE_RPC_URL` (`BASE_RPC_URL=… pnpm -C ts test:e2e`), and skips without it.
+
+## Known limits
+
+- Once the relayer drops a request's row, `waitFor` reads the chain, which
+  cannot tell its request from another that onboarded the same wallet, and
+  reads `received` at the latest block, not the inclusion block.
 
 ## Build
 

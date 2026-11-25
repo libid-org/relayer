@@ -324,7 +324,7 @@ type WaitOptions = {
 /// A request the relayer dropped, past its receipt's lag, is `UnknownRequest`:
 /// with `client` and an onboarding the chain answers instead, settled once the
 /// wallet has code and the genesis key is its admin session, at the latest
-/// block, with no hashes.
+/// block, with no hashes; otherwise it throws `RequestDropped` at once.
 export async function waitFor(
   relayerUrl: string,
   id: Hex,
@@ -337,7 +337,8 @@ export async function waitFor(
         const unknown = e instanceof RelayerError && e.name === 'UnknownRequest'
         if (!unknown || !client || !onboarded) throw e
         const at = await landedAt(client, onboarded)
-        return { status: at === undefined ? 'sent' : 'included', txHashes: [], blockNumber: at }
+        if (at === undefined) throw dropped(id)
+        return { status: 'included', txHashes: [], blockNumber: at }
       },
     )
     if (s.status === 'included' && !s.reverted) {
@@ -394,6 +395,16 @@ type RelayStatus = {
   blockNumber?: number
   reverted?: boolean
   error?: unknown
+}
+
+/// A request the relayer no longer holds, its wallet not onboarded.
+function dropped(id: Hex): RelayerError {
+  const why = 'it failed and a later request of the identity replaced it, or it was dropped'
+  return new RelayerError(
+    404,
+    'RequestDropped',
+    `request ${id} is gone and the wallet is not onboarded: ${why}`,
+  )
 }
 
 function throwaway(): Signer {
