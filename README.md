@@ -221,6 +221,12 @@ when the claimed ETH falls short, and refund, in one relayed transaction.
 The image (`Dockerfile`) reads `/etc/relayer/relayer.toml` and holds no key.
 Point `[state] db` at a mounted volume, such as `/var/lib/relayer/relayer.db`.
 
+## Known gaps
+
+- A reorg deeper than `receipt_lag_blocks` that removes a paid send after its
+  row is dropped leaves the key's nonce behind the ledger with nothing to send
+  again: sending waits for that nonce, and start refuses with nonce drift.
+
 ## Build
 
 The contract bindings come from the `libid-contracts` crate, a git dependency
