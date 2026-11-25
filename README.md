@@ -52,6 +52,7 @@ Relative paths are read from the file's directory. Loading refuses, naming the
 setting, a zero `poll_interval`, `request_timeout`, `tick_timeout` or
 `concurrency_limit`, a `tip_percentile` outside 50 to 90, a `max_gas_limit`
 above 2^24 (EIP-7825), an `l1_margin_percent` under 100, a `global_budget` window of 0,
+a `loss_hold` of 0 or under that window,
 a `receipt_lag_blocks` of 0, an API port equal to `metrics_port`, and an empty
 `RELAYER_SIGNER`.
 

@@ -380,10 +380,17 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
         supported_releases: vec![],
         ..o.config()
     };
+    let window = o.config().global_budget.window;
+    let held = |loss_hold| Config {
+        loss_hold,
+        ..o.config()
+    };
     for (config, setting) in [
         (short, "inclusion_window"),
         (cheap, "max_cancel_fee_percent"),
         (none, "supported_releases"),
+        (held(std::time::Duration::ZERO), "loss_hold"),
+        (held(window / 2), "loss_hold"),
     ] {
         let refused = Relayer::start(o.relayer.clone(), config, &crate::db("bad")).await;
         let refused = refused.err().unwrap().to_string();

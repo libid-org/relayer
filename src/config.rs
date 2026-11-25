@@ -225,7 +225,7 @@ impl Config {
     /// Refuses settings the sender cannot keep: no supported release, a max gas limit
     /// above [`MAX_TX_GAS`], an inclusion window shorter than two blocks, a max cancel
     /// fee below 1.1 × M, a tip percentile outside 50 to 90, an L1 margin under 100%,
-    /// a budget window of 0, or no receipt lag.
+    /// a budget window of 0, a loss hold shorter than it or of 0, or no receipt lag.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.supported_releases.is_empty() {
             return Err("supported_releases is empty; list a release".into());
@@ -236,6 +236,12 @@ impl Config {
         }
         if self.global_budget.window.is_zero() {
             return Err("global_budget's window is 0; set it above 0".into());
+        }
+        let (hold, window) = (self.loss_hold, self.global_budget.window);
+        if hold.is_zero() || hold < window {
+            return Err(format!(
+                "loss_hold {hold:?} is 0 or under global_budget's window {window:?}; raise it"
+            ));
         }
         if self.receipt_lag_blocks == 0 {
             return Err("receipt_lag_blocks is 0; set it to 1 or more".into());
