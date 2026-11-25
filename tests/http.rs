@@ -178,6 +178,24 @@ fn name(body: &Value) -> &str {
     body["error"]["name"].as_str().unwrap_or_default()
 }
 
+/// Ten refunded requests, net 100 and cost 25, seen 1 to 10 s after their sends; a
+/// cancel charged 20, seen at 50 s; a revert charged 30; one pending and one queued.
+const LEDGER: &str = "DELETE FROM requests; DELETE FROM attempts;
+    WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 11)
+    INSERT INTO attempts (hash, id, nonce, cancel, raw, block, at, worst, sent_at)
+        SELECT n, n, n, 0, x'', 0, 0, x'', 100 FROM i;
+    INSERT INTO requests (id, wallet, tx, net, l1, deadline, status, reverted, gas_used,
+        gas_price, l1_fee, included_at, loss)
+        SELECT id, x'', '', x'64', x'', 0, 'included', 0, 10, x'02', x'05', 100 + id, x''
+        FROM attempts;
+    UPDATE requests SET status = 'cancelled', l1_fee = x'', included_at = 150,
+        loss = x'14' WHERE id = 11;
+    INSERT INTO requests (id, wallet, tx, net, l1, deadline, status, reverted, gas_used,
+        gas_price, l1_fee, loss) VALUES
+        (12, x'', '', x'64', x'', 0, 'included', 1, 10, x'02', x'', x'1e'),
+        (13, x'', '', x'64', x'', 0, 'included', 0, 10, x'02', x'', NULL),
+        (14, x'', '', x'64', x'', 0, 'queued', NULL, NULL, NULL, NULL, NULL);";
+
 /// Quoted, relayed and included over HTTP; health, metrics and stats then count it.
 #[tokio::test]
 async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
@@ -195,6 +213,11 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
             .unwrap()
             > U256::ZERO
     );
+    let mut low = wire(&request);
+    low["gasLimit"] = 50_000.into();
+    let (code, low) = s.call("/v1/relay", Some(low)).await;
+    assert_eq!((code, name(&low)), (400, "GasLimitTooLow"), "{low}");
+    assert!(low["error"]["args"]["required"].as_u64().unwrap() > 50_000);
     let (code, accepted) = s.relay(&request).await;
     assert_eq!((code, &accepted["status"]), (202, &json!("queued")));
     let done = s.settle(&o, &accepted["id"], "included").await;
@@ -220,6 +243,25 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
         .unwrap();
     let stepped = relayer::stats::stats(&path).unwrap().inclusion_seconds;
     assert_eq!(stepped, Some([0; 3]), "a clock step back");
+    let fixed = path.with_file_name("fixed.db");
+    std::fs::copy(&path, &fixed).unwrap();
+    rusqlite::Connection::open(&fixed)
+        .unwrap()
+        .execute_batch(LEDGER)
+        .unwrap();
+    let fixed = relayer::stats::stats(&fixed).unwrap();
+    let shown = "requests      cancelled 1, included 11, queued 1, reverted 1\n\
+                 profit        700 wei, 58 per request\n\
+                 cancel rate   0.083\n\
+                 inclusion     p50 5s, p90 9s, p99 10s\n\
+                 cost ratio    0.25\n\
+                 pending       1\n";
+    assert_eq!(fixed.to_string(), shown);
+    let requests = json!({"cancelled": 1, "included": 11, "queued": 1, "reverted": 1});
+    let json = json!({"requests": requests, "profit": "700", "profitPerRequest": "58",
+        "cancelRate": 1.0 / 12.0, "inclusionSeconds": [5, 9, 10], "costRatio": 0.25,
+        "pending": 1});
+    assert_eq!(fixed.json(), json);
 
     let noncanonical = json!({"wallet": o.wallet, "data": "0x00", "gasLimit": GAS_LIMIT});
     let (code, refused) = s.call("/v1/relay", Some(noncanonical)).await;
@@ -246,6 +288,7 @@ async fn refusals_carry_their_decoded_names() {
     let mut underfunded = o.config();
     (underfunded.min_balance, underfunded.max_gas_limit) = (U256::MAX, GAS_LIMIT);
     let s = Server::start(&o, underfunded, &db("names"), Duration::from_secs(3600)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // no tick before an hour
     assert_eq!(
         s.call("/health", None).await.0,
         503,
@@ -257,6 +300,7 @@ async fn refusals_carry_their_decoded_names() {
         200,
         "unhealthy on a low balance"
     );
+    assert_eq!(s.gauge("since_last_tick_seconds").await, 0.0, "since start");
     let (code, low) = s
         .relay(&o.request_for(&o.batch(o.repay(o.value))).await)
         .await;
@@ -278,6 +322,14 @@ async fn refusals_carry_their_decoded_names() {
     let timed_out = slow.call("/v1/quote", Some(wire(&unclaimed))).await.0;
     let health = slow.call("/health", None).await.0; // outside the limits
     assert_eq!((timed_out, health), (408, 503));
+    let unsupported = Config {
+        supported_releases: vec![2],
+        ..o.config()
+    };
+    let newer = Server::start(&o, unsupported, &db("newer"), every).await;
+    let (code, release) = newer.relay(&unclaimed).await;
+    assert_eq!((code, name(&release)), (400, "UnsupportedRelease"));
+    assert_eq!(release["error"]["args"]["version"], 1);
     let (code, bad) = s.call("/v1/quote", Some(json!({"wallet": 1}))).await;
     assert_eq!((code, name(&bad)), (400, "BadRequest"));
     let (_, config) = s.call("/v1/config", None).await;

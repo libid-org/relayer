@@ -128,6 +128,10 @@ const BLIND: u8 = 5;
 const GARBLED: u8 = 6;
 /// `BLIND`, and `eth_getTransactionCount` one behind, as from a lagging node.
 const LAGGING: u8 = 7;
+/// Adds an `l1Fee` of 1 wei to each receipt.
+const L1_WEI: u8 = 8;
+/// Fails `eth_getTransactionReceipt` with a node error.
+const DOWN: u8 = 9;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -208,10 +212,24 @@ impl Provider for Racing {
         'a: 'b,
     {
         Box::pin(async move {
-            let garbled = self.1.load(Ordering::Relaxed) == GARBLED;
-            if garbled && method == "eth_getTransactionReceipt" {
+            let (mode, receipt) = (
+                self.1.load(Ordering::Relaxed),
+                method == "eth_getTransactionReceipt",
+            );
+            if mode == GARBLED && receipt {
                 let e = serde_json::from_str::<u8>("{}").unwrap_err();
                 return Err(alloy::transports::RpcError::deser_err(e, "{}"));
+            }
+            if mode == DOWN && receipt {
+                return Err(alloy::transports::TransportErrorKind::custom_str("down"));
+            }
+            if mode == L1_WEI && receipt {
+                let mut receipt: serde_json::Value =
+                    self.0.raw_request(method, params).await?;
+                if let Some(fields) = receipt.as_object_mut() {
+                    fields.insert("l1Fee".into(), "0x1".into());
+                }
+                return Ok(serde_json::from_value(receipt).unwrap());
             }
             self.0.raw_request(method, params).await
         })
@@ -428,6 +446,7 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let retry = o.onboard(&r, 1800).await.unwrap();
     o.settle(&r, retry, included).await;
     o.assert_onboarded(o.refund()).await;
+    assert_eq!(relayer::stats::stats(&path).unwrap().cancel_rate, 0.5);
 }
 
 /// A send the node lost that no longer runs is cancelled at once, inside its window,
@@ -701,8 +720,9 @@ async fn a_request_expired_before_its_send_fails_unsent() {
     );
 }
 
-/// A landed send's receipt cost goes on its request row, seen after it was queued,
-/// across a restart before its receipt was read.
+/// A landed send's receipt cost, its `l1Fee` too, goes on its request row, seen after
+/// it was queued, across a restart before its receipt was read; refunded to the wei
+/// after that fee, it charges no loss.
 #[tokio::test]
 async fn a_landed_send_records_its_receipt_cost() {
     let (o, path) = (Onboarding::new(true).await, db("ledger"));
@@ -711,14 +731,22 @@ async fn a_landed_send_records_its_receipt_cost() {
     r.tick().await.unwrap();
     o.owner.evm_mine(None).await.unwrap(); // mined, its receipt unread
     drop(r);
-    let r = o.restart(&path).await.unwrap();
+    let l1 = Racing(o.relayer.clone(), std::sync::Arc::new(L1_WEI.into()));
+    let start = async || Relayer::start(l1.clone(), o.config(), &path).await;
+    let r = unlocked(async || start().await.map_err(|e| e.to_string()));
+    let r = r.await.unwrap();
+    let left = r.budget_left().unwrap();
     let report = o.settle(&r, id, included).await;
+    assert_eq!(r.budget_left().unwrap(), left, "charged a refunded send");
     let receipt = o.owner.get_transaction_receipt(report.tx_hashes[0]).await;
     let receipt = receipt.unwrap().unwrap();
     let paid = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
     let cost = report.cost.expect("no cost recorded");
     assert_eq!(U256::from(cost.gas_used) * cost.gas_price, paid);
-    assert_eq!(cost.l1_fee, U256::ZERO, "an L1 fee on anvil");
+    assert_eq!(cost.l1_fee, U256::ONE, "not the receipt's l1Fee");
+    let profit = U256::from(GAS_BUDGET) - paid - U256::ONE; // the refund less the cost
+    let profit = alloy::primitives::I256::try_from(profit).unwrap();
+    assert_eq!(relayer::stats::stats(&path).unwrap().profit, profit);
     let (created, sent) = (report.created_at, report.sent_at[0]);
     assert!(created > 0 && sent >= created && cost.included_at >= sent);
 }
@@ -886,8 +914,15 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         if read {
             mode.store(0, Ordering::Relaxed);
         } else {
-            let lag = o.config().receipt_lag_blocks;
-            o.owner.anvil_mine(Some(lag), None).await.unwrap();
+            let Status::Included { block, .. } = report.status else {
+                panic!()
+            };
+            let head = o.owner.get_block_number().await.unwrap();
+            let lag = block + o.config().receipt_lag_blocks - head;
+            o.owner.anvil_mine(Some(lag - 1), None).await.unwrap();
+            r.tick().await.unwrap();
+            assert_eq!(pending(), 1, "charged before its lag");
+            o.owner.anvil_mine(Some(1), None).await.unwrap();
         }
         r.tick().await.unwrap();
         assert_eq!(pending(), 0, "uncharged");
@@ -897,10 +932,10 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
     }
 }
 
-/// A receipt that does not parse of a mined send holds the queue for `node_error_ticks`
-/// ticks, then its request fails as `Node`, charged at its send's worst cost from the
-/// ledger alone, in the budgets and the stats. A retry of the landed batch is refused
-/// and keeps the charge.
+/// A receipt the node fails to serve holds the queue uncharged. One that does not parse
+/// of a mined send holds it for `node_error_ticks` ticks, then its request fails as
+/// `Node`, charged at its send's worst cost from the ledger alone, in the budgets and
+/// the stats. A retry of the landed batch is refused and keeps the charge.
 #[tokio::test]
 async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("garbled"));
@@ -914,6 +949,10 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     r.tick().await.unwrap();
     o.owner.evm_mine(None).await.unwrap(); // the send mined
     let hash = r.status(id).await.unwrap().tx_hashes[0];
+    mode.store(DOWN, Ordering::Relaxed); // a node error is never charged
+    for _ in 0..=o.config().node_error_ticks {
+        r.tick().await.expect_err("no node error");
+    }
     mode.store(GARBLED, Ordering::Relaxed);
     let ledger = rusqlite::Connection::open(&path).unwrap();
     ledger

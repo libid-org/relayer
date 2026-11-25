@@ -128,16 +128,19 @@ async fn each_startup_check_refuses_with_its_hint() {
     let (ep, implementation) = (o.stack.entry_point, o.stack.release.implementation);
     let missing_ep = format!("no EntryPoint v0.9 at {ep}");
     let op = with(&|c| c.l1_fee = L1Fee::OpStack);
-    // The oracle's L1 fee bound: 0, or 2^255 for one row.
+    // The oracle's L1 fee bound: 0, or for one row its calldata size × 2^230.
     let oracle = alloy::primitives::address!("420000000000000000000000000000000000000F");
     o.set_code(oracle, zero).await;
-    let huge = "7f8000000000000000000000000000000000000000000000000000000000000000\
-                60005260206000f3";
-    let costly =
-        with(&|c| (c.l1_fee, c.wallet_budget.wei) = (L1Fee::OpStack, U256::MAX >> 10));
+    let huge = "60043560e61b60005260206000f3";
+    let costly = with(&|c| {
+        (c.l1_fee, c.wallet_budget.wei) = (L1Fee::OpStack, U256::MAX >> 10);
+        c.max_gas_limit = 5_000_000; // 1 250 000 zero bytes: an L1 bound over 2^250
+    });
+    let balance = o.owner.get_balance(o.relayer_address).await.unwrap();
     #[rustfmt::skip]
     let rows: Vec<Case> = vec![
         (ok.clone(), None, ""),
+        (with(&|c| c.min_balance = balance), None, ""),
         (with(&|c| c.chain_id = 1), None, "point rpc_url at it"),
         (with(&|c| c.relayer = at), None, "set address to the signer's"),
         (with(&|c| c.factory = at), None, "[contracts] factory"),
@@ -149,10 +152,15 @@ async fn each_startup_check_refuses_with_its_hint() {
         (with(&|c| c.supported_releases = vec![2]), None, "run a relayer that decodes"),
         (with(&|c| c.min_balance = U256::MAX), None, "fund"),
         (with(&|c| c.wallet_budget.wei = U256::ONE), None, "wallet_budget 1 is below"),
+        // 5M gas at a fee bound over 2e5 wei is over 1e12 wei.
+        (with(&|c| (c.max_gas_limit, c.wallet_budget.wei) = (5_000_000, U256::from(10u64.pow(12)))),
+         None, "below one request's worst loss"),
         (costly, Some((oracle, huge)), "the L1 fee bound"),
         (op.clone(), Some((l1_block, one)), "operator fee is on"),
         (op.clone(), Some((l1_block, revert)), ""),
+        (op.clone(), Some((l1_block, "60016000f3")), "buffer overrun"), // one byte back
         (op.clone(), Some((l1_block, zero)), ""),
+        (op.clone(), Some((l1_block, "fe")), "InvalidFEOpcode"), // a halt, no revert
         (op, None, ""),
     ];
     for (config, planted, hint) in rows {
@@ -165,6 +173,15 @@ async fn each_startup_check_refuses_with_its_hint() {
         }
         o.owner.anvil_set_code(at, kept).await.unwrap();
     }
+    // A wallet budget of exactly one request's worst loss passes.
+    let budget =
+        |wei| with(&|c| (c.max_gas_limit, c.wallet_budget.wei) = (5_000_000, wei));
+    let e = check(&o.relayer, &budget(U256::ONE), o.relayer_address).await;
+    let e = e.unwrap_err().to_string();
+    let worst = e.split("worst loss ").nth(1).unwrap();
+    let worst = &worst[..worst.find(',').unwrap()];
+    let exact = budget(worst.parse().unwrap());
+    check(&o.relayer, &exact, o.relayer_address).await.unwrap();
 }
 
 /// A binary's exit: its file, its environment, its arguments and its hint; none when
@@ -294,15 +311,22 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
         let response = request.send().await.unwrap();
         (response.status().as_u16(), response.text().await.unwrap())
     };
-    let mut healthy = false;
-    for _ in 0..50 {
-        healthy = call(0, "/health", None).await.0 == 200;
-        if healthy {
-            break;
+    let health = async |code: u16| {
+        for _ in 0..50 {
+            if call(0, "/health", None).await.0 == code {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(healthy, "no tick succeeded: {}", logs());
+        false
+    };
+    assert!(health(200).await, "no tick succeeded: {}", logs());
+    tokio::time::sleep(Duration::from_millis(37)).await; // off the 100 ms ticks
+    assert_eq!(
+        call(0, "/health", None).await.0,
+        200,
+        "stale before 10 ticks"
+    );
     let config: Value =
         serde_json::from_str(&call(0, "/v1/config", None).await.1).unwrap();
     assert_eq!(config["relayer"], json!(signer.address()));
@@ -323,6 +347,7 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
     let unreachable = call(0, "/v1/quote", Some(&wire)).await;
     assert_eq!(unreachable.0, 503, "{unreachable:?}");
     answered.push_str(&unreachable.1);
+    assert!(health(503).await, "healthy with every tick failing");
     let pid = child.0.id().to_string();
     Command::new("kill").args(["-INT", &pid]).status().unwrap();
     assert!(child.0.wait().unwrap().success(), "not shut down");
@@ -335,4 +360,7 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
         "no node error: {logs}"
     );
     assert!(logs.contains("shutting down"), "{logs}");
+    // Trace from other targets; the HTTP transport's own debug held back.
+    assert!(logs.contains("TRACE alloy_rpc_client"), "{logs}");
+    assert!(!logs.contains("received response from server"), "{logs}");
 }
