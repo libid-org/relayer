@@ -961,7 +961,7 @@ impl<P: Provider> Relayer<P> {
         };
         // The node may hold `a` unless its pool named a refusal and it has no such hash.
         let first = run.is_none() && !a.cancel;
-        let message = e.as_error_resp().map(|r| r.message.to_lowercase());
+        let message = e.as_error_resp().map(|r| r.message.to_string());
         let message = message.filter(|m| first && pool_refused(m));
         let rejected = match &message {
             Some(_) => self
@@ -976,7 +976,7 @@ impl<P: Provider> Relayer<P> {
             return Ok(true);
         };
         self.uncommit(a)?;
-        if message.contains("replacement") {
+        if words(&message).iter().any(|w| w == "replacement") {
             self.paused.store(true, Relaxed);
             let held = format!("the node refused send {}: {e}", a.hash);
             let held = format!("{held}; a pending transaction of the key holds it");
@@ -1220,9 +1220,18 @@ const FOR_GOOD: [&str; 4] = ["fee", "gas", "funds", "oversized"];
 /// Words of a pool's refusal that may pass: a replacement or an underpriced send.
 const FOR_NOW: [&str; 2] = ["replacement", "underpriced"];
 
-/// The lowercase words of `message`.
+/// The lowercase words of `message`, a camelCase one split at each capital.
 fn words(message: &str) -> Vec<String> {
-    let words = message.split(|c: char| !c.is_ascii_alphanumeric());
+    let mut spaced = String::with_capacity(message.len());
+    let mut lower = false;
+    for c in message.chars() {
+        if lower && c.is_ascii_uppercase() {
+            spaced.push(' ');
+        }
+        lower = c.is_ascii_lowercase();
+        spaced.push(c);
+    }
+    let words = spaced.split(|c: char| !c.is_ascii_alphanumeric());
     words
         .filter(|w| !w.is_empty())
         .map(str::to_lowercase)
@@ -1403,6 +1412,7 @@ mod tests {
             (answer("insufficient funds for gas * price + value"), true),
             (answer("header not found"), false),
             (answer("oversized data"), true),
+            (answer("FeeTooLow"), true),
             (TransportErrorKind::custom_str(url), false),
         ];
         for (e, expected) in cases {
@@ -1420,13 +1430,30 @@ mod tests {
             ("txpool is full", true),
             ("insufficient funds for gas * price + value", true),
             ("oversized data", true),
+            ("InsufficientFunds", true),
+            ("FeeTooLow", true),
+            ("ReplacementTransactionUnderpriced", true),
             ("nonce too low", false),
+            ("NonceTooLow", false),
             ("already known", false),
             ("rate limit exceeded", false),
             ("bad gateway (ray id 8feeb2c1)", false),
         ];
         for (message, refused) in cases {
             assert_eq!(pool_refused(message), refused, "{message}");
+        }
+    }
+
+    #[test]
+    fn camel_case_splits_into_words() {
+        let cases = [
+            ("InsufficientFunds", "insufficient funds"),
+            ("FeeTooLow", "fee too low"),
+            ("maxFeePerGas too low", "max fee per gas too low"),
+            ("txpool is full", "txpool is full"),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(words(message).join(" "), expected, "{message}");
         }
     }
 
