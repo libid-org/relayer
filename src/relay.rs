@@ -61,6 +61,7 @@ use rusqlite::{
 
 use crate::{
     check::{
+        answered,
         decode,
         node,
         outer,
@@ -77,6 +78,7 @@ use crate::{
         Head,
         OperatorFee,
     },
+    logs,
 };
 
 /// Why the relayer did not start or tick.
@@ -1139,13 +1141,17 @@ fn most(tx: &TxEnvelope, l1: U256) -> U256 {
     U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1
 }
 
-/// A node error that the same run meets again: one naming fees, gas or funds.
+/// A node error that the same run meets again: an error response naming fees, gas or
+/// funds.
 fn deterministic(e: &str) -> bool {
-    let e = e.to_lowercase();
-    ["fee", "gas", "funds"].iter().any(|w| e.contains(w))
+    let Some(message) = answered(e) else {
+        return false;
+    };
+    let message = message.to_lowercase();
+    ["fee", "gas", "funds"].iter().any(|w| message.contains(w))
 }
 
-/// A failure as stored: its name and its fields.
+/// A failure as stored: its name and its fields, a node error's text redacted.
 fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
     let words = |a: &U256, b: &U256| [a.to_be_bytes::<32>(), b.to_be_bytes()].concat();
     match refusal {
@@ -1160,7 +1166,7 @@ fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
             let version = U256::from(*version).to_be_bytes::<32>();
             ("UnsupportedRelease".into(), version.to_vec())
         }
-        Refusal::Node(e) => ("Node".into(), e.as_bytes().to_vec()),
+        Refusal::Node(e) => ("Node".into(), logs::redact(e).into_bytes()),
         other => (other.name().into(), vec![]),
     }
 }
@@ -1262,6 +1268,48 @@ mod tests {
         let (net, l1) = (U256::from(703), U256::from(3));
         assert_eq!(affordable(&raw, (net, l1)).unwrap(), U256::from(703));
         assert!(affordable(&raw, (net - U256::ONE, l1)).is_err());
+    }
+
+    #[test]
+    fn only_a_node_answer_naming_fees_gas_or_funds_is_deterministic() {
+        use alloy::{
+            rpc::json_rpc::ErrorPayload,
+            transports::{
+                RpcError,
+                TransportErrorKind,
+            },
+        };
+        let answer = |message: &str| {
+            RpcError::ErrorResp(ErrorPayload {
+                code: -32000,
+                message: message.to_owned().into(),
+                data: None,
+            })
+        };
+        let url = "error sending request for url (https://gas.example/funds?fee=1)";
+        let cases = [
+            (answer("insufficient funds for gas * price + value"), true),
+            (answer("header not found"), false),
+            (TransportErrorKind::custom_str(url), false),
+        ];
+        for (e, expected) in cases {
+            let Refusal::Node(text) = crate::check::refusal(e) else {
+                panic!()
+            };
+            assert_eq!(deterministic(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_node_failure_is_stored_without_the_rpc_url() {
+        let url = "https://user:pw0rd@node.example/v2/s3cr3tk3y?key=qu3ry";
+        crate::logs::install(Some(url), None);
+        let text = format!("error sending request for url ({url})");
+        let (_, detail) = encode_failure(&Refusal::Node(text));
+        let detail = String::from_utf8(detail).unwrap();
+        for secret in ["pw0rd", "s3cr3tk3y", "qu3ry"] {
+            assert!(!detail.contains(secret), "{detail}");
+        }
     }
 
     #[test]

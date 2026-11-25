@@ -444,13 +444,25 @@ async fn simulate<P: Provider>(
     Ok(())
 }
 
-fn refusal(e: TransportError) -> Refusal {
+/// What a `Node` refusal of a node's error response starts with.
+const ANSWERED: &str = "the node answered: ";
+
+/// A revert, a node's error response, or another node error.
+pub(crate) fn refusal(e: TransportError) -> Refusal {
     match e.as_error_resp() {
         Some(resp) if resp.code == 3 => {
             reverted(resp.as_revert_data().unwrap_or_default())
         }
+        Some(resp) => {
+            Refusal::Node(format!("{ANSWERED}{} ({})", resp.message, resp.code))
+        }
         _ => node(e),
     }
+}
+
+/// The message of the node's error response a `Node` refusal's text carries, if any.
+pub(crate) fn answered(e: &str) -> Option<&str> {
+    e.strip_prefix(ANSWERED)
 }
 
 /// A revert with `data`, decoded on the wallet route where it can be.

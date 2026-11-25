@@ -7,7 +7,7 @@ use std::{
         IsTerminal,
         Write,
     },
-    sync::Arc,
+    sync::OnceLock,
 };
 
 use alloy::transports::http::reqwest::Url;
@@ -23,10 +23,14 @@ use tracing_subscriber::{
 /// The target of alloy's HTTP transport, whose debug span names the whole URL.
 const TRANSPORT: &str = "alloy_transport_http";
 
+/// What [`redact`] replaces, once [`install`] sets it.
+static SECRETS: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
 /// Install the subscriber, redacting `rpc_url` and `signer`.
 pub fn init(rpc_url: Option<&str>, signer: Option<&str>) {
+    install(rpc_url, signer);
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let writer = Redacting(redactions(rpc_url, signer).into());
+    let writer = Redacting;
     let transport = filter_fn(|meta| {
         let rest = meta.target().strip_prefix(TRANSPORT);
         let ours = rest.is_some_and(|rest| rest.is_empty() || rest.starts_with("::"));
@@ -75,25 +79,37 @@ fn redactions(rpc_url: Option<&str>, signer: Option<&str>) -> Vec<(String, Strin
     secrets
 }
 
+/// Redact `rpc_url` and `signer` from what [`redact`] and the log write; the first
+/// call sets them.
+pub(crate) fn install(rpc_url: Option<&str>, signer: Option<&str>) {
+    let _ = SECRETS.set(redactions(rpc_url, signer));
+}
+
+/// `text` with each installed secret replaced.
+pub(crate) fn redact(text: &str) -> String {
+    let mut text = text.to_owned();
+    for (secret, shown) in SECRETS.get().into_iter().flatten() {
+        text = text.replace(secret, shown);
+    }
+    text
+}
+
 /// Stdout, with each secret replaced in every line written.
 #[derive(Clone)]
-struct Redacting(Arc<[(String, String)]>);
+struct Redacting;
 
 impl<'a> MakeWriter<'a> for Redacting {
     type Writer = Self;
 
     fn make_writer(&'a self) -> Self {
-        self.clone()
+        Self
     }
 }
 
 impl Write for Redacting {
     /// A whole formatted event: the subscriber writes each in one call.
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut line = String::from_utf8_lossy(buf).into_owned();
-        for (secret, shown) in self.0.iter() {
-            line = line.replace(secret, shown);
-        }
+        let line = redact(&String::from_utf8_lossy(buf));
         io::stdout().write_all(line.as_bytes())?;
         Ok(buf.len())
     }
