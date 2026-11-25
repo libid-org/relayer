@@ -326,6 +326,22 @@ async fn refusals_carry_their_decoded_names() {
         supported_releases: vec![2],
         ..o.config()
     };
+    let capped = |max: U256| Config {
+        max_value: Some(max),
+        ..o.config()
+    };
+    let at = Server::start(&o, capped(o.value), &db("at-max"), every).await;
+    let (_, quoted) = at.call("/v1/quote", Some(wire(&unclaimed))).await;
+    assert_eq!(name(&quoted), "NothingHeld", "{quoted}");
+    let max = o.value - U256::ONE;
+    let under = Server::start(&o, capped(max), &db("under-max"), every).await;
+    let (_, config) = under.call("/v1/config", None).await;
+    assert_eq!(config["maxValue"], max.to_string());
+    let (code, quoted) = under.call("/v1/quote", Some(wire(&unclaimed))).await;
+    let (_, relayed) = under.relay(&unclaimed).await;
+    assert_eq!(quoted, relayed);
+    assert_eq!((code, name(&quoted)), (400, "ValueTooHigh"), "{quoted}");
+    assert_eq!(quoted["error"]["args"]["max"], max.to_string());
     let newer = Server::start(&o, unsupported, &db("newer"), every).await;
     let (code, release) = newer.relay(&unclaimed).await;
     assert_eq!((code, name(&release)), (400, "UnsupportedRelease"));

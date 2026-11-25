@@ -123,6 +123,8 @@ struct Limit {
     wallet_budget: Budget,
     global_budget: Budget,
     max_gas_limit: u64,
+    #[serde(default)]
+    max_value: Option<U256>,
     supported_releases: Vec<u64>,
     node_error_ticks: u32,
     receipt_lag_blocks: u64,
@@ -199,6 +201,7 @@ impl Settings {
             forwarder: contracts.forwarder,
             supported_releases: limits.supported_releases,
             max_gas_limit: limits.max_gas_limit,
+            max_value: limits.max_value,
             relayer: key.address,
             l1_fee: fees.l1_fee,
             l1_margin: fees.l1_margin_percent,

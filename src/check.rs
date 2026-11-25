@@ -109,6 +109,11 @@ pub enum Refusal {
         /// The highest gas limit relayed.
         max: u64,
     },
+    /// The batch's value is above the configured `max_value`.
+    ValueTooHigh {
+        /// The most value relayed, in wei.
+        max: U256,
+    },
     /// The contracts do not vouch for the target.
     UnknownWallet,
     /// An EIP-7702 account's batch carries value, which the relayer does not front.
@@ -156,6 +161,7 @@ impl Refusal {
             Self::RefundTooLow { .. } => "RefundTooLow",
             Self::GasLimitTooLow { .. } => "GasLimitTooLow",
             Self::GasLimitTooHigh { .. } => "GasLimitTooHigh",
+            Self::ValueTooHigh { .. } => "ValueTooHigh",
             Self::UnknownWallet => "UnknownWallet",
             Self::ValueNotAllowed => "ValueNotAllowed",
             Self::UnsupportedRelease { .. } => "UnsupportedRelease",
@@ -181,6 +187,7 @@ impl Request {
         under_max(self.gas_limit, config)?;
         let (message, authorization, executions) =
             decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
+        under_max_value(message.value, config)?;
         let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
         let late =
             unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
@@ -302,6 +309,15 @@ pub(crate) fn under_max(gas_limit: u64, config: &Config) -> Result<(), Refusal> 
     (gas_limit <= max)
         .then_some(())
         .ok_or(Refusal::GasLimitTooHigh { max })
+}
+
+/// `ValueTooHigh` above `config.max_value`.
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+pub(crate) fn under_max_value(value: U256, config: &Config) -> Result<(), Refusal> {
+    match config.max_value {
+        Some(max) if value > max => Err(Refusal::ValueTooHigh { max }),
+        _ => Ok(()),
+    }
 }
 
 /// `late`, unless `deadline` falls before it.

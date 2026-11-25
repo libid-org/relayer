@@ -68,12 +68,14 @@ concurrency_limit = 64
 [limits]
 # What one wallet may cost in unrefunded sends before it is rate limited: at least
 # max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of that
-# much calldata, which start checks. A batch's value is uncapped and not in it.
+# much calldata, plus max_value when set, which start checks.
 wallet_budget = { wei = "1000000000000000", window = "1h" }
 # What all wallets may cost before sending pauses.
 global_budget = { wei = "10000000000000000", window = "1h" }
 # The highest gas limit a request may be priced for.
 max_gas_limit = 5000000
+# The most value, in wei, a batch may ask the relayer to front. Unset, no cap.
+# max_value = "10000000000000000"
 # The wallet releases whose AUTHORIZED data the relayer decodes.
 supported_releases = [1]
 # Ticks of node errors on a request before it fails, and of a receipt that does

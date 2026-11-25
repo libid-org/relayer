@@ -55,7 +55,7 @@ the RPC URL's scheme, host and port only.
 - the signer's balance is under `min_balance`;
 - `wallet_budget` is under one request's worst loss: `max_gas_limit` at
   `max_fee_percent` of the base fee, plus the L1 fee bound of `max_gas_limit`
-  of zero-byte calldata. A batch's value is uncapped and not in it;
+  of zero-byte calldata, plus `max_value` when set;
 - the OP-stack operator fee is on;
 - another relayer holds the ledger's lock (`<db>.lock`);
 - the chain's nonce of the key disagrees with the ledger's.
@@ -84,7 +84,7 @@ A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 
 | Status | Names |
 | ------ | ----- |
-| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `UnknownWallet`, `ValueNotAllowed`, `UnsupportedRelease`, `Expired`, a reverting batch's decoded error (`Reverted` when unknown) |
+| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `ValueTooHigh`, `UnknownWallet`, `ValueNotAllowed`, `UnsupportedRelease`, `Expired`, a reverting batch's decoded error (`Reverted` when unknown) |
 | `404`  | `UnknownRequest` |
 | `408`  | past `request_timeout` |
 | `409`  | `WalletBusy` |

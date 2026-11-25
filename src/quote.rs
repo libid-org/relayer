@@ -29,6 +29,7 @@ use crate::{
         reverted,
         target,
         under_max,
+        under_max_value,
         Create,
         Refusal,
     },
@@ -86,6 +87,7 @@ impl Draft {
     ) -> Result<Quote, Refusal> {
         let (message, authorization, executions) =
             decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
+        under_max_value(message.value, config)?;
         let (wallet, create) = (self.wallet, self.create);
         let call = target(provider, config, wallet, create, &self.data, message.value);
         let call = call.await?;

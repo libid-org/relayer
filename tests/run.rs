@@ -60,6 +60,10 @@ fn the_example_loads_with_its_overrides() {
     assert_eq!(s.config.fee_params, FeeParams::Header);
     assert_eq!(s.config.wallet_budget.window, Duration::from_secs(3600));
     assert!(s.db.ends_with("relayer.db") && s.db.is_absolute());
+    assert_eq!(s.config.max_value, None);
+    let capped = EXAMPLE.replace("# max_value", "max_value");
+    let max = load(&capped, &|_| None).unwrap().config.max_value;
+    assert_eq!(max, Some(U256::from(10u64.pow(16))));
 
     let limit = "concurrency_limit = 64";
     let unknown = EXAMPLE.replace(limit, &format!("{limit}\ncolour = 1"));
@@ -182,6 +186,16 @@ async fn each_startup_check_refuses_with_its_hint() {
     let worst = &worst[..worst.find(',').unwrap()];
     let exact = budget(worst.parse().unwrap());
     check(&o.relayer, &exact, o.relayer_address).await.unwrap();
+    // A value cap counts in the worst loss.
+    let capped = |max| Config {
+        max_value: Some(max),
+        ..exact.clone()
+    };
+    let e = check(&o.relayer, &capped(U256::ONE), o.relayer_address).await;
+    assert!(e.unwrap_err().to_string().contains("plus max_value"));
+    let mut room = capped(U256::ONE);
+    room.wallet_budget.wei += U256::ONE;
+    check(&o.relayer, &room, o.relayer_address).await.unwrap();
 }
 
 /// A binary's exit: its file, its environment, its arguments and its hint; none when

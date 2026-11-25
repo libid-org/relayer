@@ -133,6 +133,9 @@ pub struct Config {
     pub supported_releases: Vec<u64>,
     /// The highest gas limit a request may be priced for; above it, `GasLimitTooHigh`.
     pub max_gas_limit: u64,
+    /// The most value a batch may ask the relayer to front; above it,
+    /// `ValueTooHigh`. `None` is no cap.
+    pub max_value: Option<U256>,
     /// The sending key's address, which every refund must pay.
     pub relayer: Address,
     /// The L1 fee model.
@@ -179,7 +182,7 @@ impl Config {
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
-    /// budgets or gas limit cap, and release 1, the one the contracts' test stack
+    /// budgets, gas limit or value cap, and release 1, the one the contracts' test stack
     /// publishes.
     pub fn anvil(
         chain_id: u64,
@@ -193,6 +196,7 @@ impl Config {
             forwarder,
             supported_releases: vec![1],
             max_gas_limit: u64::MAX,
+            max_value: None,
             relayer,
             l1_fee: L1Fee::None,
             l1_margin: L1_MARGIN,
