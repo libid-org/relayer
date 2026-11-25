@@ -946,7 +946,7 @@ impl<P: Provider> Relayer<P> {
             self.uncommit(a, None)?;
             return Ok(true); // checked again from the next tick's block
         }
-        if message.contains("replacement") {
+        if message.to_lowercase().contains("replacement") {
             self.uncommit(a, None)?;
             self.paused.store(true, Relaxed);
             let held = format!("the node refused send {}: {e}", a.hash);

@@ -856,9 +856,15 @@ async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
 #[tokio::test]
 async fn a_tick_the_node_stalls_times_out() {
     let o = Onboarding::new(true).await;
-    let (r, mode) = o.armable(&db("stall")).await;
+    let config = Config {
+        tick_timeout: std::time::Duration::from_secs(1),
+        ..o.config()
+    };
+    let mode = std::sync::Arc::new(AtomicU8::new(0));
+    let racing = Racing(o.relayer.clone(), mode.clone());
+    let r = Relayer::start(racing, config, &db("stall")).await.unwrap();
     mode.store(HANG, Ordering::Relaxed);
-    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), r.tick());
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(5), r.tick());
     let e = ticked
         .await
         .expect("the tick hung")

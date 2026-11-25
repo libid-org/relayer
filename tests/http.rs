@@ -360,6 +360,7 @@ async fn refusals_carry_their_decoded_names() {
     assert_eq!((code, name(&bad)), (400, "BadRequest"));
     let (_, config) = s.call("/v1/config", None).await;
     let max = config["maxGasLimit"].as_u64().unwrap();
+    assert_eq!(config["maxTransactionBytes"], 131_072);
     assert_eq!(config["registry"], json!(o.stack.wallet_registry));
     let mut over = wire(&unclaimed);
     over["gasLimit"] = (max + 1).into();
