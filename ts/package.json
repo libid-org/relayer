@@ -1,0 +1,33 @@
+{
+  "name": "@libid/relayer-client",
+  "version": "0.1.0",
+  "description": "Onboard a libID web wallet through the relayer in one transaction.",
+  "license": "(MIT OR Apache-2.0)",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --dir src",
+    "test:e2e": "vitest run --dir test",
+    "lint": "biome lint .",
+    "fmt": "biome format --write .",
+    "fmt:check": "biome format ."
+  },
+  "dependencies": {
+    "@libid/contracts": "file:vendor/contracts"
+  },
+  "peerDependencies": {
+    "viem": "^2.48.11"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.6.8",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0",
+    "viem": "^2.48.11",
+    "vitest": "^4.1.11"
+  }
+}

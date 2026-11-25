@@ -125,6 +125,12 @@ chain. Run `down -v` before starting again: a ledger on a fresh anvil fails
 the nonce check. Beside `relayer.toml`, the one-shot writes `stack.json`, the
 identity registry's and the escrow's addresses.
 
+## Client
+
+[`ts/`](ts/README.md) is `@libid/relayer-client`, a TypeScript client that
+onboards a wallet through the API: link, bind, escrow claim, a token swap
+when the claimed ETH falls short, and refund, in one relayed transaction.
+
 ## Operate
 
 - Rate-limit per IP in front of the relayer (Cloudflare, an AWS load
