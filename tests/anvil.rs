@@ -67,11 +67,8 @@ async fn refuses_before_sending() {
     let existing = factory.walletAddress(platform, id_node, U256::ZERO);
     let existing = existing.call().await.unwrap(); // a factory wallet K has no session in
     mined!(factory.createWallet(platform, id_node, U256::ZERO));
-    // An account at `byte` delegated to `to`, its release slot set to `release`.
-    let delegated = async |byte, to: Address, release: Release| {
-        let at = Address::repeat_byte(byte);
-        let delegation = [&[0xef, 0x01, 0x00][..], to.as_slice()].concat();
-        o.owner.anvil_set_code(at, delegation.into()).await.unwrap();
+    // `at`'s release slot set to `release`.
+    let released = async |at: Address, release: Release| {
         let word = U256::from_be_slice(release.implementation.as_slice())
             | U256::from(release.version) << 160;
         let slot = RELEASE_SLOT.into();
@@ -79,16 +76,23 @@ async fn refuses_before_sending() {
         set.await.unwrap();
         at
     };
-    let account = delegated(0x77, o.stack.forwarder, o.stack.release).await;
-    let other = Address::repeat_byte(0x66); // the forwarder's code, at another address
-    let code = o.owner.get_code_at(o.stack.forwarder).await.unwrap();
-    o.owner.anvil_set_code(other, code).await.unwrap();
-    let other = delegated(0x78, other, o.stack.release).await;
+    // An EIP-7702 account delegated to the stack's forwarder, on its published release.
+    let account = Address::repeat_byte(0x77);
+    let delegation = [&[0xef, 0x01, 0x00][..], o.stack.forwarder.as_slice()].concat();
+    o.owner
+        .anvil_set_code(account, delegation.into())
+        .await
+        .unwrap();
+    let account = released(account, o.stack.release).await;
     let unpublished = Release {
         implementation: Address::repeat_byte(0x55),
         ..o.stack.release
     };
-    let planted = delegated(0x79, o.stack.forwarder, unpublished).await;
+    // A factory wallet whose release slot names a release the factory did not publish.
+    let planted = factory.walletAddress(platform, B256::repeat_byte(0xa4), U256::ZERO);
+    let planted = planted.call().await.unwrap();
+    mined!(factory.createWallet(platform, B256::repeat_byte(0xa4), U256::ZERO));
+    let planted = released(planted, unpublished).await;
     // Nothing is mined below, so the check reads this fee and this time.
     let (r, now) = (o.refund(), o.now().await);
     // The relay-time fee floor: the base fee grown 12.5% a block over the window's 5.
@@ -103,7 +107,6 @@ async fn refuses_before_sending() {
     let noncanonical = |r: &Refusal| matches!(r, Refusal::NoncanonicalData);
     let expired = |r: &Refusal| matches!(r, Refusal::Expired);
     let unknown = |r: &Refusal| matches!(r, Refusal::UnknownWallet);
-    let value_not_allowed = |r: &Refusal| matches!(r, Refusal::ValueNotAllowed);
     // The batch ran on the target: its link or bind failed, not the check.
     let failed_call = |r: &Refusal| reverted(r, "FailedCall");
     let wrong_bind = |r: &Refusal| reverted(r, "WrongBindValue");
@@ -196,10 +199,8 @@ async fn refuses_before_sending() {
         ("too large", large.clone(), too_large),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
-        ("account with value", on(account, good.clone()), value_not_allowed),
-        ("another forwarder", on(other, sign_at(U256::ZERO, now, now + 3600)), unknown),
+        ("EIP-7702 account", on(account, sign_at(U256::ZERO, now, now + 3600)), unknown),
         ("planted release", on(planted, sign_at(U256::ZERO, now, now + 3600)), unknown),
-        ("account, no value", on(account, sign_at(U256::ZERO, now, now + 3600)), failed_call),
         ("factory wallet", on(existing, good.clone()), wrong_bind),
     ];
 

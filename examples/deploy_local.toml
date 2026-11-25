@@ -9,7 +9,6 @@ poll_interval = "200ms"
 
 [contracts]
 factory = "{factory}"
-forwarder = "{forwarder}"
 
 [key]
 address = "{relayer}"

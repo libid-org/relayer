@@ -130,10 +130,8 @@ pub struct Budget {
 pub struct Config {
     /// The chain every request is for.
     pub chain_id: u64,
-    /// `WalletFactory`, the create path's target.
+    /// `WalletFactory`, the create path's target and the voucher of its wallets.
     pub factory: Address,
-    /// `WalletForwarder`, which EIP-7702 accounts delegate to.
-    pub forwarder: Address,
     /// The release versions a target may run: the ones whose AUTHORIZED data layout
     /// the relayer decodes.
     pub supported_releases: Vec<u64>,
@@ -192,16 +190,10 @@ impl Config {
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
     /// budgets or value cap, gas limits up to [`MAX_TX_GAS`], and release 1, the one the
     /// contracts' test stack publishes.
-    pub fn anvil(
-        chain_id: u64,
-        factory: Address,
-        forwarder: Address,
-        relayer: Address,
-    ) -> Self {
+    pub fn anvil(chain_id: u64, factory: Address, relayer: Address) -> Self {
         let mut config = Self {
             chain_id,
             factory,
-            forwarder,
             supported_releases: vec![1],
             max_gas_limit: MAX_TX_GAS,
             max_value: None,

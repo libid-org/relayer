@@ -219,12 +219,7 @@ impl Onboarding {
     }
 
     fn config(&self) -> Config {
-        Config::anvil(
-            self.chain_id,
-            self.stack.factory,
-            self.stack.forwarder,
-            self.relayer_address,
-        )
+        Config::anvil(self.chain_id, self.stack.factory, self.relayer_address)
     }
 
     /// Link, bind, claim to the wallet, then `refund`.

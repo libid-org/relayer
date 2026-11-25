@@ -159,8 +159,6 @@ async fn each_startup_check_refuses_with_its_hint() {
         (with(&|c| c.chain_id = 1), None, "point rpc_url at it"),
         (with(&|c| c.relayer = at), None, "set address to the signer's"),
         (with(&|c| c.factory = at), None, "[contracts] factory"),
-        (with(&|c| c.forwarder = at), None, "[contracts] forwarder"),
-        (with(&|c| c.forwarder = at), Some((at, one)), "set this factory's forwarder"),
         (ok.clone(), Some((implementation, one)), "set the factory that published it"),
         (ok.clone(), Some((ep, "")), &missing_ep),
         (ok.clone(), Some((o.stack.factory, "60406000f3")), "published no release"),
@@ -250,7 +248,7 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
     let fixed = "{ fixed = { denominator = 8, elasticity = 2, min_base_fee = 0 } }";
     let file = |extra: &[(&str, &str)]| {
         let mut text = EXAMPLE.to_owned();
-        for at in [o.stack.factory, o.stack.forwarder, signer.address()] {
+        for at in [o.stack.factory, signer.address()] {
             text = text.replacen(&Address::ZERO.to_string(), &at.to_string(), 1);
         }
         #[rustfmt::skip]

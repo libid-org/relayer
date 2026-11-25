@@ -245,7 +245,6 @@ async fn config<P: Provider + 'static>(State(s): S<P>) -> Answer {
         "relayer": c.relayer,
         "factory": c.factory,
         "registry": registry,
-        "forwarder": c.forwarder,
         "supportedReleases": c.supported_releases,
         "maxGasLimit": c.max_gas_limit,
         "maxTransactionBytes": gas::MAX_TX_BYTES,
@@ -391,7 +390,6 @@ fn described(refusal: &Refusal) -> (C, Value) {
         TooLarge { .. } => (C::BAD_REQUEST, "the transaction is over `max` bytes"),
         ValueTooHigh { .. } => (C::BAD_REQUEST, "the batch's value is over `max` wei"),
         UnknownWallet => (C::BAD_REQUEST, "the contracts do not vouch for the wallet"),
-        ValueNotAllowed => (C::BAD_REQUEST, "an EIP-7702 account's batch carries value"),
         UnsupportedRelease { .. } => {
             (C::BAD_REQUEST, "the wallet's release is unsupported")
         }

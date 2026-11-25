@@ -25,7 +25,6 @@ use alloy::{
 use libid_contracts::bindings::wallet::{
     IWebWallet,
     WalletFactory,
-    WalletForwarder,
 };
 use libid_signer::SignerSource;
 use tokio::net::TcpListener;
@@ -90,8 +89,8 @@ pub async fn run(
 }
 
 /// The chain `provider` reads is the one `config` names, for the key at `signer`:
-/// the chain id and block time, the signer's address and balance, the contracts' code
-/// and the addresses they name, the factory's latest release, its EntryPoint, the loss
+/// the chain id and block time, the signer's address and balance, the factory's code
+/// and the addresses it names, the factory's latest release, its EntryPoint, the loss
 /// budgets against one request's worst loss, and no OP-stack operator fee.
 pub async fn check<P: Provider>(
     provider: &P,
@@ -112,21 +111,13 @@ pub async fn check<P: Provider>(
             "the signer is {signer}, [key] address {at}: set address to the signer's"
         ));
     }
-    for (name, at) in [("factory", config.factory), ("forwarder", config.forwarder)] {
-        if provider.get_code_at(at).await?.is_empty() {
-            return fail(format!(
-                "no code at [contracts] {name} {at}: set its address"
-            ));
-        }
-    }
-    let factory = WalletFactory::new(config.factory, provider);
-    let forwarder = WalletForwarder::new(config.forwarder, provider);
-    let named = forwarder.FACTORY().call().await?;
-    if named != config.factory {
+    let at = config.factory;
+    if provider.get_code_at(at).await?.is_empty() {
         return fail(format!(
-            "the forwarder's FACTORY() is {named}, not the factory: set this factory's forwarder"
+            "no code at [contracts] factory {at}: set its address"
         ));
     }
+    let factory = WalletFactory::new(config.factory, provider);
     let latest = factory.latest().call().await?;
     if latest.implementation == Address::ZERO {
         return fail(

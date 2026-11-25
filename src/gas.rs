@@ -133,8 +133,8 @@ fn reverted(e: &alloy::contract::Error) -> bool {
 /// `ceil(1.25 × gas) + (callGas + CALL_OVERHEAD) × (64/63)^d`. The 1.25 is the gas
 /// a transaction needs while it runs above its gas used after the refund (EIP-3529).
 /// Each 64/63 is a frame's kept 1/64: the wallet's check, and the delegatecall of the
-/// wallet proxy or 7702 forwarder, so `d` is 2; the create path adds the factory
-/// proxy's delegatecall and its call of the wallet, so 4.
+/// wallet proxy, so `d` is 2; the create path adds the factory proxy's delegatecall
+/// and its call of the wallet, so 4.
 pub(crate) fn limit(gas: u64, call_gas: u64, create: bool) -> u64 {
     let d = if create { 4 } else { 2 };
     let reserve = u128::from(call_gas) + u128::from(CALL_OVERHEAD);
@@ -413,7 +413,7 @@ mod tests {
             eips::Encodable2718,
             primitives::Signature,
         };
-        let config = Config::anvil(1, Address::ZERO, Address::ZERO, Address::ZERO);
+        let config = Config::anvil(1, Address::ZERO, Address::ZERO);
         for len in [0, 55, 300, 70_000] {
             let call = TransactionRequest::default()
                 .with_to(Address::ZERO)

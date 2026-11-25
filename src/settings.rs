@@ -77,7 +77,6 @@ struct Chain {
 #[serde(deny_unknown_fields)]
 struct Contracts {
     factory: Address,
-    forwarder: Address,
 }
 
 #[derive(Deserialize)]
@@ -206,7 +205,6 @@ impl Settings {
         let config = Config {
             chain_id: chain.chain_id,
             factory: contracts.factory,
-            forwarder: contracts.forwarder,
             supported_releases: limits.supported_releases,
             max_gas_limit: limits.max_gas_limit,
             max_value: limits.max_value,

@@ -1,8 +1,9 @@
 # libID relayer
 
-Sends signed `AUTHORIZED_MODE` batches of libID web wallets, starting with
+Sends signed `AUTHORIZED_MODE` batches of libID factory wallets, starting with
 one-transaction onboarding through `WalletFactory.createAndExecute`, and is
-repaid by a refund inside each batch. One relayer serves one chain with one key.
+repaid by a refund inside each batch. EIP-7702 accounts are refused as
+`UnknownWallet`. One relayer serves one chain with one key.
 
 ## Run
 
@@ -54,8 +55,7 @@ the RPC URL's scheme, host and port only.
 - on an OP-stack chain, or with `fee_params = "header"`, `block_time` is more
   than 25% off the chain's mean block time over the last 10 seconds of blocks;
 - the signer's address differs from `[key] address` (a KMS key included);
-- the factory or the forwarder has no code;
-- the forwarder's `FACTORY()` is not the factory;
+- the factory has no code;
 - the factory has published no release;
 - the latest release's `FACTORY()` and `REGISTRY()` are not the factory's;
 - the release's EntryPoint v0.9 has no code;
@@ -75,7 +75,7 @@ On `[http] port`:
 
 | Route                  | Body                     | Answer |
 | ---------------------- | ------------------------ | ------ |
-| `GET /v1/config`       |                          | `200` chain id, relayer, factory, registry, forwarder, supported releases, limits |
+| `GET /v1/config`       |                          | `200` chain id, relayer, factory, registry, supported releases, limits |
 | `POST /v1/quote`       | `{wallet, create?, data, belowQuorum?}` | `200 {relayer, callGas, gasLimit, maxFeePerGas, l1FeeBound, minRefund, validUntil}` |
 | `POST /v1/relay`       | `{wallet, create?, data, gasLimit}` | `202 {id, status}` |
 | `GET /v1/relay/{id}`   |                          | `200 {status, txHashes, blockNumber?, reverted?, error?}` |
@@ -100,7 +100,7 @@ A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 
 | Status | Names |
 | ------ | ----- |
-| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `TooLarge`, `ValueTooHigh`, `UnknownWallet`, `ValueNotAllowed`, `UnsupportedRelease`, `Expired`, a reverting batch's decoded error (`Reverted` when unknown) |
+| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `TooLarge`, `ValueTooHigh`, `UnknownWallet`, `UnsupportedRelease`, `Expired`, a reverting batch's decoded error (`Reverted` when unknown) |
 | `404`  | `UnknownRequest` |
 | `408`  | past `request_timeout` |
 | `409`  | `WalletBusy` |

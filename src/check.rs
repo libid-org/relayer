@@ -119,10 +119,8 @@ pub enum Refusal {
         /// The most value relayed, in wei.
         max: U256,
     },
-    /// The contracts do not vouch for the target.
+    /// The contracts do not vouch for the target as a factory wallet.
     UnknownWallet,
-    /// An EIP-7702 account's batch carries value, which the relayer does not front.
-    ValueNotAllowed,
     /// The target runs a release outside the configured supported set.
     UnsupportedRelease {
         /// The target's release version.
@@ -169,7 +167,6 @@ impl Refusal {
             Self::TooLarge { .. } => "TooLarge",
             Self::ValueTooHigh { .. } => "ValueTooHigh",
             Self::UnknownWallet => "UnknownWallet",
-            Self::ValueNotAllowed => "ValueNotAllowed",
             Self::UnsupportedRelease { .. } => "UnsupportedRelease",
             Self::Expired => "Expired",
             Self::Reverted { .. } => "Reverted",
@@ -340,7 +337,7 @@ fn covered(deadline: u64, late: u64) -> Result<u64, Refusal> {
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, when the contracts
-/// vouch for the wallet on a supported release; a 7702 account only with no value.
+/// vouch for the wallet on a supported release.
 pub(crate) async fn target<P: Provider>(
     provider: &P,
     config: &Config,
@@ -356,7 +353,7 @@ pub(crate) async fn target<P: Provider>(
             return Err(Refusal::UnknownWallet);
         }
     }
-    vouched(provider, config, wallet, create.is_some(), value).await?;
+    vouched(provider, config, wallet, create.is_some()).await?;
     Ok(outer(config, wallet, create, data, value))
 }
 
@@ -381,26 +378,24 @@ pub(crate) fn outer(
     call.with_to(wallet).with_input(input)
 }
 
-/// The contracts vouch for `wallet` on a supported release: on the create path with
-/// no code yet, the factory's latest; a 7702 account only with no value.
+/// The contracts vouch for `wallet` as a factory wallet on a supported release: on the
+/// create path with no code yet, the factory's latest. An EIP-7702 account is not one.
 pub(crate) async fn vouched<P: Provider>(
     provider: &P,
     config: &Config,
     wallet: Address,
     create: bool,
-    value: U256,
 ) -> Result<(), Refusal> {
     let new = create && provider.get_code_at(wallet).await.map_err(node)?.is_empty();
     let version = if new {
         let factory = WalletFactory::new(config.factory, provider);
         factory.latest().call().await.map_err(node)?.version
     } else {
-        let vouched = check_target(provider, config.factory, config.forwarder, wallet);
+        // No forwarder: a delegation to the zero address leaves no code to match.
+        let vouched = check_target(provider, config.factory, Address::ZERO, wallet);
         match vouched.await.map_err(node)? {
             Some(Target::FactoryWallet(release)) => release.version,
-            Some(Target::Account(release)) if value.is_zero() => release.version,
-            Some(Target::Account(_)) => return Err(Refusal::ValueNotAllowed),
-            None => return Err(Refusal::UnknownWallet),
+            Some(Target::Account(_)) | None => return Err(Refusal::UnknownWallet),
         }
     };
     if !config.supported_releases.contains(&version) {

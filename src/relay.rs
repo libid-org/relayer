@@ -781,7 +781,7 @@ impl<P: Provider> Relayer<P> {
         if balance < required {
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }
-        let vouched = vouched(&self.provider, &self.config, wallet, create, value);
+        let vouched = vouched(&self.provider, &self.config, wallet, create);
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
         if let Err(refusal) = async { vouched.await.and(run.await) }.await {
             return self.strike(&mut ticking.send, id, refusal);
@@ -1232,7 +1232,6 @@ fn decode_failure(name: &str, detail: Option<Vec<u8>>) -> Refusal {
         "UnsupportedRelease" => Refusal::UnsupportedRelease {
             version: first.saturating_to(),
         },
-        "ValueNotAllowed" => Refusal::ValueNotAllowed,
         "UnknownWallet" => Refusal::UnknownWallet,
         "Node" => Refusal::Node(String::from_utf8_lossy(&detail).into()),
         _ => Refusal::Expired,
@@ -1370,7 +1369,7 @@ mod tests {
     #[test]
     fn a_target_failure_reads_back_as_stored() {
         let release = Refusal::UnsupportedRelease { version: 7 };
-        for refusal in [release, Refusal::ValueNotAllowed, Refusal::UnknownWallet] {
+        for refusal in [release, Refusal::UnknownWallet] {
             let (name, detail) = encode_failure(&refusal);
             let read = decode_failure(&name, Some(detail));
             assert_eq!(format!("{read:?}"), format!("{refusal:?}"));

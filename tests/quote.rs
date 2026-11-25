@@ -1,13 +1,11 @@
-//! The quote and the relay-time gas limit on anvil, on the create path, factory
-//! wallets and EIP-7702 accounts. Needs `anvil` on `PATH`.
+//! The quote and the relay-time gas limit on anvil, on the create path and existing
+//! factory wallets. Needs `anvil` on `PATH`.
 
 #![allow(dead_code, unused_imports)]
 
 include!("common/onboarding.rs");
 
 use alloy::{
-    eips::eip7702::Authorization,
-    network::TransactionBuilder7702,
     primitives::keccak256,
     rpc::types::simulate::{
         SimBlock,
@@ -440,49 +438,15 @@ fn fillable(data: &Bytes, refunds: &[U256]) -> u64 {
     signatures.sum::<u64>() + refunds.sum::<u64>() + stamps.iter().sum::<u64>()
 }
 
-/// A key delegated to the forwarder by a real EIP-7702 authorization, reset into the
-/// factory's release with K linked, relays as a wallet. A release outside the supported
-/// set is refused, for it and for a factory wallet, created or not. Reset into such a
-/// release while queued, it keeps its id and fails at its send. Re-delegated to code
+/// An existing factory wallet relays as the create path does. A release outside the
+/// supported set is refused, for it and on the create path, created or not. Its release
+/// changed while queued, it keeps its id and fails at its send. Its code replaced by one
 /// that skips the refund after its send is broadcast, it costs the relayer only that
 /// send's gas.
 #[tokio::test]
-async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
-    let mut o = Onboarding::new(true).await;
-    let key = PrivateKeySigner::random();
-    o.set_balance(key.address(), U256::from(CLAIMED)).await;
-    o.linking(key.address(), false);
-    let link = (o.stack.platform, 2, o.list.clone(), admin());
-    let link = IWebWallet::linkIdentityCall::new(link).abi_encode();
-    // `identityOf(platformId, idNode)`.
-    let identity = keccak256((o.create.platform_id, o.create.id_node).abi_encode());
-    let add = IWebWallet::addSessionCall::new((identity, key_of(&o.k), admin()));
-    let (wallet, value) = (o.wallet, o.value);
-    let link = [
-        call(wallet, value, link),
-        call(wallet, U256::ZERO, add.abi_encode()),
-    ];
-    let link = encode_executions(&link);
-    let account = ProviderBuilder::new()
-        .wallet(key.clone())
-        .connect_http(o._anvil.endpoint_url());
-    let nonce = account.get_transaction_count(key.address()).await.unwrap();
-    let authorization = Authorization {
-        chain_id: U256::from(o.chain_id),
-        address: o.stack.forwarder,
-        nonce: nonce + 1, // the key's own transaction takes `nonce`
-    };
-    let signature = key.sign_hash_sync(&authorization.signature_hash()).unwrap();
-    let reset = TransactionRequest::default()
-        .with_to(key.address())
-        .with_input(IWebWallet::resetCall::new((link,)).abi_encode())
-        .with_authorization_list(vec![authorization.into_signed(signature)])
-        .with_gas_limit(GAS_LIMIT);
-    let sent = account.send_transaction(reset).await.unwrap();
-    assert!(sent.get_receipt().await.unwrap().status(), "reset reverted");
-    o.owner.anvil_increase_time(2).await.unwrap(); // K's session is active
-    o.owner.anvil_mine(Some(1), None).await.unwrap();
-
+async fn an_existing_wallet_relays_and_a_skipped_refund_costs_only_gas() {
+    let o = Onboarding::new(true).await;
+    o.land(&o.sign(&o.onboarding()).await, o.value).await;
     let refund = o.repay(U256::from(CLAIMED / 100));
     let b = Batch(vec![refund], U256::ZERO, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &b).await;
@@ -522,21 +486,25 @@ async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
     }
     o.send(&request).await;
 
-    // Queued, then reset into a release 2 outside the supported set: relayed again it
+    // Queued, then moved to a release 2 outside the supported set: relayed again it
     // keeps its id, and its send fails unsent.
     let data = o.authorize(&b, Some(q.call_gas)).await;
     let queued = o.request_at(&data, q.gas_limit).await;
-    let r = o.start(&db("reset")).await.unwrap();
+    let r = o.start(&db("moved")).await.unwrap();
     let id = r.relay(&queued).await.unwrap();
-    let (s, code) = (
-        o.stack,
-        Artifacts::embedded().bytecode("WebWallet").unwrap(),
+    let (s, artifacts) = (o.stack, Artifacts::embedded());
+    let deploy = async |name: &str, args: Vec<u8>| {
+        let code = artifacts.bytecode(name).unwrap();
+        deploy_with_ctor(&o.owner, &code, &args, "", None)
+            .await
+            .unwrap()
+    };
+    let (admin, rules) = (
+        deploy("IdentityAdmin", vec![]).await,
+        deploy("SessionRules", vec![]).await,
     );
-    let args =
-        (s.factory, s.wallet_registry, 2u64, s.escrow, s.escrow).abi_encode_params();
-    let release = deploy_with_ctor(&o.owner, &code, &args, "", None)
-        .await
-        .unwrap();
+    let args = (s.factory, s.wallet_registry, 2u64, admin, rules).abi_encode_params();
+    let release = deploy("WebWallet", args).await;
     mined!(factory.publish(release));
     // The created wallet on the create path: its own release, not `latest`.
     let created = Request {
@@ -547,15 +515,14 @@ async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
     let refused = created.check(&o.relayer, &unsupported).await.err();
     let own = matches!(refused, Some(Refusal::UnsupportedRelease { version: 1 }));
     assert!(own, "{refused:?}");
-    // The account's release slot as its reset writes it.
-    let reset = U256::from(2) << 160 | U256::from_be_slice(release.as_slice());
+    let moved = U256::from(2) << 160 | U256::from_be_slice(release.as_slice());
     let slot = o.owner.get_storage_at(o.wallet, RELEASE_SLOT.into()).await;
     let at = |word: U256| {
         o.owner
             .anvil_set_storage_at(o.wallet, RELEASE_SLOT.into(), word.into())
     };
     let slot = slot.unwrap();
-    at(reset).await.unwrap();
+    at(moved).await.unwrap();
     assert_eq!(r.relay(&queued).await.unwrap(), id, "a new id");
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
@@ -566,9 +533,9 @@ async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
     assert!(gated && report.tx_hashes.is_empty(), "{:?}", report.status);
     at(slot).await.unwrap();
 
-    // The same batch at the account's next nonce.
+    // The same batch at the wallet's next nonce.
     let data = o.authorize(&b, Some(q.call_gas)).await;
-    let r = o.start(&db("redelegate")).await.unwrap();
+    let r = o.start(&db("skipped")).await.unwrap();
     let id = r
         .relay(&o.request_at(&data, q.gas_limit).await)
         .await
@@ -580,10 +547,8 @@ async fn a_reset_account_relays_and_a_redelegation_costs_only_gas() {
     o.owner.anvil_set_auto_mine(false).await.unwrap();
     r.tick().await.unwrap();
     let sent = matches!(r.status(id).await.unwrap().status, Status::Sent);
-    assert!(sent, "not broadcast before the re-delegation");
-    let stop = Address::repeat_byte(0x5f);
-    o.set_code(stop, "00").await;
-    o.set_code(o.wallet, &format!("ef0100{stop:x}")).await;
+    assert!(sent, "not broadcast before the code changed");
+    o.set_code(o.wallet, "00").await;
     let report = o.settle(&r, id, included).await; // lands, without the refund
     let tx = o.tx(report.tx_hashes[0]).await;
     assert_eq!(tx.inner.value(), U256::ZERO, "value fronted");

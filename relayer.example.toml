@@ -20,9 +20,8 @@ block_time = "200ms"
 poll_interval = "1s"
 
 [contracts]
-# The wallet stack's addresses; chain-configurations does not list them yet.
+# The wallet factory; chain-configurations does not list it yet.
 factory = "0x0000000000000000000000000000000000000000"
-forwarder = "0x0000000000000000000000000000000000000000"
 
 [key]
 # Optional: a 64-hex-digit private key, or an AWS KMS key id, alias or ARN, with its

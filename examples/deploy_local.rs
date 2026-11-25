@@ -68,7 +68,6 @@ async fn main() -> Result<(), Error> {
         .replace("{rpc_url}", &rpc_url)
         .replace("{chain_id}", &provider.get_chain_id().await?.to_string())
         .replace("{factory}", &stack.factory.to_string())
-        .replace("{forwarder}", &stack.forwarder.to_string())
         .replace("{relayer}", &relayer.to_string())
         .replace("{release}", &stack.release.version.to_string());
     std::fs::write(&out, file)?;
