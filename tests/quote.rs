@@ -382,39 +382,51 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     );
 }
 
-/// A `callGas` far beyond the 1.25 margin on an onboarded wallet: the same data one
-/// 64/63 factor of the reserve below the relay-time limit reverts
-/// `InsufficientCallGas`, and the relayer lands it at that limit. On the create path
-/// such a `callGas` is over EIP-7825's 2^24 gas.
+/// A `callGas` far beyond the 1.25 margin, on the create path and then on the wallet
+/// it created, and the relayer lands each at the relay-time limit. On the wallet, the
+/// same data one 64/63 factor of the reserve below that limit reverts
+/// `InsufficientCallGas`. On the create path, under EIP-7825's 2^24 gas, the 1.25
+/// margin covers one factor, so the least gas it runs at is shown above its gas used
+/// plus the whole depth-4 reserve instead.
 #[tokio::test]
 async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     let o = Onboarding::new(true).await;
-    o.send(&o.request_for(&o.onboarding()).await).await;
     let r = U256::from(CLAIMED / 10);
-    let b = Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None);
-    let call_gas = 50 * o.quote_with(&o.config(), &b).await.call_gas;
-    let data = o.authorize(&b, Some(call_gas)).await;
-    let limit = o.limit(&data, b.1, call_gas).await;
-    let short = limit - reserve(call_gas, o.path().await.is_some()) / 64;
-    let tx = o.outer(&data, b.1).await.with_gas_limit(short);
-    let e = o.relayer.call(tx).await.unwrap_err();
-    let revert = e.as_error_resp().and_then(|r| r.as_revert_data());
-    let revert = revert.unwrap_or_default();
-    assert_eq!(
-        revert[..4],
-        IWebWallet::InsufficientCallGas::SELECTOR,
-        "{e}"
-    );
-    let hash = o
-        .send(&o.request_at(&data, limit + 2).await)
-        .await
-        .transaction_hash;
-    let tx = o.tx(hash).await;
-    let sent = tx.inner.gas_limit();
-    assert!(
-        sent.abs_diff(limit) <= 2,
-        "sent at {sent}, expected {limit}"
-    );
+    let onboarding = Batch(o.onboarding(), o.value, vec![&o.k], None);
+    let repay = Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None);
+    for (b, times) in [(onboarding, 8), (repay, 50)] {
+        let call_gas = times * o.quote_with(&o.config(), &b).await.call_gas;
+        let data = o.authorize(&b, Some(call_gas)).await;
+        let limit = o.limit(&data, b.1, call_gas).await;
+        let create = o.path().await.is_some();
+        let tx = o.outer(&data, b.1).await;
+        if create {
+            let used = o.simulated(&data, b.1).await.gas_used;
+            let tx = TransactionRequest { gas: None, ..tx };
+            let least = o.relayer.estimate_gas(tx).await.unwrap();
+            let reserve = reserve(call_gas, true);
+            assert!(least > used + reserve, "{least} within {used} + {reserve}");
+        } else {
+            let short = limit - reserve(call_gas, false) / 64;
+            let e = o.relayer.call(tx.with_gas_limit(short)).await.unwrap_err();
+            let revert = e.as_error_resp().and_then(|r| r.as_revert_data());
+            let revert = revert.unwrap_or_default();
+            assert_eq!(
+                revert[..4],
+                IWebWallet::InsufficientCallGas::SELECTOR,
+                "{e}"
+            );
+        }
+        let hash = o
+            .send(&o.request_at(&data, limit + 2).await)
+            .await
+            .transaction_hash;
+        let sent = o.tx(hash).await.inner.gas_limit();
+        assert!(
+            sent.abs_diff(limit) <= 2,
+            "sent at {sent}, expected {limit}"
+        );
+    }
 }
 
 /// The zero bytes a client may fill when it signs `data` with `refunds`: in them, the
