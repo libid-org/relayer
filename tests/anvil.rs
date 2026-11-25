@@ -1,6 +1,8 @@
 //! Onboarding on anvil: K signs link, bind, claim to the wallet and a refund; the relayer
 //! checks and sends `createAndExecute`, or refuses before sending. Needs `anvil` on `PATH`.
 
+#![allow(dead_code)]
+
 include!("common/onboarding.rs");
 
 use libid_contracts::wallet_target::Release;

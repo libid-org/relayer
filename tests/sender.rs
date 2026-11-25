@@ -257,7 +257,7 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     let report = o.settle(&r, id, included).await;
     o.assert_within_refund(&report.tx_hashes, U256::ZERO).await;
     drop(r);
-    let r = o.start(&db).await.unwrap(); // latest = stored next, with our receipt
+    let r = o.restart(&db).await.unwrap(); // latest = stored next, with our receipt
     let again = r.relay(&request).await.unwrap();
     assert_eq!(again, id, "a new id after restart");
     r.tick().await.unwrap();
@@ -265,7 +265,7 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     assert_eq!(o.relayer_nonce().await, 1, "sent twice");
     drop(r);
     o.foreign().await;
-    let refused = o.start(&db).await.err().unwrap();
+    let refused = o.restart(&db).await.err().unwrap();
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
@@ -333,7 +333,7 @@ async fn a_send_pending_at_start_lands_once_before_the_next() {
     let hashes = r.status(id).await.unwrap().tx_hashes;
     o.owner.anvil_drop_transaction(hashes[0]).await.unwrap();
     drop(r);
-    let r = o.start(&db).await.unwrap();
+    let r = o.restart(&db).await.unwrap();
     o.wallet_at(U256::ONE).await;
     let next = o.queue(&r).await;
     r.tick().await.unwrap();
@@ -420,7 +420,7 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     assert_eq!(raised.inner.max_fee_per_gas(), twice, "not 2 × base");
     assert!(tip(&raised) * 10 >= tip(&cancel) * 11);
     drop(r);
-    let r = o.start(&path).await.unwrap();
+    let r = o.restart(&path).await.unwrap();
     assert_eq!(r.relay(&request).await.unwrap(), id);
     let again = r.status(id).await.unwrap();
     let kept = cancelled(&again.status) && again.tx_hashes == report.tx_hashes;
@@ -483,7 +483,7 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     let _ = r.tick().await;
     assert_eq!(o.relayer_nonce().await, 1, "sent while paused");
     drop(r);
-    let refused = o.start(&db).await.err().unwrap();
+    let refused = o.restart(&db).await.err().unwrap();
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
@@ -517,7 +517,7 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     let held = r.status(next).await.unwrap().status;
     assert!(matches!(held, Status::Queued), "sent past it: {held:?}");
     drop(r);
-    let refused = o.start(&db).await.err().unwrap();
+    let refused = o.restart(&db).await.err().unwrap();
     assert!(refused.contains("inspect the key's nonce"), "{refused}");
 }
 
@@ -711,7 +711,7 @@ async fn a_landed_send_records_its_receipt_cost() {
     r.tick().await.unwrap();
     o.owner.evm_mine(None).await.unwrap(); // mined, its receipt unread
     drop(r);
-    let r = o.start(&path).await.unwrap();
+    let r = o.restart(&path).await.unwrap();
     let report = o.settle(&r, id, included).await;
     let receipt = o.owner.get_transaction_receipt(report.tx_hashes[0]).await;
     let receipt = receipt.unwrap().unwrap();
@@ -821,7 +821,9 @@ async fn a_node_error_on_a_run_fails_its_send_after_its_ticks() {
         let path = db("node");
         let id = o.queue(&o.start(&path).await.unwrap()).await;
         let failing = Racing(o.relayer.clone(), std::sync::Arc::new(mode.into()));
-        let r = Relayer::start(failing, o.config(), &path).await.unwrap();
+        let start = async || Relayer::start(failing.clone(), o.config(), &path).await;
+        let r = unlocked(async || start().await.map_err(|e| e.to_string()));
+        let r = r.await.unwrap();
         for _ in 1..ticks {
             r.tick().await.expect_err("no node error");
             let held = r.status(id).await.unwrap().status;

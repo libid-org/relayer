@@ -350,6 +350,11 @@ impl Onboarding {
         started.map_err(|e| e.to_string())
     }
 
+    /// [`Self::start`] on `db` just after its relayer dropped.
+    async fn restart(&self, db: &Path) -> Result<Relayer<DynProvider>, String> {
+        unlocked(async || self.start(db).await).await
+    }
+
     /// Ticks and mines until `id`'s status is `done`.
     async fn settle<P: Provider>(
         &self,
@@ -486,4 +491,18 @@ fn call(target: Address, value: U256, data: Vec<u8>) -> Execution {
         value,
         callData: data.into(),
     }
+}
+
+/// `start` retried for 2 s while its lock is held: a child another test spawns keeps a
+/// forked copy of a dropped relayer's lock until it execs.
+async fn unlocked<T>(start: impl AsyncFn() -> Result<T, String>) -> Result<T, String> {
+    for _ in 0..20 {
+        match start().await {
+            Err(e) if e.contains("is held by another relayer") => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await
+            }
+            started => return started,
+        }
+    }
+    start().await
 }
