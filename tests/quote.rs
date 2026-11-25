@@ -7,11 +7,6 @@ include!("common/onboarding.rs");
 
 use alloy::{
     primitives::keccak256,
-    rpc::types::simulate::{
-        SimBlock,
-        SimCallResult,
-        SimulatePayload,
-    },
     sol_types::SolError,
 };
 use libid_contracts::deploy::deploy_with_ctor;
