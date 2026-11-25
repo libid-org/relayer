@@ -436,6 +436,24 @@ async fn one_identity_is_sent_one_batch_at_a_time() {
     assert_eq!(after, before + o.refund() - o.value - gas);
 }
 
+/// A batch for a queued identity's wallet that its key did not sign fails its check,
+/// and learns nothing of the queued request; the owner's second batch is busy with the
+/// first's id.
+#[tokio::test]
+async fn a_stranger_learns_nothing_of_a_queued_batch() {
+    let mut o = Onboarding::new(true).await;
+    let r = o.start(&db("stranger")).await.unwrap();
+    let first = o.queue(&r).await;
+    let owner = std::mem::replace(&mut o.k, PrivateKeySigner::random());
+    let stranger = r.relay(&o.request_for(&o.onboarding()).await).await;
+    let refused = matches!(stranger, Err(Refusal::Reverted { .. }));
+    assert!(refused, "{stranger:?}");
+    o.k = owner;
+    let again = o.onboard(&r, 1800).await;
+    let busy = matches!(again, Err(Refusal::IdentityBusy { id }) if id == first);
+    assert!(busy, "{again:?}");
+}
+
 /// A send priced out by the base fee is replaced when its window ends, long before its
 /// deadline, by a 0-value self-send at its nonce, +10% on both fees and its cap at least
 /// twice the base fee. Lost by the node with the base fee below its cap, that cancel is

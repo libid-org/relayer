@@ -33,7 +33,9 @@ has it sent again; a row with a loss (a reverted batch, a skipped refund, a
 landed cancel) or a failed one is dropped `loss_hold` after it last moved.
 
 - An identity has one request in flight: another is `IdentityBusy` until the
-  row is dropped or failed.
+  row is dropped or failed. Before its check, a relay answers only for its own
+  id; busy and held answer after it, so a batch the wallet's key did not sign
+  is refused by its check and learns nothing of the identity's request.
 - A loss refuses the identity as `IdentityHeld` until `loss_hold` has passed:
   an honest batch that reverts after a good check waits as long.
 - The global budget sums the rows' losses over its `window`, each send at its
