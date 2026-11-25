@@ -51,7 +51,7 @@ impl Onboarding {
             value: b.1,
             at: U48::from(now),
             nonce,
-            deadline: U48::from(now + 3600),
+            deadline: U48::from(now + self.longest()),
             call_gas: U256::from(call_gas.unwrap_or(0)),
         };
         let mut digest = message.digest(self.chain_id, self.wallet, version, salt);

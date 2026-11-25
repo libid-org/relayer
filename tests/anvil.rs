@@ -106,6 +106,8 @@ async fn refuses_before_sending() {
     let low = |r: &Refusal| matches!(r, Refusal::RefundTooLow { .. });
     let noncanonical = |r: &Refusal| matches!(r, Refusal::NoncanonicalData);
     let expired = |r: &Refusal| matches!(r, Refusal::Expired);
+    // A quote's deadline and two block times of a node behind it.
+    let max = now + o.longest() + 2 * o.config().block_time.as_secs();
     let unknown = |r: &Refusal| matches!(r, Refusal::UnknownWallet);
     // The batch ran on the target: its link or bind failed, not the check.
     let failed_call = |r: &Refusal| reverted(r, "FailedCall");
@@ -126,7 +128,7 @@ async fn refuses_before_sending() {
     trailing.extend([0; 32]);
     let mut padded = calldata.to_vec();
     padded.extend([0; 32]); // signed, but the wallet would refuse it NoncanonicalBatch
-    let padded = o.sign_until(padded.into(), o.value, now, now + 3600);
+    let padded = o.sign_until(padded.into(), o.value, now, now + o.longest());
     let another = Request {
         wallet: Address::repeat_byte(0x0f), // the create path names another wallet
         ..o.request(good.clone())
@@ -184,8 +186,8 @@ async fn refuses_before_sending() {
         ("nested refund", o.request_for(&o.batch(nested)).await, missing),
         ("refund = value", o.request_for(&o.batch(bare)).await, low),
         // Signed with `value` R, so R - value is 0.
-        ("value = refund", o.request(sign_at(r, now, now + 3600)), low),
-        ("value > refund", o.request(sign_at(r + U256::ONE, now, now + 3600)), low),
+        ("value = refund", o.request(sign_at(r, now, now + o.longest())), low),
+        ("value > refund", o.request(sign_at(r + U256::ONE, now, now + o.longest())), low),
         ("refund 1 wei below the bound", below_bound.clone(), low),
         ("moved offsets", o.request(moved.into()), noncanonical),
         ("trailing word", o.request(trailing.into()), noncanonical),
@@ -202,8 +204,8 @@ async fn refuses_before_sending() {
         ("too large", large.clone(), too_large),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
-        ("EIP-7702 account", on(account, sign_at(U256::ZERO, now, now + 3600)), unknown),
-        ("planted release", on(planted, sign_at(U256::ZERO, now, now + 3600)), unknown),
+        ("EIP-7702 account", on(account, sign_at(U256::ZERO, now, now + o.longest())), unknown),
+        ("planted release", on(planted, sign_at(U256::ZERO, now, now + o.longest())), unknown),
         ("factory wallet", on(existing, good.clone()), wrong_bind),
     ];
 
@@ -236,7 +238,12 @@ async fn refuses_before_sending() {
     // The good request still passes: every refusal above is the change's.
     let at_bound = o.request_for(&o.batch(o.repay(bound))).await;
     let at_window = o.request(sign_at(o.value, now, now + window));
-    for request in [o.request(good.clone()), at_bound, at_window] {
+    let far = o.request(sign_at(o.value, now, max + 1));
+    let refused = far.check(&o.relayer, &o.config()).await.err();
+    let too_far = matches!(refused, Some(Refusal::DeadlineTooFar { max: m }) if m == max);
+    assert!(too_far, "{refused:?}");
+    let at_max = o.request(sign_at(o.value, now, max));
+    for request in [o.request(good.clone()), at_bound, at_window, at_max] {
         request.check(&o.relayer, &o.config()).await.unwrap();
     }
     let op_stack = Config {

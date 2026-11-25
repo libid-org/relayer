@@ -141,12 +141,15 @@ async fn an_onboarding_lands_through_the_stack() {
 
     let now = chain.get_block_by_number(Default::default()).await.unwrap();
     let now = now.unwrap().header.timestamp;
+    // The latest deadline a relay accepts: a quote's `validUntil` and the window.
+    let seconds = |key: &str| config[key].as_u64().unwrap();
+    let longest = seconds("quoteValiditySeconds") + seconds("inclusionWindowSeconds");
     let message = ExecuteMessage {
         execution_calldata: encode_executions(&calls),
         value,
         at: U48::from(now),
         nonce: U256::ZERO,
-        deadline: U48::from(now + 3600),
+        deadline: U48::from(now + longest),
         call_gas: U256::from(CALL_GAS),
     };
     let digest = message.digest(chain_id, wallet, release, wallet_salt(B256::ZERO, 0));

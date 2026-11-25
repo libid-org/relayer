@@ -20,7 +20,7 @@ impl Onboarding {
         r.relay(&self.request(data)).await
     }
 
-    /// The onboarding relayed by `r`, signed to expire an hour after the latest block.
+    /// The onboarding relayed by `r`, signed to expire at the latest a relay accepts.
     async fn queue(&self, r: &Relayer<impl Provider>) -> B256 {
         let request = self.request_for(&self.onboarding()).await;
         r.relay(&request).await.unwrap()
@@ -312,7 +312,7 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     let r = o.start(&db).await.unwrap();
     let id = r.relay(&request).await.unwrap();
     assert_eq!(r.relay(&request).await.unwrap(), id, "a second id");
-    let busy = o.onboard(&r, 1800).await;
+    let busy = o.onboard(&r, o.longest() - 1).await;
     let busy = matches!(busy, Err(Refusal::IdentityBusy { id: first }) if first == id);
     assert!(busy, "another batch for a busy identity");
     let report = o.settle(&r, id, included).await;
@@ -415,7 +415,7 @@ async fn a_send_pending_at_start_lands_once_before_the_next() {
     let (mut o, db) = (Onboarding::new(true).await, db("crash"));
     o.owner.anvil_set_auto_mine(false).await.unwrap();
     let r = o.start(&db).await.unwrap();
-    let id = o.onboard(&r, 3600).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
     r.tick().await.unwrap();
     let hashes = r.status(id).await.unwrap().tx_hashes;
     o.owner.anvil_drop_transaction(hashes[0]).await.unwrap();
@@ -476,7 +476,7 @@ async fn a_stranger_learns_nothing_of_a_queued_batch() {
     let refused = matches!(stranger, Err(Refusal::Reverted { .. }));
     assert!(refused, "{stranger:?}");
     o.k = owner;
-    let again = o.onboard(&r, 1800).await;
+    let again = o.onboard(&r, o.longest() - 1).await;
     let busy = matches!(again, Err(Refusal::IdentityBusy { id }) if id == first);
     assert!(busy, "{again:?}");
 }
@@ -551,7 +551,7 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let kept = cancelled(&again.status) && again.tx_hashes == report.tx_hashes;
     assert!(kept, "queued again: {:?}", again.status);
     // The cancel's gas is a loss: the identity is held for `loss_hold`.
-    let retry = o.onboard(&r, 1800).await;
+    let retry = o.onboard(&r, o.longest() - 1).await;
     assert!(
         matches!(retry, Err(Refusal::IdentityHeld { .. })),
         "{retry:?}"
@@ -607,11 +607,11 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
     let (mut o, db) = (Onboarding::new(true).await, db("pause"));
     let r = o.start(&db).await.unwrap();
     o.foreign().await;
-    o.onboard(&r, 3600).await.unwrap();
+    o.onboard(&r, o.longest()).await.unwrap();
     let _ = r.tick().await;
     assert!(r.paused(), "no pause on a foreign nonce");
     o.wallet_at(U256::ONE).await;
-    let refused = o.onboard(&r, 3600).await;
+    let refused = o.onboard(&r, o.longest()).await;
     assert!(matches!(refused, Err(Refusal::Paused)), "{refused:?}");
     let _ = r.tick().await;
     assert_eq!(o.relayer_nonce().await, 1, "sent while paused");
@@ -629,7 +629,7 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     let (mut o, db) = (Onboarding::new(true).await, db("taken"));
     o.owner.anvil_set_auto_mine(false).await.unwrap();
     let r = o.start(&db).await.unwrap();
-    let id = o.onboard(&r, 3600).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
     r.tick().await.unwrap();
     let hash = r.status(id).await.unwrap().tx_hashes[0];
     o.other_identity(1).await;
@@ -784,12 +784,12 @@ async fn a_max_fee_percent_under_the_window_growth_still_sends() {
 async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("reorg")).await.unwrap();
-    let id = o.onboard(&r, 3600).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
     let snapshot = o.owner.anvil_snapshot().await.unwrap();
     let hashes = o.settle(&r, id, included).await.tx_hashes;
     assert!(o.owner.anvil_revert(snapshot).await.unwrap());
     assert!(!o.mined(hashes[0]).await);
-    let late = o.onboard(&r, 1800).await;
+    let late = o.onboard(&r, o.longest() - 1).await;
     assert!(
         matches!(late, Err(Refusal::IdentityBusy { .. })),
         "{late:?}"
@@ -839,9 +839,10 @@ async fn a_request_expired_before_its_send_fails_unsent() {
     let o = Onboarding::new(true).await;
     let r = o.start(&db("stale")).await.unwrap();
     let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
-    let request = o.request(o.sign_until(calls, o.value, now, now + 60));
+    let request = o.request(o.sign_until(calls, o.value, now, now + o.longest()));
     let id = r.relay(&request).await.unwrap();
-    o.owner.anvil_increase_time(58).await.unwrap();
+    let late = now + o.longest() - 2;
+    o.owner.anvil_set_next_block_timestamp(late).await.unwrap();
     o.owner.evm_mine(None).await.unwrap();
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
@@ -864,7 +865,7 @@ async fn a_request_expired_before_its_send_fails_unsent() {
 async fn a_refunded_send_read_after_a_restart_charges_no_loss() {
     let (o, path) = (Onboarding::new(true).await, db("ledger"));
     let r = o.start(&path).await.unwrap();
-    let id = o.onboard(&r, 3600).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
     r.tick().await.unwrap();
     o.owner.evm_mine(None).await.unwrap(); // mined, its receipt unread
     drop(r);
@@ -895,7 +896,7 @@ async fn an_underfunded_relayer_pauses_before_its_send() {
     };
     let r = Relayer::start(o.relayer.clone(), config, &db("underfunded")).await;
     let r = r.unwrap();
-    let id = o.onboard(&r, 3600).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
     // The value, not its gas; then the send's cost, below the floor.
     for balance in [o.value, floor - U256::ONE] {
         o.set_balance(o.relayer_address, balance).await;
@@ -1003,7 +1004,7 @@ async fn a_refused_first_send_is_queued_again_and_pauses() {
         .with_max_fee_per_gas(1000 * gwei)
         .with_max_priority_fee_per_gas(100 * gwei);
     let pending = o.relayer.send_transaction(ahead).await.unwrap();
-    let id = o.onboard(&r, 3600).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
     let refused = r.tick().await.expect_err("refusal unreported").to_string();
     assert!(refused.contains("refused"), "{refused}");
     let report = r.status(id).await.unwrap();
@@ -1169,7 +1170,7 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         let worst = worst + o.value;
         assert_eq!((pending(), lost()), (1, worst), "pending not at its worst");
         let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
-        let again = o.request(o.sign_until(calls, o.value, now, now + 1800));
+        let again = o.request(o.sign_until(calls, o.value, now, now + o.longest() - 1));
         assert!(r.relay(&again).await.is_err(), "relayed again uncharged");
         if read {
             mode.store(0, Ordering::Relaxed);

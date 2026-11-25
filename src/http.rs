@@ -414,6 +414,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
             C::BAD_REQUEST,
             "the deadline ends within the inclusion window",
         ),
+        DeadlineTooFar { .. } => (C::BAD_REQUEST, "the deadline is past `max`"),
         Reverted { .. } => (C::BAD_REQUEST, "the batch reverts"),
         IdentityBusy { .. } => (C::CONFLICT, "a batch of the identity is in flight"),
         IdentityHeld { .. } => (C::TOO_MANY_REQUESTS, "a loss holds the identity"),
@@ -431,7 +432,9 @@ fn described(refusal: &Refusal) -> (C, Value) {
             json!({"refund": wei(refund), "required": wei(required)})
         }
         GasLimitTooLow { required } => json!({ "required": required }),
-        GasLimitTooHigh { max } | TooLarge { max } => json!({ "max": max }),
+        GasLimitTooHigh { max } | TooLarge { max } | DeadlineTooFar { max } => {
+            json!({ "max": max })
+        }
         ValueTooHigh { max } => json!({ "max": wei(max) }),
         OverBudget { worst, left } => json!({"worst": wei(worst), "left": wei(left)}),
         UnsupportedRelease { version } => json!({ "version": version }),

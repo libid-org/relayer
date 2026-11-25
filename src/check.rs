@@ -55,6 +55,10 @@ pub struct Create {
     pub salt: U256,
 }
 
+/// The block times a deadline may run past `validUntil` plus the inclusion window: a
+/// relay read at a node behind the quote's.
+const DEADLINE_SLACK: u32 = 2;
+
 /// A wallet's genesis identity, `(platformId, idNode)`: what a loss is charged to.
 pub type Identity = (B256, B256);
 
@@ -130,6 +134,12 @@ pub enum Refusal {
     },
     /// The batch's deadline falls before the inclusion window ends.
     Expired,
+    /// The batch's deadline is past the latest a quote signed now gives, which bounds
+    /// how long a send resumed at start is sent again.
+    DeadlineTooFar {
+        /// The latest deadline relayed, in unix seconds.
+        max: u64,
+    },
     /// The simulation reverted, decoded on the wallet route where it can be.
     Reverted {
         /// The decoded error.
@@ -182,6 +192,7 @@ impl Refusal {
             Self::UnknownWallet => "UnknownWallet",
             Self::UnsupportedRelease { .. } => "UnsupportedRelease",
             Self::Expired => "Expired",
+            Self::DeadlineTooFar { .. } => "DeadlineTooFar",
             Self::Reverted { .. } => "Reverted",
             Self::OverBudget { .. } => "OverBudget",
             Self::RelayerUnderfunded { .. } => "RelayerUnderfunded",
@@ -222,11 +233,13 @@ impl Request {
                 BlockId::latest()
             ),
         )?;
-        let window = config.inclusion_window.as_secs();
-        let late = covered(
-            message.deadline.to(),
-            header.timestamp.saturating_add(window),
-        )?;
+        let (window, deadline) = (config.inclusion_window, message.deadline.to());
+        let late = covered(deadline, header.timestamp.saturating_add(window.as_secs()))?;
+        let slack = DEADLINE_SLACK * config.block_time;
+        let max = late + (config.quote_validity + slack).as_secs();
+        if deadline > max {
+            return Err(Refusal::DeadlineTooFar { max });
+        }
         let head = gas::Head::of(config, &header)?;
         let cost = gas::cost(self.gas_limit, head.floor, l1_fee_bound);
         let Some(net) = refund.checked_sub(value).filter(|net| *net >= cost) else {

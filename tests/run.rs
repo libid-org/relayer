@@ -374,7 +374,9 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
         serde_json::from_str(&call(0, "/v1/config", None).await.1).unwrap();
     assert_eq!(config["relayer"], json!(signer.address()));
     assert_eq!(config["registry"], json!(o.stack.wallet_registry));
-    let request = o.request_for(&o.onboarding()).await;
+    // Signed to the file's quote validity and window, 5 s each.
+    let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
+    let request = o.request(o.sign_until(calls, o.value, now, now + 10));
     let c = request.create.unwrap();
     let create =
         json!({"platformId": c.platform_id, "idNode": c.id_node, "salt": c.salt});

@@ -144,6 +144,9 @@ impl Onboarding {
             provider.erased()
         };
         let (owner, relayer, depositor) = (connect(0), connect(1), connect(2));
+        // Each block 1 s after the last, whatever the wall clock: a slow test runner
+        // does not run a batch past its deadline.
+        owner.anvil_set_block_timestamp_interval(1).await.unwrap();
         let relayer_address = anvil.addresses()[1];
         let chain_id = anvil.chain_id();
         let artifacts = Artifacts::embedded();
@@ -319,9 +322,17 @@ impl Onboarding {
         })
     }
 
+    /// The latest deadline a relay accepts, in seconds after the latest block: what a
+    /// quote's `validUntil` and the inclusion window give.
+    fn longest(&self) -> u64 {
+        let config = self.config();
+        (config.quote_validity + config.inclusion_window).as_secs()
+    }
+
     async fn sign(&self, calls: &[Execution]) -> Bytes {
         let now = self.now().await;
-        self.sign_until(encode_executions(calls), self.value, now, now + 3600)
+        let deadline = now + self.longest();
+        self.sign_until(encode_executions(calls), self.value, now, deadline)
     }
 
     fn request(&self, data: Bytes) -> Request {
