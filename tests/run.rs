@@ -273,6 +273,8 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
             ("max_fee_percent = 210", "max_fee_percent = 181"), ("\"200ms\"", "\"1s\""),
             ("poll_interval = \"1s\"", "poll_interval = \"100ms\""), ("\"10s\"", "\"5s\""),
             ("port = 8080", "port = 0"), ("metrics_port = 9090", "metrics_port = 0"),
+            // /health goes stale 1 s and ten 100 ms polls after the last good tick.
+            ("tick_timeout = \"30s\"", "tick_timeout = \"1s\""),
             ("\"20000000000000000\"", "\"1000000000000000000\""),
         ];
         let pairs = anvil.iter().chain(extra);

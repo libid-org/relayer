@@ -83,10 +83,12 @@ pub async fn run(
     for warning in check(&provider, &config, signer.address()).await? {
         tracing::warn!("{warning}");
     }
+    // Stale once a tick may have run its whole timeout and ten more polls passed.
+    let stale_after = config.tick_timeout + poll_interval * 10;
     let relayer = Relayer::start(provider, config, &db).await?;
     let api = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
     let metrics = TcpListener::bind((Ipv4Addr::UNSPECIFIED, metrics_port)).await?;
-    let service = Service::new(relayer, poll_interval * 10);
+    let service = Service::new(relayer, stale_after);
     Ok(serve(service, poll_interval, limits, (api, metrics), shutdown).await?)
 }
 

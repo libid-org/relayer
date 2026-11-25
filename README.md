@@ -117,7 +117,7 @@ On `[http] port`:
 | `POST /v1/quote`       | `{wallet, create?, data, belowQuorum?}` | `200 {relayer, callGas, gasLimit, maxFeePerGas, l1FeeBound, minRefund, validUntil}` |
 | `POST /v1/relay`       | `{wallet, create?, data, gasLimit}` | `202 {id, status}` |
 | `GET /v1/relay/{id}`   |                          | `200 {status, txHashes, blockNumber?, reverted?, error?}` |
-| `GET /health`          |                          | `200 OK`, or `503` once no tick succeeded for ten poll intervals |
+| `GET /health`          |                          | `200 OK`, or `503` once no tick succeeded for `tick_timeout` and ten poll intervals |
 
 `create` is `{platformId, idNode, salt}` when the batch creates the wallet.
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy

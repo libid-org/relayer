@@ -119,6 +119,10 @@ type Queued = (B256, String, Cover, u64, Address);
 /// The fee-history percentile a cancel's tip is read at.
 const CANCEL_PERCENTILE: f64 = 90.0;
 
+/// How long a tick goes on sending the queue once a send in it failed; the rest wait
+/// for the next tick.
+const FAILING_TICK: Duration = Duration::from_secs(5);
+
 /// The schema version, `PRAGMA user_version`, a database must have.
 const VERSION: i32 = 5;
 
@@ -407,11 +411,13 @@ impl<P: Provider> Relayer<P> {
 
     /// Resolve or rebroadcast each request in flight, drop the rows that are done,
     /// then send the oldest queued one when none is in flight and the key's count at the
-    /// pinned block is the stored next nonce. Above it a foreign nonce pauses sending;
+    /// pinned block is the stored next nonce, the next after a failed one until the tick
+    /// has run [`FAILING_TICK`]. Above it a foreign nonce pauses sending;
     /// below it ours is unmined. A balance below `min_balance` pauses sending until a
     /// tick finds it funded, an OP-stack operator fee until a tick finds it off, and a
     /// spent global loss budget until its window passes.
     async fn step(&self) -> Result<(), Error> {
+        let started = tokio::time::Instant::now();
         let mut ticking = self.ticking.lock().await;
         let head = gas::head(&self.provider, &self.config)
             .await
@@ -480,7 +486,7 @@ impl<P: Provider> Relayer<P> {
                 .send(&mut ticking, queued, &head, next, balance)
                 .await?;
             ticking.send.clear(id); // out of the queue
-            if !failed {
+            if !failed || started.elapsed() >= FAILING_TICK {
                 break;
             }
         }

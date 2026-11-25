@@ -16,7 +16,8 @@ chain_id = 84532
 # The chain's block time: the step of the base fee's growth. On an OP-stack chain, or
 # with fee_params = "header", start refuses one 25% off the chain's.
 block_time = "200ms"
-# How often the relayer ticks, above 0. /health answers 503 once no tick succeeded for ten.
+# How often the relayer ticks, above 0. /health answers 503 once no tick succeeded for
+# tick_timeout and ten of these.
 poll_interval = "1s"
 
 [contracts]
