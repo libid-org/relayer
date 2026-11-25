@@ -250,10 +250,14 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
             ("max_fee_percent = 210", "max_fee_percent = 181"), ("\"200ms\"", "\"1s\""),
             ("poll_interval = \"1s\"", "poll_interval = \"100ms\""), ("\"10s\"", "\"5s\""),
             ("port = 8080", "port = 0"), ("metrics_port = 9090", "metrics_port = 0"),
-            ("\"1000000000000000\"", "\"1000000000000000000\""),
+            ("\"2000000000000000\"", "\"1000000000000000000\""),
         ];
         let pairs = anvil.iter().chain(extra);
-        write("run", &pairs.fold(text, |t, (a, b)| t.replace(a, b)))
+        let replace = |t: String, (a, b): &(&str, &str)| {
+            assert!(t.contains(a), "{a} not in the example");
+            t.replace(a, b)
+        };
+        write("run", &pairs.fold(text, replace))
     };
     let relayer = |config: &Path, env: &[(&str, &str)], args: &[&str]| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_relayer"));
