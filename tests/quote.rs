@@ -218,8 +218,22 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     let q = o.quote_with(&o.config(), &b).await;
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
-    // Above the base fee grown over the quote's validity and the window: 15 blocks.
-    assert!(q.max_fee_per_gas > relayer::config::Eip1559::L1.grow(base.into(), 15));
+    // At least the base fee grown over the quote's validity and the window, 15 blocks,
+    // and at most what a send pays: that, or M × the base fee grown over the validity.
+    let grow = |blocks| relayer::config::Eip1559::L1.grow(base.into(), blocks);
+    let m = u128::from(o.config().max_fee_percent);
+    let floor = grow(15);
+    assert!(
+        q.max_fee_per_gas >= floor,
+        "{} under {floor}",
+        q.max_fee_per_gas
+    );
+    let most = floor.max(grow(10) * m / 100);
+    assert!(
+        q.max_fee_per_gas <= most,
+        "{} over {most}",
+        q.max_fee_per_gas
+    );
 
     let above = o.authorize(&b, Some(2 * q.call_gas)).await;
     let expected = o.limit(&above, o.value, 2 * q.call_gas).await;

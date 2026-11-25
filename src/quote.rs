@@ -68,8 +68,10 @@ pub struct Quote {
     pub call_gas: u64,
     /// The gas limit the refund is priced for.
     pub gas_limit: u64,
-    /// The fee cap the refund is priced at: the base fee grown by its most until
-    /// `valid_until` and over the inclusion window, plus the tip.
+    /// The fee cap the refund is priced at: the floor, the base fee grown by its most
+    /// until `valid_until` and over the inclusion window, plus the tip, but no more than
+    /// a send's cap, M × the base fee grown until `valid_until`, unless that is under
+    /// the floor.
     pub max_fee_per_gas: u128,
     /// The L1 fee bound with its margin.
     pub l1_fee_bound: U256,
@@ -117,7 +119,10 @@ impl Draft {
         under_max(gas_limit, config)?;
         let growth = config.quote_validity + config.inclusion_window;
         let floor = gas::fee_floor(provider, config, growth).await?;
-        let max_fee_per_gas = floor + gas::tip(provider, config.tip_percentile).await?;
+        let grown = gas::fee_floor(provider, config, config.quote_validity).await?;
+        let cap = grown.saturating_mul(config.max_fee_percent.into()) / 100;
+        let tip = gas::tip(provider, config.tip_percentile).await?;
+        let max_fee_per_gas = (floor + tip).min(cap).max(floor);
         let priced = gas::price(provider, config, &call, gas_limit, max_fee_per_gas);
         let (l1_fee_bound, min_refund) = priced.await?;
         Ok(Quote {
