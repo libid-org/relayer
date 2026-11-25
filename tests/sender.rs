@@ -300,6 +300,13 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
     let held = std::fs::File::open(&lock).unwrap();
     assert!(held.try_lock().is_err(), "no flock on {lock}");
     drop(r);
+    // A child spawned meanwhile may hold the lock until its exec.
+    for _ in 0..20 {
+        if held.try_lock().is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     held.try_lock().unwrap();
     assert!(o.start(&db).await.err().unwrap().contains(&lock));
     let old = crate::db("schema");
