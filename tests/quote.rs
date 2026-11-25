@@ -181,7 +181,8 @@ async fn anvil_simulates_a_draft_to_execution_not_signed() {
     assert_eq!(data[..], IWebWallet::ExecutionNotSigned::SELECTOR);
 }
 
-/// The create path: a `callGas` signed above the quote is `GasLimitTooLow` with the
+/// The create path: `callGas` is quoted for its dearest call; a `callGas` signed above
+/// the quote is `GasLimitTooLow` with the
 /// relay-time limit; the quoted one lands at that limit, and a last call that swallows
 /// a failed inner call (`ReferralSplitter._deliver`) gets `callGas` and succeeds.
 #[tokio::test]
@@ -193,6 +194,14 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     calls.push(call(swallower, U256::ZERO, vec![]));
     let b = Batch(calls, o.value, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &b).await;
+    // `callGas` covers the dearest call, the swallower, not the whole batch.
+    let whole = o.simulated(&o.authorize(&b, None).await, o.value).await;
+    assert!(
+        q.call_gas < whole.gas_used,
+        "{} of {}",
+        q.call_gas,
+        whole.gas_used
+    );
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
     // At least the base fee grown over the quote's validity and the window, 15 blocks,
@@ -380,7 +389,7 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     let r = U256::from(CLAIMED / 10);
     let onboarding = Batch(o.onboarding(), o.value, vec![&o.k], None);
     let repay = Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None);
-    for (b, times) in [(onboarding, 8), (repay, 100)] {
+    for (b, times) in [(onboarding, 8), (repay, 1000)] {
         let call_gas = times * o.quote_with(&o.config(), &b).await.call_gas;
         let data = o.authorize(&b, Some(call_gas)).await;
         let limit = o.limit(&data, b.1, call_gas).await;

@@ -121,7 +121,12 @@ On `[http] port`:
 
 `create` is `{platformId, idNode, salt}` when the batch creates the wallet.
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
-signatures. A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
+signatures. A quote's `callGas`, which the wallet reserves before each call,
+covers what the batch's dearest call used and a quarter, measured on cuts of
+the draft run in one block, for batches of up to 8 calls; a longer batch, or
+one whose cuts do not run, gets the whole run's gas. A call that needs more
+than its run showed, made dearer by an earlier call or swallowing a failure
+deep down, may be starved by whoever sends the signed batch. A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
 once its row is dropped (see [Ledger](#ledger)) the request is
 `404 UnknownRequest`. Relaying the same request again answers its current
 status; a failed one is checked and queued again. A batch whose signed transaction would be over 128 KiB, which node

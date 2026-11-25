@@ -312,30 +312,47 @@ pub(crate) async fn simulate<P: Provider>(
     tx: &TransactionRequest,
     time: u64,
 ) -> Result<SimCallResult, Refusal> {
+    let call = simulate_all(provider, vec![tx.clone()], time).await?;
+    call.into_iter()
+        .next()
+        .ok_or_else(|| node("eth_simulateV1 returned no call"))
+}
+
+/// `txs` run in order with `eth_simulateV1` in one block after the latest, at `time`.
+pub(crate) async fn simulate_all<P: Provider>(
+    provider: &P,
+    txs: Vec<TransactionRequest>,
+    time: u64,
+) -> Result<Vec<SimCallResult>, Refusal> {
     let payload = SimulatePayload {
         block_state_calls: vec![SimBlock {
             block_overrides: Some(BlockOverrides {
                 time: Some(time),
                 ..Default::default()
             }),
-            calls: vec![tx.clone()],
+            calls: txs,
             ..Default::default()
         }],
         ..Default::default()
     };
     let blocks = provider.simulate(&payload).await.map_err(node)?;
-    let call = blocks
+    let calls = blocks
         .into_iter()
         .next()
-        .and_then(|b| b.calls.into_iter().next());
-    let mut call = call.ok_or_else(|| node("eth_simulateV1 returned no call"))?;
-    // Some nodes (anvil 1.8) return a revert's data only in `error.data`.
-    if !call.status && call.return_data.is_empty() {
-        if let Some(data) = call.error.as_ref().and_then(|e| e.data.clone()) {
-            call.return_data = data;
-        }
-    }
-    Ok(call)
+        .map(|b| b.calls)
+        .unwrap_or_default();
+    Ok(calls
+        .into_iter()
+        .map(|mut call| {
+            // Some nodes (anvil 1.8) return a revert's data only in `error.data`.
+            if !call.status && call.return_data.is_empty() {
+                if let Some(data) = call.error.as_ref().and_then(|e| e.data.clone()) {
+                    call.return_data = data;
+                }
+            }
+            call
+        })
+        .collect())
 }
 
 /// `k × getL1FeeUpperBound` of `call`'s unsigned size at `gas_limit`, read at

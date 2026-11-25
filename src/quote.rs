@@ -7,12 +7,17 @@ use alloy::{
         U256,
     },
     providers::Provider,
-    sol_types::SolError,
+    sol_types::{
+        SolError,
+        SolValue,
+    },
 };
 use libid_contracts::{
     bindings::wallet::{
+        encode_executions,
         ExecuteAuthorization,
         ExecuteMessage,
+        Execution,
         IWebWallet,
     },
     gas::{
@@ -44,6 +49,9 @@ use crate::{
 /// A call's extra gas for sending value (`CALL`'s value transfer).
 const CALL_VALUE: u64 = 9_000;
 
+/// The most calls a batch may have for each call's gas to be measured.
+const PREFIXES: usize = 8;
+
 /// A batch to quote: its data carries a well-formed dummy signature for every signer.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,7 +72,8 @@ pub struct Draft {
 /// for a send at `gas_limit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quote {
-    /// The gas the wallet reserves for each call: the simulation's gas used.
+    /// The gas the wallet reserves for each call: what its dearest call used and a
+    /// quarter, at most the whole run's gas used.
     pub call_gas: u64,
     /// The gas limit the refund is priced for.
     pub gas_limit: u64,
@@ -107,7 +116,17 @@ impl Draft {
         if !sim.status && !unsigned {
             return Err(reverted(sim.return_data));
         }
-        let call_gas = sim.gas_used;
+        let call_gas = self
+            .call_gas(
+                provider,
+                config,
+                (&message, &authorization),
+                &executions,
+                late,
+            )
+            .await
+            .unwrap_or(sim.gas_used)
+            .min(sim.gas_used);
         let below_quorum = self.below_quorum.then_some(executions.len());
         let refunds = refunds(&executions, config.relayer);
         if refunds.clone().next().is_none() {
@@ -134,6 +153,52 @@ impl Draft {
             valid_until: now + config.quote_validity.as_secs(),
         })
     }
+
+    /// 1.25 × the gas of the batch's dearest call: the run of the draft cut after it,
+    /// less the run cut before it and its calldata's gas. Each cut is run in one block
+    /// at `time`. `None` with over [`PREFIXES`] calls, or a cut that does not run to the
+    /// dummy signatures.
+    async fn call_gas<P: Provider>(
+        &self,
+        provider: &P,
+        config: &Config,
+        (message, authorization): (&ExecuteMessage, &ExecuteAuthorization),
+        executions: &[Execution],
+        time: u64,
+    ) -> Option<u64> {
+        if executions.len() > PREFIXES {
+            return None;
+        }
+        let cut = |k: usize| {
+            let message = ExecuteMessage {
+                execution_calldata: encode_executions(&executions[..k]),
+                ..message.clone()
+            };
+            let data = message.authorized_data(authorization.clone());
+            outer(config, self.wallet, self.create, &data, message.value)
+        };
+        let cuts = (0..=executions.len()).map(cut).collect();
+        let runs = gas::simulate_all(provider, cuts, time).await.ok()?;
+        let signed = IWebWallet::ExecutionNotSigned::SELECTOR;
+        let ran = |r: &alloy::rpc::types::simulate::SimCallResult| {
+            !r.status && r.return_data[..] == signed
+        };
+        if runs.len() != executions.len() + 1 || !runs.iter().all(ran) {
+            return None;
+        }
+        let each = runs.windows(2).zip(executions).map(|(runs, e)| {
+            let used = runs[1].gas_used.saturating_sub(runs[0].gas_used);
+            used.saturating_sub(calldata_gas(&e.abi_encode()))
+        });
+        Some((each.max().unwrap_or_default() * 5).div_ceil(4))
+    }
+}
+
+/// The calldata gas of `bytes` (EIP-2028).
+fn calldata_gas(bytes: &[u8]) -> u64 {
+    let zeros = bytes.iter().filter(|&&b| b == 0).count() as u64;
+    zeros * gas::ZERO_BYTE
+        + (bytes.len() as u64 - zeros) * (gas::ZERO_BYTE + NONZERO_BYTE)
 }
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
