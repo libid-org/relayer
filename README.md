@@ -182,9 +182,14 @@ when the claimed ETH falls short, and refund, in one relayed transaction.
 
 ## Operate
 
-- Rate-limit per IP in front of the relayer (Cloudflare, an AWS load
-  balancer). The relayer bounds losses per identity and in total, not per
-  caller.
+- Put a proxy in front of the relayer (Cloudflare, an AWS load balancer)
+  that buffers whole request headers and bodies, closes idle connections,
+  and limits connections and requests per IP. The relayer sets no header
+  deadline and no connection limit of its own: half-sent headers or bodies
+  sent to it directly hold its file descriptors and its quote and relay
+  permits. Config, status and `/health` answer outside those permits; a
+  shutdown waits for requests in flight at most `request_timeout`. The
+  relayer bounds losses per identity and in total, not per caller.
 - Keep `/metrics` private: it has its own port for that.
 - Watch `libid_relayer_oldest_in_flight_seconds`: a node that refuses sends
   and cancels with errors that name no pool refusal stalls the queue with no

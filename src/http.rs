@@ -169,10 +169,10 @@ impl<P: Provider + 'static> Service<P> {
     }
 }
 
-/// Serve `service`'s API on `api`, all but `/health` within `limits`, and its metrics
-/// on `metrics`,
-/// ticking every `every` from one `every` on, until `shutdown` resolves; requests in
-/// flight finish first.
+/// Serve `service`'s API on `api`, its quotes and relays within `limits`, its config and
+/// status within their timeout, and its metrics on `metrics`, ticking every `every`
+/// from one `every` on, until `shutdown` resolves; requests in flight finish first, for
+/// at most the limits' timeout.
 pub async fn serve<P: Provider + 'static>(
     service: Arc<Service<P>>,
     every: Duration,
@@ -192,11 +192,12 @@ pub async fn serve<P: Provider + 'static>(
     let (at, scraped) = (api.local_addr()?, metrics.local_addr()?);
     tracing::info!("relayer listening on {at}, metrics on {scraped}");
     let app = Router::new()
-        .route(CONFIG_PATH, get(config))
         .route(QUOTE_PATH, post(quote))
         .route(RELAY_PATH, post(relay))
-        .route(STATUS_PATH, get(status))
         .layer(GlobalConcurrencyLimitLayer::new(limits.concurrency))
+        // Outside the concurrency limit: they read no node, or one once.
+        .route(CONFIG_PATH, get(config))
+        .route(STATUS_PATH, get(status))
         .layer(TimeoutLayer::with_status_code(
             C::REQUEST_TIMEOUT,
             limits.timeout,
@@ -219,16 +220,32 @@ pub async fn serve<P: Provider + 'static>(
     let on_stop = |mut stopped: tokio::sync::watch::Receiver<()>| async move {
         let _ = stopped.changed().await;
     };
-    let served = tokio::try_join!(
-        axum::serve(api, app)
-            .with_graceful_shutdown(on_stop(stopped.clone()))
-            .into_future(),
-        axum::serve(metrics, scrape)
-            .with_graceful_shutdown(on_stop(stopped))
-            .into_future(),
-    );
+    // A client that sends no whole request, or reads no answer, holds no drain longer.
+    let drained = {
+        let stopped = on_stop(stopped.clone());
+        async move {
+            stopped.await;
+            tokio::time::sleep(limits.timeout).await;
+        }
+    };
+    let served = tokio::select! {
+        served = async {
+            tokio::try_join!(
+                axum::serve(api, app)
+                    .with_graceful_shutdown(on_stop(stopped.clone()))
+                    .into_future(),
+                axum::serve(metrics, scrape)
+                    .with_graceful_shutdown(on_stop(stopped))
+                    .into_future(),
+            )
+        } => served.map(drop),
+        () = drained => {
+            tracing::warn!("connections still open a request_timeout after shutdown: closed");
+            Ok(())
+        }
+    };
     ticking.abort();
-    served.map(drop)
+    served
 }
 
 type S<P> = State<Arc<Service<P>>>;

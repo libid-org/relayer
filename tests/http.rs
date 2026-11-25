@@ -339,6 +339,45 @@ async fn refusals_carry_their_decoded_names() {
     assert_eq!((code, name(&unknown)), (404, "UnknownRequest"));
 }
 
+/// With every permit held by a half-sent body, config and status still answer; at
+/// shutdown, that request holds the drain no longer than `request_timeout`.
+#[tokio::test]
+async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
+    use tokio::io::AsyncWriteExt;
+    let o = Onboarding::new(false).await;
+    let relayer = Relayer::start(o.relayer.clone(), o.config(), &db("half"))
+        .await
+        .unwrap();
+    let service = Service::new(relayer, Duration::from_secs(5));
+    let bind = || tokio::net::TcpListener::bind("127.0.0.1:0");
+    let (api, metrics) = (bind().await.unwrap(), bind().await.unwrap());
+    let at = api.local_addr().unwrap();
+    let limits = Limits {
+        timeout: Duration::from_secs(1),
+        concurrency: 1,
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move { drop(stopped.await) };
+    let hour = Duration::from_secs(3600);
+    let served = tokio::spawn(serve(service, hour, limits, (api, metrics), shutdown));
+    let mut half = tokio::net::TcpStream::connect(at).await.unwrap();
+    let head = "POST /v1/relay HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n{";
+    half.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let url = format!("http://{at}");
+    let config = reqwest::get(format!("{url}/v1/config")).await.unwrap();
+    assert_eq!(config.status(), 200);
+    let status = reqwest::get(format!("{url}/v1/relay/{}", B256::ZERO)).await;
+    assert_eq!(status.unwrap().status(), 404);
+    stop.send(()).unwrap();
+    let drained = tokio::time::timeout(Duration::from_secs(5), served).await;
+    drained
+        .expect("held past request_timeout")
+        .unwrap()
+        .unwrap();
+    drop(half);
+}
+
 /// An identity whose send lost the relayer gas is `IdentityHeld` until `loss_hold`
 /// has passed, while others relay; once identities' losses, counted whole, leave less of
 /// the global budget than a request's worst loss, that request is `OverBudget`.
