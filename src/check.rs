@@ -140,6 +140,14 @@ pub enum Refusal {
         /// The revert data.
         data: Bytes,
     },
+    /// The request's worst loss, its value in full, is above what is left of the global
+    /// loss budget.
+    OverBudget {
+        /// The request's worst loss.
+        worst: U256,
+        /// What is left of the global loss budget.
+        left: U256,
+    },
     /// The relayer's balance at its send does not cover its worst cost and value.
     RelayerUnderfunded {
         /// The balance at the pinned block.
@@ -178,6 +186,7 @@ impl Refusal {
             Self::UnsupportedRelease { .. } => "UnsupportedRelease",
             Self::Expired => "Expired",
             Self::Reverted { .. } => "Reverted",
+            Self::OverBudget { .. } => "OverBudget",
             Self::RelayerUnderfunded { .. } => "RelayerUnderfunded",
             Self::IdentityBusy { .. } => "IdentityBusy",
             Self::IdentityHeld { .. } => "IdentityHeld",

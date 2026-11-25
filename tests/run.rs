@@ -121,13 +121,14 @@ fn settings_it_cannot_run_with_are_refused() {
     }
 }
 
-/// A configuration, code planted at an address, and the hint refused with; none when it
-/// passes.
-type Case<'a> = (Config, Option<(Address, &'a str)>, &'a str);
+/// A configuration, code planted at an address, the hint refused with, and the hint
+/// warned with; empty when none.
+type Case<'a> = (Config, Option<(Address, &'a str)>, &'a str, &'a str);
 
-/// Each check refuses its case with its fix; the code planted for a case is restored.
+/// Each check refuses what waiting does not cure with its fix, and warns of the rest;
+/// the code planted for a case is restored.
 #[tokio::test]
-async fn each_startup_check_refuses_with_its_hint() {
+async fn each_startup_check_refuses_or_warns_with_its_hint() {
     let o = Onboarding::new(true).await;
     let (ok, at) = (o.config(), Address::repeat_byte(0x0c));
     let with = |change: &dyn Fn(&mut Config)| {
@@ -154,56 +155,70 @@ async fn each_startup_check_refuses_with_its_hint() {
     o.owner.anvil_mine(Some(12), Some(1)).await.unwrap();
     #[rustfmt::skip]
     let rows: Vec<Case> = vec![
-        (ok.clone(), None, ""),
-        (with(&|c| c.min_balance = balance), None, ""),
-        (with(&|c| c.chain_id = 1), None, "point rpc_url at it"),
-        (with(&|c| c.relayer = at), None, "set address to the signer's"),
-        (with(&|c| c.factory = at), None, "[contracts] factory"),
-        (ok.clone(), Some((implementation, one)), "set the factory that published it"),
-        (ok.clone(), Some((ep, "")), &missing_ep),
-        (ok.clone(), Some((o.stack.factory, "60406000f3")), "published no release"),
-        (with(&|c| c.supported_releases = vec![2]), None, "run a relayer that decodes"),
-        (with(&|c| c.min_balance = U256::MAX), None, "fund"),
-        (with(&|c| c.global_budget.wei = U256::ONE), None, "global_budget 1 is below"),
+        (ok.clone(), None, "", ""),
+        (with(&|c| c.min_balance = balance), None, "", ""),
+        (with(&|c| c.chain_id = 1), None, "point rpc_url at it", ""),
+        (with(&|c| c.relayer = at), None, "set address to the signer's", ""),
+        (with(&|c| c.factory = at), None, "[contracts] factory", ""),
+        (ok.clone(), Some((implementation, one)), "set the factory that published it", ""),
+        (ok.clone(), Some((ep, "")), &missing_ep, ""),
+        (ok.clone(), Some((o.stack.factory, "60406000f3")), "published no release", ""),
+        (with(&|c| c.supported_releases = vec![2]), None, "", "run a relayer that decodes"),
+        (with(&|c| c.min_balance = U256::MAX), None, "", "fund"),
+        (with(&|c| c.global_budget.wei = U256::ONE), None, "", "global_budget 1 is below"),
         // Blocks a second apart below, not the 2 s set.
         (with(&|c| (c.l1_fee, c.block_time) = (L1Fee::OpStack, Duration::from_secs(2))),
-         None, "block_time 2s"),
+         None, "block_time 2s", ""),
         // 5M gas at a fee bound over 2e5 wei is over 1e12 wei.
         (with(&|c| (c.max_gas_limit, c.global_budget.wei) = (5_000_000, U256::from(10u64.pow(12)))),
-         None, "below one request's worst loss"),
-        (costly, Some((oracle, huge)), "the L1 fee bound"),
-        (op.clone(), Some((l1_block, one)), "operator fee is on"),
-        (op.clone(), Some((l1_block, revert)), ""),
-        (op.clone(), Some((l1_block, "60016000f3")), "buffer overrun"), // one byte back
-        (op.clone(), Some((l1_block, zero)), ""),
-        (op.clone(), Some((l1_block, "fe")), "InvalidFEOpcode"), // a halt, no revert
-        (op, None, ""),
+         None, "", "below one request's worst loss"),
+        (costly, Some((oracle, huge)), "", "the L1 fee bound"),
+        (op.clone(), Some((l1_block, one)), "", "operator fee is on"),
+        (op.clone(), Some((l1_block, revert)), "", "no operator fee getters"),
+        (op.clone(), Some((l1_block, "60016000f3")), "buffer overrun", ""), // one byte back
+        (op.clone(), Some((l1_block, zero)), "", ""),
+        (op.clone(), Some((l1_block, "fe")), "InvalidFEOpcode", ""), // a halt, no revert
+        (op, None, "", "no operator fee getters"),
     ];
-    for (config, planted, hint) in rows {
+    for (config, planted, refused, warned) in rows {
         let (at, hex) = planted.unwrap_or((Address::ZERO, "")); // no code at zero
         let kept = o.owner.get_code_at(at).await.unwrap();
         o.set_code(at, hex).await;
         match check(&o.relayer, &config, o.relayer_address).await {
-            Ok(()) => assert_eq!(hint, "", "passed"),
-            Err(e) => assert!(!hint.is_empty() && e.to_string().contains(hint), "{e}"),
+            Ok(warnings) => {
+                assert_eq!(refused, "", "passed");
+                let named = warnings.iter().any(|w| w.contains(warned));
+                let expected = if warned.is_empty() {
+                    warnings.is_empty()
+                } else {
+                    named
+                };
+                assert!(expected, "{warned}: {warnings:?}");
+            }
+            Err(e) => assert!(
+                !refused.is_empty() && e.to_string().contains(refused),
+                "{e}"
+            ),
         }
         o.owner.anvil_set_code(at, kept).await.unwrap();
     }
-    // A global budget of exactly one request's worst loss passes.
+    // A global budget of exactly one request's worst loss passes unwarned.
     let budget =
         |wei| with(&|c| (c.max_gas_limit, c.global_budget.wei) = (5_000_000, wei));
-    let e = check(&o.relayer, &budget(U256::ONE), o.relayer_address).await;
-    let e = e.unwrap_err().to_string();
-    let worst = e.split("worst loss ").nth(1).unwrap();
+    let warned = check(&o.relayer, &budget(U256::ONE), o.relayer_address).await;
+    let warned = warned.unwrap().concat();
+    let worst = warned.split("worst loss ").nth(1).unwrap();
     let worst = &worst[..worst.find(',').unwrap()];
     let exact = budget(worst.parse().unwrap());
-    check(&o.relayer, &exact, o.relayer_address).await.unwrap();
+    let none = check(&o.relayer, &exact, o.relayer_address).await.unwrap();
+    assert!(none.is_empty(), "{none:?}");
     // A batch's value is not a loss: a value cap adds none.
     let capped = Config {
         max_value: Some(U256::MAX),
         ..exact
     };
-    check(&o.relayer, &capped, o.relayer_address).await.unwrap();
+    let none = check(&o.relayer, &capped, o.relayer_address).await.unwrap();
+    assert!(none.is_empty(), "{none:?}");
 }
 
 /// A binary's exit: its file, its environment, its arguments and its hint; none when

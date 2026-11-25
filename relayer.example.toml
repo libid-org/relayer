@@ -70,10 +70,11 @@ request_timeout = "30s"
 concurrency_limit = 64
 
 [limits]
-# What all identities may lose over `window` before sending pauses: each send counts
-# at its worst, value included, until its receipt, then at its loss. At least one
-# request's worst loss, which start checks: 8M gas at 210% of a 0.1 gwei base fee
-# is 1.68e15 wei. The window is above 0.
+# What all identities may lose over `window`: each send counts at its worst, value
+# included, until its receipt, then at its loss. A request whose worst loss is over
+# what is left is OverBudget. Keep it above one request's worst loss, which start
+# warns of: 8M gas at 210% of a 0.1 gwei base fee is 1.68e15 wei, plus a fronted
+# value. The window is above 0.
 global_budget = { wei = "20000000000000000", window = "1h" }
 # Optional, "24h" by default: how long a loss refuses its identity (`IdentityHeld`).
 loss_hold = "24h"
@@ -90,5 +91,5 @@ node_error_ticks = 5
 # Blocks a receipt may lag its mined nonce before sending pauses, at least 1; a
 # paid request's row is dropped this many blocks after its receipt.
 receipt_lag_blocks = 50
-# The balance below which start refuses and sending pauses.
+# The balance below which start warns and sending pauses.
 min_balance = "50000000000000000"

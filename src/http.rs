@@ -400,6 +400,10 @@ fn described(refusal: &Refusal) -> (C, Value) {
         Reverted { .. } => (C::BAD_REQUEST, "the batch reverts"),
         IdentityBusy { .. } => (C::CONFLICT, "a batch of the identity is in flight"),
         IdentityHeld { .. } => (C::TOO_MANY_REQUESTS, "a loss holds the identity"),
+        OverBudget { .. } => (
+            C::SERVICE_UNAVAILABLE,
+            "the worst loss is over what is left of the global budget",
+        ),
         RelayerUnderfunded { .. } | Paused => (C::SERVICE_UNAVAILABLE, "sending paused"),
         Node(_) => (C::SERVICE_UNAVAILABLE, "the node could not answer"),
     };
@@ -412,6 +416,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
         GasLimitTooLow { required } => json!({ "required": required }),
         GasLimitTooHigh { max } | TooLarge { max } => json!({ "max": max }),
         ValueTooHigh { max } => json!({ "max": wei(max) }),
+        OverBudget { worst, left } => json!({"worst": wei(worst), "left": wei(left)}),
         UnsupportedRelease { version } => json!({ "version": version }),
         IdentityBusy { id } => json!({ "id": id }),
         IdentityHeld { until } => json!({ "until": until }),

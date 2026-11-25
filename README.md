@@ -74,7 +74,7 @@ the RPC URL's scheme, host and port only.
 
 ## Startup checks
 
-`run` refuses to start, naming the fix, when:
+`run` refuses to start, naming the fix, on what waiting does not cure:
 
 - the node's chain id differs from `[chain] chain_id`, or a `network_file`'s;
 - on an OP-stack chain, or with `fee_params = "header"`, `block_time` is more
@@ -84,15 +84,26 @@ the RPC URL's scheme, host and port only.
 - the factory has published no release;
 - the latest release's `FACTORY()` and `REGISTRY()` are not the factory's;
 - the release's EntryPoint v0.9 has no code;
-- the latest release is not in `supported_releases`;
-- the signer's balance is under `min_balance`;
-- `global_budget` is under one request's worst loss:
-  `max_gas_limit` at `max_fee_percent` of the base fee, plus the L1 fee bound of
-  `max_gas_limit` of zero-byte calldata, at most 128 KiB;
-- the OP-stack operator fee is on, which also pauses sending while a tick finds
-  it on;
+- the OP-stack operator fee cannot be read;
 - another relayer holds the ledger's lock (`<db>.lock`);
 - the chain's nonce of the key disagrees with the ledger's.
+
+It logs a warning, naming the fix, and serves through what the running relayer
+serves through:
+
+- the latest release is not in `supported_releases`: its new wallets are
+  `UnsupportedRelease`;
+- the signer's balance is under `min_balance`: sending pauses until it is
+  funded;
+- `global_budget` is under one request's worst loss, `max_gas_limit` at
+  `max_fee_percent` of the base fee plus the L1 fee bound of `max_gas_limit`
+  of zero-byte calldata, at most 128 KiB: such a request is `OverBudget`;
+- the OP-stack operator fee is on, which pauses sending while a tick finds it
+  on, or `L1Block` has no operator fee getters.
+
+A request whose worst loss, its gas at its fee cap, its L1 fee bound and its
+`value` in full, is over what is left of the global budget is refused as
+`OverBudget` when relayed, and fails as `OverBudget` at its send.
 
 ## HTTP API
 
@@ -135,7 +146,7 @@ A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 | `408`  | past `request_timeout` |
 | `409`  | `IdentityBusy`: another request of the identity is in flight, `args.id` |
 | `429`  | `IdentityHeld`: a loss holds the identity until `args.until`, in unix seconds |
-| `503`  | `RelayerUnderfunded`, `Paused`, `Node`, `Ledger` |
+| `503`  | `OverBudget` (`args.worst`, `args.left`), `RelayerUnderfunded`, `Paused`, `Node`, `Ledger` |
 
 `GET /metrics` is OpenMetrics on `[http] metrics_port`, under `libid_relayer_`.
 

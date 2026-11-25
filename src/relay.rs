@@ -350,7 +350,8 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Store `checked` as `id`, queued in its identity's row, unless [`admit`] now
-    /// answers for it.
+    /// answers for it, or its worst loss, value included, is over what is left of the
+    /// global budget.
     #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
     fn queue(
         &self,
@@ -365,6 +366,17 @@ impl<P: Provider> Relayer<P> {
         let ((platform, id_node), db) = (checked.identity, self.db());
         if let Some(stored) = admit(&db, id, checked.identity, self.config.loss_hold)? {
             return Ok(stored);
+        }
+        let call = &checked.tx;
+        let gas = U256::from(call.gas.unwrap_or_default())
+            * U256::from(call.max_fee_per_gas.unwrap_or_default());
+        let worst = gas + checked.l1_fee_bound + call.value.unwrap_or_default();
+        let budget = self.config.global_budget;
+        let left = budget
+            .wei
+            .saturating_sub(lost(&db, budget.window).map_err(node)?);
+        if worst > left {
+            return Err(Refusal::OverBudget { worst, left });
         }
         let row = params![
             &platform[..],
@@ -753,6 +765,10 @@ impl<P: Provider> Relayer<P> {
         if balance < worst {
             let required = worst;
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
+        }
+        let left = self.budget_left()?;
+        if worst > left {
+            return self.fail(id, &Refusal::OverBudget { worst, left });
         }
         let vouched = vouched(&self.provider, &self.config, wallet, create);
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
@@ -1236,6 +1252,7 @@ fn encode_failure(refusal: &Refusal) -> (String, Vec<u8>) {
         Refusal::RelayerUnderfunded { balance, required } => {
             ("RelayerUnderfunded".into(), words(balance, required))
         }
+        Refusal::OverBudget { worst, left } => ("OverBudget".into(), words(worst, left)),
         Refusal::UnsupportedRelease { version } => {
             let version = U256::from(*version).to_be_bytes::<32>();
             ("UnsupportedRelease".into(), version.to_vec())
@@ -1260,6 +1277,10 @@ fn decode_failure(name: &str, detail: Option<Vec<u8>>) -> Refusal {
         "RelayerUnderfunded" => Refusal::RelayerUnderfunded {
             balance: first,
             required: second,
+        },
+        "OverBudget" => Refusal::OverBudget {
+            worst: first,
+            left: second,
         },
         "UnsupportedRelease" => Refusal::UnsupportedRelease {
             version: first.saturating_to(),

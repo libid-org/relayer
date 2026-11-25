@@ -80,7 +80,9 @@ pub async fn run(
     let provider = ProviderBuilder::new()
         .wallet(signer.wallet())
         .connect_reqwest(http, rpc_url.parse()?);
-    check(&provider, &config, signer.address()).await?;
+    for warning in check(&provider, &config, signer.address()).await? {
+        tracing::warn!("{warning}");
+    }
     let relayer = Relayer::start(provider, config, &db).await?;
     let api = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
     let metrics = TcpListener::bind((Ipv4Addr::UNSPECIFIED, metrics_port)).await?;
@@ -88,16 +90,20 @@ pub async fn run(
     Ok(serve(service, poll_interval, limits, (api, metrics), shutdown).await?)
 }
 
-/// The chain `provider` reads is the one `config` names, for the key at `signer`:
-/// the chain id and block time, the signer's address and balance, the factory's code
-/// and the addresses it names, the factory's latest release, its EntryPoint, the loss
-/// budget against one request's worst loss, and no OP-stack operator fee.
+/// The chain `provider` reads is the one `config` names, for the key at `signer`,
+/// refusing what waiting does not cure: the chain id and block time, the signer's
+/// address, the factory's code, a published release, the addresses it names, its
+/// EntryPoint, and a readable operator fee. What the running relayer serves through,
+/// pausing or refusing requests, it returns as warnings: the latest release outside
+/// `supported_releases`, a balance under `min_balance`, a global budget under one
+/// request's worst loss, and the operator fee on.
 pub async fn check<P: Provider>(
     provider: &P,
     config: &Config,
     signer: Address,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     let fail = |e: String| Err(e.into());
+    let mut warnings = vec![];
     let (chain_id, ours) = (provider.get_chain_id().await?, config.chain_id);
     if chain_id != ours {
         return fail(format!(
@@ -149,15 +155,16 @@ pub async fn check<P: Provider>(
         ));
     }
     if !config.supported_releases.contains(&version) {
-        return fail(format!(
-            "the factory's latest release {version} is not in [limits] supported_releases: \
-             run a relayer that decodes it"
+        warnings.push(format!(
+            "the factory's latest release {version} is not in [limits] supported_releases, \
+             whose wallets are UnsupportedRelease: run a relayer that decodes it"
         ));
     }
     let (balance, floor) = (provider.get_balance(signer).await?, config.min_balance);
     if balance < floor {
-        return fail(format!(
-            "the signer's balance {balance} is below [limits] min_balance {floor}: fund {signer}"
+        warnings.push(format!(
+            "the signer's balance {balance} is below [limits] min_balance {floor}, so \
+             sending pauses: fund {signer}"
         ));
     }
     let refused = |e| format!("{e:?}");
@@ -171,13 +178,14 @@ pub async fn check<P: Provider>(
     let worst = gas.saturating_add(l1);
     let budget = config.global_budget.wei;
     if budget < worst {
-        return fail(format!(
+        warnings.push(format!(
             "[limits] global_budget {budget} is below one request's worst loss {worst}, \
              max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of \
-             that much calldata: raise it"
+             that much calldata, so such a request is OverBudget: raise it"
         ));
     }
-    operator_fee(provider, config).await
+    warnings.extend(operator_fee(provider, config).await?);
+    Ok(warnings)
 }
 
 /// `block_time` within 25% of the chain's mean over the blocks of the last
@@ -210,19 +218,21 @@ async fn block_time<P: Provider>(provider: &P, config: &Config) -> Result<(), Er
     Ok(())
 }
 
-/// No OP-stack operator fee, which no refund bounds.
-async fn operator_fee<P: Provider>(provider: &P, config: &Config) -> Result<(), Error> {
+/// The OP-stack operator fee, which no refund bounds, read: a warning when it is on or
+/// has no getters.
+async fn operator_fee<P: Provider>(
+    provider: &P,
+    config: &Config,
+) -> Result<Option<String>, Error> {
     let fee = gas::operator_fee(provider, config, BlockId::latest()).await;
-    match fee.map_err(|e| format!("{e:?}"))? {
-        gas::OperatorFee::On(s, c) => Err(format!(
-            "the operator fee is on (scalar {s}, constant {c}), which no refund bounds: \
-             relay on a chain without one"
-        )
-        .into()),
+    Ok(match fee.map_err(|e| format!("{e:?}"))? {
+        gas::OperatorFee::On(s, c) => Some(format!(
+            "the operator fee is on (scalar {s}, constant {c}), which no refund bounds, \
+             so sending pauses until it is off"
+        )),
         gas::OperatorFee::Unread => {
-            tracing::warn!("L1Block has no operator fee getters: none to check");
-            Ok(())
+            Some("L1Block has no operator fee getters: none to check".into())
         }
-        gas::OperatorFee::Off => Ok(()),
-    }
+        gas::OperatorFee::Off => None,
+    })
 }

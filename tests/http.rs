@@ -340,14 +340,17 @@ async fn refusals_carry_their_decoded_names() {
 }
 
 /// An identity whose send lost the relayer gas is `IdentityHeld` until `loss_hold`
-/// has passed, while others relay; once identities lose the global budget, their whole
-/// losses counted, requests are `Paused`.
+/// has passed, while others relay; once identities' losses, counted whole, leave less of
+/// the global budget than a request's worst loss, that request is `OverBudget`.
 #[tokio::test]
-async fn a_loss_holds_its_identity_and_the_global_budget_pauses() {
+async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
     let (mut o, path) = (Onboarding::new(true).await, db("budgets"));
+    // A request's worst loss is its refund R. Over R and a reverted send's gas, under R
+    // and a mined send's loss with its value.
+    let budget = o.refund() + o.value / U256::from(2);
     let config = Config {
         global_budget: Budget {
-            wei: o.value, // over a reverted send's gas, under a mined one's loss
+            wei: budget,
             window: Duration::from_secs(3600),
         },
         ..o.config()
@@ -368,10 +371,14 @@ async fn a_loss_holds_its_identity_and_the_global_budget_pauses() {
     // Accepted within the global budget; STOP: mined, status 1, its value lost too.
     let second = s.unrefunded(&o, "00").await;
     o.other_identity(2).await;
-    let (code, paused) = s.relay(&o.request_for(&o.onboarding()).await).await;
-    assert_eq!((code, name(&paused)), (503, "Paused"));
-    assert_eq!(s.gauge("paused").await, 1.0);
-    assert_eq!(s.gauge("budget_left_wei").await, 0.0);
+    let (code, over) = s.relay(&o.request_for(&o.onboarding()).await).await;
+    assert_eq!((code, name(&over)), (503, "OverBudget"), "{over}");
+    let left = budget - first - second;
+    assert_eq!(over["error"]["args"]["left"], left.to_string());
+    let worst = over["error"]["args"]["worst"].as_str().unwrap();
+    assert!(worst.parse::<U256>().unwrap() > left, "{over}");
+    assert_eq!(s.gauge("paused").await, 0.0);
+    assert_eq!(s.gauge("budget_left_wei").await, f64::from(left));
     let stats = stats(&path, &config).unwrap();
     let requests = [("included".to_owned(), 1), ("reverted".to_owned(), 1)];
     assert_eq!(stats.requests, BTreeMap::from(requests));
