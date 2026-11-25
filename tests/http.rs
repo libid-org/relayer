@@ -1,5 +1,5 @@
 //! The HTTP API on anvil, served in-process on a random port: quote, relay, status,
-//! refusals by name, loss budgets, health, metrics and the ledger's stats. Needs
+//! refusals by name, the loss hold and budget, health, metrics and the ledger's stats. Needs
 //! `anvil` on `PATH`.
 
 #![allow(dead_code, unused_imports)]
@@ -15,7 +15,6 @@ use std::{
     time::Duration,
 };
 
-use alloy::primitives::I256;
 use relayer::{
     config::Budget,
     http::{
@@ -127,7 +126,7 @@ impl Server {
     /// The onboarding relayed, then `planted` code at the wallet before its send is
     /// mined: it lands with no refund. Its loss: gas, plus the value fronted unless
     /// it reverted.
-    async fn unrefunded(&self, o: &Onboarding, planted: &str) -> I256 {
+    async fn unrefunded(&self, o: &Onboarding, planted: &str) -> U256 {
         let (code, accepted) = self.relay(&o.request_for(&o.onboarding()).await).await;
         assert_eq!(code, 202, "{accepted}");
         o.owner.anvil_set_auto_mine(false).await.unwrap();
@@ -140,7 +139,7 @@ impl Server {
         } else {
             o.value
         };
-        I256::try_from(cost(o, &done).await + value).unwrap()
+        cost(o, &done).await + value
     }
 
     /// The value of the gauge `name` at a scrape.
@@ -178,24 +177,6 @@ fn name(body: &Value) -> &str {
     body["error"]["name"].as_str().unwrap_or_default()
 }
 
-/// Ten refunded requests, net 100 and cost 25, seen 1 to 10 s after their sends; a
-/// cancel charged 20, seen at 50 s; a revert charged 30; one pending and one queued.
-const LEDGER: &str = "DELETE FROM requests; DELETE FROM attempts;
-    WITH RECURSIVE i(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM i WHERE n < 11)
-    INSERT INTO attempts (hash, id, nonce, cancel, raw, block, at, worst, sent_at)
-        SELECT n, n, n, 0, x'', 0, 0, x'', 100 FROM i;
-    INSERT INTO requests (id, wallet, tx, net, l1, deadline, status, reverted, gas_used,
-        gas_price, l1_fee, included_at, loss)
-        SELECT id, x'', '', x'64', x'', 0, 'included', 0, 10, x'02', x'05', 100 + id, x''
-        FROM attempts;
-    UPDATE requests SET status = 'cancelled', l1_fee = x'', included_at = 150,
-        loss = x'14' WHERE id = 11;
-    INSERT INTO requests (id, wallet, tx, net, l1, deadline, status, reverted, gas_used,
-        gas_price, l1_fee, loss) VALUES
-        (12, x'', '', x'64', x'', 0, 'included', 1, 10, x'02', x'', x'1e'),
-        (13, x'', '', x'64', x'', 0, 'included', 0, 10, x'02', x'', NULL),
-        (14, x'', '', x'64', x'', 0, 'queued', NULL, NULL, NULL, NULL, NULL);";
-
 /// Quoted, relayed and included over HTTP; health, metrics and stats then count it.
 #[tokio::test]
 async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
@@ -229,39 +210,14 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
     );
     o.assert_onboarded(o.refund()).await;
 
-    let (cost, net) = (cost(&o, &done).await, o.refund() - o.value);
-    let stats = stats(&path).unwrap();
-    assert_eq!(stats.requests, BTreeMap::from([("included".to_owned(), 1)]));
-    let profit = I256::try_from(net).unwrap() - I256::try_from(cost).unwrap();
-    assert_eq!((stats.profit, stats.profit_per_request), (profit, profit));
-    assert_eq!(stats.cancel_rate, 0.0);
-    assert_eq!(stats.cost_ratio, Some(f64::from(cost) / f64::from(net)));
-    assert!(stats.inclusion_seconds.is_some());
-    let ledger = rusqlite::Connection::open(&path).unwrap();
-    ledger
-        .execute("UPDATE attempts SET sent_at = sent_at + 60", [])
-        .unwrap();
-    let stepped = relayer::stats::stats(&path).unwrap().inclusion_seconds;
-    assert_eq!(stepped, Some([0; 3]), "a clock step back");
-    let fixed = path.with_file_name("fixed.db");
-    std::fs::copy(&path, &fixed).unwrap();
-    rusqlite::Connection::open(&fixed)
-        .unwrap()
-        .execute_batch(LEDGER)
-        .unwrap();
-    let fixed = relayer::stats::stats(&fixed).unwrap();
-    let shown = "requests      cancelled 1, included 11, queued 1, reverted 1\n\
-                 profit        700 wei, 58 per request\n\
-                 cancel rate   0.083\n\
-                 inclusion     p50 5s, p90 9s, p99 10s\n\
-                 cost ratio    0.25\n\
-                 pending       1\n";
-    assert_eq!(fixed.to_string(), shown);
-    let requests = json!({"cancelled": 1, "included": 11, "queued": 1, "reverted": 1});
-    let json = json!({"requests": requests, "profit": "700", "profitPerRequest": "58",
-        "cancelRate": 1.0 / 12.0, "inclusionSeconds": [5, 9, 10], "costRatio": 0.25,
-        "pending": 1});
-    assert_eq!(fixed.json(), json);
+    let stats = stats(&path, &o.config()).unwrap();
+    let shown = "requests      included 1\n\
+                 held          0\n\
+                 lost          0 wei\n\
+                 pending       0\n";
+    assert_eq!(stats.to_string(), shown);
+    let json = json!({"requests": {"included": 1}, "held": 0, "lost": "0", "pending": 0});
+    assert_eq!(stats.json(), json);
 
     let noncanonical = json!({"wallet": o.wallet, "data": "0x00", "gasLimit": GAS_LIMIT});
     let (code, refused) = s.call("/v1/relay", Some(noncanonical)).await;
@@ -281,7 +237,7 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
 }
 
 /// Refusals carry their names: the relayer's own with their fields, and a revert
-/// decoded on the wallet route; a wallet with a batch queued is busy; a low balance
+/// decoded on the wallet route; an identity with a batch queued is busy; a low balance
 /// is a heartbeat and pauses relays.
 #[tokio::test]
 async fn refusals_carry_their_decoded_names() {
@@ -377,48 +333,59 @@ async fn refusals_carry_their_decoded_names() {
     assert_eq!(code, 202, "{first}");
     calls[2] = o.repay(o.refund() + U256::ONE);
     let (code, busy) = s.relay(&o.request_for(&calls).await).await;
-    assert_eq!((code, name(&busy)), (409, "WalletBusy"));
+    assert_eq!((code, name(&busy)), (409, "IdentityBusy"));
     assert_eq!(busy["error"]["args"]["id"], first["id"]);
     let (code, unknown) = s.call(&format!("/v1/relay/{}", B256::ZERO), None).await;
     assert_eq!((code, name(&unknown)), (404, "UnknownRequest"));
 }
 
-/// A wallet that lost its budget is `RateLimited` while others relay; once wallets
-/// lose the global budget, their whole losses counted, requests are `Paused`.
+/// An identity whose send lost the relayer gas is `IdentityHeld` until `loss_hold`
+/// has passed, while others relay; once identities lose the global budget, their whole
+/// losses counted, requests are `Paused`.
 #[tokio::test]
-async fn a_wallet_budget_trips_before_the_global_pause() {
+async fn a_loss_holds_its_identity_and_the_global_budget_pauses() {
     let (mut o, path) = (Onboarding::new(true).await, db("budgets"));
-    let window = Duration::from_secs(3600);
     let config = Config {
-        wallet_budget: Budget {
-            wei: U256::from(1),
-            window,
-        },
         global_budget: Budget {
             wei: o.value, // over a reverted send's gas, under a mined one's loss
-            window,
+            window: Duration::from_secs(3600),
         },
         ..o.config()
     };
-    let s = Server::start(&o, config, &path, Duration::from_secs(3600)).await;
+    let s = Server::start(&o, config.clone(), &path, Duration::from_secs(3600)).await;
     let first = s.unrefunded(&o, "60006000fd").await; // REVERT: mined, status 0
+    o.set_code(o.wallet, "").await; // its batch reverted: the wallet was not created
     let again = o
         .request_for(&o.batch(o.repay(o.refund() + U256::ONE)))
         .await;
-    let (code, limited) = s.relay(&again).await;
-    assert_eq!((code, name(&limited)), (429, "RateLimited"));
-    o.wallet_at(U256::ONE).await;
+    let (code, held) = s.relay(&again).await;
+    assert_eq!((code, name(&held)), (429, "IdentityHeld"), "{held}");
+    assert!(
+        held["error"]["args"]["until"].as_u64().unwrap() > 0,
+        "{held}"
+    );
+    o.other_identity(1).await;
     // Accepted within the global budget; STOP: mined, status 1, its value lost too.
     let second = s.unrefunded(&o, "00").await;
-    o.wallet_at(U256::from(2)).await;
+    o.other_identity(2).await;
     let (code, paused) = s.relay(&o.request_for(&o.onboarding()).await).await;
     assert_eq!((code, name(&paused)), (503, "Paused"));
-    let (code, limited) = s.relay(&again).await; // its wallet's budget answers first
-    assert_eq!((code, name(&limited)), (429, "RateLimited"));
     assert_eq!(s.gauge("paused").await, 1.0);
     assert_eq!(s.gauge("budget_left_wei").await, 0.0);
-    let stats = stats(&path).unwrap();
+    let stats = stats(&path, &config).unwrap();
     let requests = [("included".to_owned(), 1), ("reverted".to_owned(), 1)];
     assert_eq!(stats.requests, BTreeMap::from(requests));
-    assert_eq!(stats.profit, -first - second, "not charged its loss");
+    assert_eq!(
+        (stats.held, stats.lost),
+        (2, first + second),
+        "not charged its loss"
+    );
+    // Past the hold, the rows go: nothing is held or counted.
+    let hold = config.loss_hold.as_secs();
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let back = format!("UPDATE identities SET at = at - {hold}");
+    ledger.execute(&back, []).unwrap();
+    s.service.tick().await;
+    let after = relayer::stats::stats(&path, &config).unwrap();
+    assert_eq!((after.held, after.lost), (0, U256::ZERO), "{after:?}");
 }

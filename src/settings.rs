@@ -22,6 +22,7 @@ use crate::{
         Config,
         FeeParams,
         L1Fee,
+        LOSS_HOLD,
         TICK_TIMEOUT,
     },
     http::Limits,
@@ -113,6 +114,10 @@ fn tick_timeout() -> Duration {
     TICK_TIMEOUT
 }
 
+fn loss_hold() -> Duration {
+    LOSS_HOLD
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Http {
@@ -126,8 +131,9 @@ struct Http {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Limit {
-    wallet_budget: Budget,
     global_budget: Budget,
+    #[serde(default = "loss_hold", with = "humantime_serde")]
+    loss_hold: Duration,
     max_gas_limit: u64,
     #[serde(default)]
     max_value: Option<U256>,
@@ -221,8 +227,8 @@ impl Settings {
             min_balance: limits.min_balance,
             node_error_ticks: limits.node_error_ticks,
             receipt_lag_blocks: limits.receipt_lag_blocks,
-            wallet_budget: limits.wallet_budget,
             global_budget: limits.global_budget,
+            loss_hold: limits.loss_hold,
             tick_timeout: state.tick_timeout,
         };
         config.validate()?;

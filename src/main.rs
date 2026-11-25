@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         }
     };
     if let Command::Stats { json } = cli.command {
-        return match stats(&settings.db) {
+        return match stats(&settings.db, &settings.config) {
             Ok(stats) if json => {
                 println!("{:#}", stats.json());
                 ExitCode::SUCCESS

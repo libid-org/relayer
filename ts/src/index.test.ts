@@ -13,7 +13,7 @@ import {
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
-import { type Holding, type Onboarding, onboard, RelayerError, swapAbi } from './index.js'
+import { type Holding, type Onboarding, onboard, RelayerError, swapAbi, waitFor } from './index.js'
 
 const a = (n: number) => `0x${n.toString(16).padStart(40, '0')}` as Address
 const [FACTORY, REGISTRY, RELAYER, WALLET, TOKEN, ROUTER] = [a(1), a(2), a(3), a(4), a(7), a(8)]
@@ -261,16 +261,54 @@ describe('onboard', () => {
     relayer({
       '/v1/quote': [[200, quote(1)]],
       '/v1/relay': [
-        [409, { error: { name: 'WalletBusy', message: 'busy', args: { id: '0xef' } } }],
+        [409, { error: { name: 'IdentityBusy', message: 'busy', args: { id: '0xef' } } }],
       ],
     })
     const refused = await onboard(ethOnly).catch((e) => e)
     expect(refused).toBeInstanceOf(RelayerError)
     expect(refused).toMatchObject({
       status: 409,
-      name: 'WalletBusy',
+      name: 'IdentityBusy',
       message: 'busy',
       args: { id: '0xef' },
+    })
+  })
+})
+
+describe('waitFor', () => {
+  const unknown = [404, { error: { name: 'UnknownRequest', message: 'no such request' } }]
+  /// A chain where the wallet has `code` and `key`'s session is `admin`.
+  const chain = (code: Hex, admin: boolean) =>
+    ({
+      getBlockNumber: async () => 42n,
+      getCode: async () => code,
+      readContract: async () => ({ admin }),
+      getBalance: async () => ETHER,
+    }) as unknown as PublicClient
+  const onboarded = { wallet: WALLET, key: k.address, native: NATIVE, tokens: [NATIVE] }
+  const wait = (client: PublicClient) =>
+    waitFor('http://relayer.test', ID, { intervalMs: 1, timeoutMs: 50, client, onboarded })
+
+  test('once dropped, settles from the chain once the genesis key is admin', async () => {
+    relayer({ [`/v1/relay/${ID}`]: [unknown as [number, unknown]] })
+    await expect(wait(chain('0x01', true))).resolves.toEqual({
+      txHashes: [],
+      blockNumber: 42,
+      received: [{ token: NATIVE, amount: ETHER }],
+    })
+  })
+
+  test('once dropped, waits while the wallet has no code or no admin key', async () => {
+    for (const client of [chain('0x', true), chain('0x01', false)]) {
+      relayer({ [`/v1/relay/${ID}`]: Array(100).fill(unknown) })
+      await expect(wait(client)).rejects.toThrow('did not settle')
+    }
+  })
+
+  test('without a client, UnknownRequest throws', async () => {
+    relayer({ [`/v1/relay/${ID}`]: [unknown as [number, unknown]] })
+    await expect(waitFor('http://relayer.test', ID)).rejects.toMatchObject({
+      name: 'UnknownRequest',
     })
   })
 })

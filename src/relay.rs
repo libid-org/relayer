@@ -1,6 +1,8 @@
-//! The sender: requests and their send attempts kept in SQLite, sent one at a time
-//! by the one writer of the key's nonces, each at a pinned block, watched to a
-//! receipt, and cancelled when their inclusion window ends.
+//! The sender: one SQLite row per genesis identity, holding its request, its signed
+//! send and cancels, and its loss; sent one at a time by the one writer of the key's
+//! nonces, each at a pinned block, watched to a receipt, and cancelled when its
+//! inclusion window ends. A paid row goes `receipt_lag_blocks` after its receipt, a
+//! row with a loss after `loss_hold`, refusing its identity until then.
 
 use std::{
     collections::{
@@ -70,6 +72,7 @@ use crate::{
         reverted,
         vouched,
         Checked,
+        Identity,
         Refusal,
         Request,
     },
@@ -110,43 +113,6 @@ impl std::error::Error for Stop {}
 /// A request's `R - value` and the L1 fee bound its refund covers.
 type Cover = (U256, U256);
 
-/// A request as `stats` reads it.
-pub(crate) struct Entry {
-    /// Its status, or `reverted` for an included request whose batch reverted.
-    pub status: String,
-    /// Its refund net of value.
-    pub net: U256,
-    /// What its receipts cost, once read.
-    pub cost: Option<U256>,
-    /// Its loss, once charged.
-    pub loss: Option<U256>,
-    /// The seconds from its first send to its inclusion.
-    pub inclusion: Option<u64>,
-}
-
-/// Every request of the ledger `db`.
-pub(crate) fn entries(db: &Connection) -> Result<Vec<Entry>, Error> {
-    let sql = "SELECT CASE WHEN r.reverted THEN 'reverted' ELSE r.status END, r.net, \
-               r.gas_used, r.gas_price, r.l1_fee, \
-               max(r.included_at - (SELECT min(sent_at) FROM attempts a WHERE a.id = r.id), 0), \
-               r.loss FROM requests r";
-    let entry = |r: &Row| {
-        let cost = match r.get::<_, Option<u64>>(2)? {
-            Some(gas) => Some(U256::from(gas) * u256(r, 3)? + u256(r, 4)?),
-            None => None,
-        };
-        let loss = r.get::<_, Option<Vec<u8>>>(6)?;
-        Ok(Entry {
-            status: first(r)?,
-            net: u256(r, 1)?,
-            cost,
-            loss: loss.map(|w| U256::from_be_slice(&w)),
-            inclusion: r.get(5)?,
-        })
-    };
-    rows(db, sql, [], entry)
-}
-
 /// A queued request: id, transaction, cover, deadline, wallet.
 type Queued = (B256, String, Cover, u64, Address);
 
@@ -154,15 +120,15 @@ type Queued = (B256, String, Cover, u64, Address);
 const CANCEL_PERCENTILE: f64 = 90.0;
 
 /// The schema version, `PRAGMA user_version`, a database must have.
-const VERSION: i32 = 4;
+const VERSION: i32 = 5;
 
 /// The tables, created in a new database.
 const SCHEMA: &str = include_str!("schema.sql");
 
-/// A request in flight, over `requests r JOIN attempts a` and the key's mined count
-/// `?1`: sent, or ended at a nonce the count no longer covers.
+/// A row in flight at the key's mined count `?1`: sent, or ended at a nonce the count
+/// no longer covers.
 const IN_FLIGHT: &str =
-    "r.status = 'sent' OR (r.status IN ('included', 'cancelled') AND a.nonce >= ?1)";
+    "status = 'sent' OR (status IN ('included', 'cancelled') AND nonce >= ?1)";
 
 /// Where a request stands.
 #[derive(Debug)]
@@ -181,7 +147,7 @@ pub enum Status {
     /// Replaced by a cancel that landed; not queued again.
     Cancelled,
     /// Refused before or at its first broadcast, or charged at its worst as `Node` when
-    /// its receipt did not parse; queued again when relayed again.
+    /// its receipt did not parse.
     Failed(Refusal),
 }
 
@@ -192,25 +158,6 @@ pub struct Report {
     pub status: Status,
     /// Its send, then its cancels.
     pub tx_hashes: Vec<B256>,
-    /// When each of `tx_hashes` was committed, in unix seconds.
-    pub sent_at: Vec<u64>,
-    /// When it was last queued, in unix seconds.
-    pub created_at: u64,
-    /// What its attempt with a receipt cost.
-    pub cost: Option<Cost>,
-}
-
-/// A receipt's cost, in wei: `gas_used × gas_price + l1_fee`.
-#[derive(Debug)]
-pub struct Cost {
-    /// The receipt's gas used.
-    pub gas_used: u64,
-    /// The receipt's effective gas price.
-    pub gas_price: U256,
-    /// The receipt's `l1Fee`; 0 on a chain without one.
-    pub l1_fee: U256,
-    /// When the relayer first saw the receipt, in unix seconds.
-    pub included_at: u64,
 }
 
 /// A signed transaction, committed at its nonce before it is broadcast.
@@ -219,11 +166,41 @@ struct Attempt {
     nonce: u64,
     cancel: bool,
     raw: Bytes,
-    /// The number and time of the block it was signed at.
-    block: u64,
-    at: u64,
-    /// The most it costs, at the L1 bound it was sent with.
-    worst: U256,
+}
+
+impl Attempt {
+    /// The stored `raw`, a cancel when `cancel`.
+    fn read(raw: Bytes, cancel: bool) -> Result<Self, Error> {
+        let tx = TxEnvelope::decode_2718(&mut &raw[..])?;
+        Ok(Self {
+            hash: *tx.tx_hash(),
+            nonce: tx.nonce(),
+            cancel,
+            raw,
+        })
+    }
+}
+
+/// A row's signed transactions.
+struct Sent {
+    nonce: u64,
+    /// The send's, then each cancel's.
+    hashes: Vec<B256>,
+    send: Bytes,
+    /// The last cancel signed.
+    cancel: Option<Bytes>,
+    /// The time of the block the send was signed at.
+    signed_at: u64,
+}
+
+impl Sent {
+    /// The last transaction signed: the last cancel, or the send.
+    fn last(&self) -> Result<Attempt, Error> {
+        match &self.cancel {
+            Some(cancel) => Attempt::read(cancel.clone(), true),
+            None => Attempt::read(self.send.clone(), false),
+        }
+    }
 }
 
 /// What a tick leaves for the next, behind the lock that runs one tick at a time.
@@ -260,6 +237,8 @@ pub struct Relayer<P> {
     pub(crate) provider: P,
     config: Config,
     db: Mutex<Connection>,
+    /// The sends in flight at start, by their hash: sent again until their deadline.
+    resumed: BTreeSet<B256>,
     paused: AtomicBool,
     /// The balance at the last pinned block is below `min_balance`.
     low: AtomicBool,
@@ -313,6 +292,12 @@ impl<P: Provider> Relayer<P> {
             None => drop(conn.execute("INSERT INTO nonce (next) VALUES (?1)", [mined])?),
             Some(next) => explained(&provider, &conn, mined, next).await?,
         }
+        let sql = format!("SELECT send FROM identities WHERE {IN_FLIGHT}");
+        let resumed = rows(&conn, &sql, [mined], |r| r.get::<_, Vec<u8>>(0))?;
+        let resumed = resumed
+            .iter()
+            .map(|raw| Ok(Attempt::read(raw.clone().into(), false)?.hash));
+        let resumed = resumed.collect::<Result<_, Error>>()?;
         let growth = gas::window_growth(&provider, &config)
             .await
             .map_err(refused)?;
@@ -327,6 +312,7 @@ impl<P: Provider> Relayer<P> {
             provider,
             config,
             db: Mutex::new(conn),
+            resumed,
             paused: AtomicBool::new(false),
             low: AtomicBool::new(false),
             unexplained: AtomicBool::new(false),
@@ -342,9 +328,9 @@ impl<P: Provider> Relayer<P> {
         self.submit(request).await.map(|(id, _)| id)
     }
 
-    /// Check `request` and queue it under its id, within the wallet's loss budget and
-    /// while sending is not paused: its id and status. The same request again returns
-    /// its id and stored status unchecked; one that failed is queued again under it.
+    /// Check `request` and queue it under its id while sending is not paused: its id
+    /// and status. The same request again returns its id and stored status unchecked;
+    /// one that failed is queued again under it.
     pub(crate) async fn submit(
         &self,
         request: &Request,
@@ -353,23 +339,18 @@ impl<P: Provider> Relayer<P> {
         let (p, c, wallet) = (&self.provider, &self.config, request.wallet);
         let call = outer(c, wallet, request.create, &request.data, message.value);
         let id = request_id(c.chain_id, &call, message.value);
-        if let Some(stored) = admit(&self.db(), id, wallet)? {
+        if let Some(stored) = stored(&self.db(), id)? {
             return Ok(stored);
         }
-        // A wallet that lost its budget is refused before the global budget counts.
-        let budget = c.wallet_budget;
-        let lost = self.losses(budget.window).map_err(node)?;
-        if lost.get(&wallet).is_some_and(|lost| *lost >= budget.wei) {
-            return Err(Refusal::RateLimited);
-        }
-        if self.budget_left().map_err(node)?.is_zero() || self.paused() {
+        if self.paused() {
             return Err(Refusal::Paused);
         }
         let checked = request.check(p, c).await?;
         self.queue(id, wallet, &checked, message.deadline.to())
     }
 
-    /// Store `checked` as `id`, queued, unless [`admit`] now answers for it.
+    /// Store `checked` as `id`, queued in its identity's row, unless [`admit`] now
+    /// answers for it.
     #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
     fn queue(
         &self,
@@ -381,22 +362,26 @@ impl<P: Provider> Relayer<P> {
         let tx = serde_json::to_string(&checked.tx).map_err(node)?;
         let (net, l1) = (checked.net, checked.l1_fee_bound);
         let (net, l1) = (net.to_be_bytes::<32>(), l1.to_be_bytes::<32>());
-        let db = self.db();
-        if let Some(stored) = admit(&db, id, wallet)? {
+        let ((platform, id_node), db) = (checked.identity, self.db());
+        if let Some(stored) = admit(&db, id, checked.identity, self.config.loss_hold)? {
             return Ok(stored);
         }
-        let row = params![&id[..], &wallet[..], tx, net, l1, deadline];
-        // A charged failure stays in the budgets, under another id.
-        let keep = "UPDATE requests SET id = id || CAST(rowid AS BLOB) \
-                    WHERE id = ?1 AND loss IS NOT NULL";
-        db.execute(keep, [&id[..]])
-            .and_then(|_| db.execute("DELETE FROM attempts WHERE id = ?1", [&id[..]]))
-            .and_then(|_| db.execute(
-                "INSERT OR REPLACE INTO requests (id, wallet, tx, net, l1, deadline, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued')",
-                row,
-            ))
-            .map_err(node)?;
+        let row = params![
+            &platform[..],
+            &id_node[..],
+            &id[..],
+            &wallet[..],
+            tx,
+            net,
+            l1,
+            deadline
+        ];
+        db.execute(
+            "INSERT OR REPLACE INTO identities (platform, id_node, id, wallet, tx, net, l1, \
+             deadline, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'queued')",
+            row,
+        )
+        .map_err(node)?;
         Ok((id, "queued".into()))
     }
 
@@ -408,12 +393,12 @@ impl<P: Provider> Relayer<P> {
         step.map_err(|_| format!("a tick ran over tick_timeout {limit:?}: dropped"))?
     }
 
-    /// Resolve or rebroadcast each request in flight, then send the oldest queued one
-    /// when none is in flight and the key's count at the pinned block is the stored
-    /// next nonce. Above it a foreign nonce pauses sending; below it ours is unmined.
-    /// A balance below `min_balance` pauses sending until a tick finds it funded, an
-    /// OP-stack operator fee until a tick finds it off, and a spent global loss budget
-    /// until its window passes.
+    /// Resolve or rebroadcast each request in flight, drop the rows that are done,
+    /// then send the oldest queued one when none is in flight and the key's count at the
+    /// pinned block is the stored next nonce. Above it a foreign nonce pauses sending;
+    /// below it ours is unmined. A balance below `min_balance` pauses sending until a
+    /// tick finds it funded, an OP-stack operator fee until a tick finds it off, and a
+    /// spent global loss budget until its window passes.
     async fn step(&self) -> Result<(), Error> {
         let mut ticking = self.ticking.lock().await;
         let head = gas::head(&self.provider, &self.config)
@@ -433,6 +418,7 @@ impl<P: Provider> Relayer<P> {
             let resolved = self.resolve(id, net, &head).await;
             self.read(&mut ticking.receipt, id, resolved, mined)?;
         }
+        self.prune(&head)?;
         let lag = self.config.receipt_lag_blocks;
         let unexplained = missing.values().any(|at| head.number >= at + lag);
         self.unexplained.store(unexplained, Relaxed);
@@ -489,19 +475,17 @@ impl<P: Provider> Relayer<P> {
         Ok(())
     }
 
-    /// The requests in flight at the mined count: id, deadline, cover.
+    /// The rows in flight at the mined count: id, deadline, cover.
     fn in_flight(&self, mined: u64) -> Result<Vec<(B256, u64, Cover)>, Error> {
-        let sql = format!(
-            "SELECT DISTINCT r.id, r.deadline, r.net, r.l1 FROM requests r \
-             JOIN attempts a ON a.id = r.id WHERE {IN_FLIGHT}"
-        );
+        let sql =
+            format!("SELECT id, deadline, net, l1 FROM identities WHERE {IN_FLIGHT}");
         let row = |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?));
         rows(&self.db(), &sql, [mined], row)
     }
 
     /// The oldest queued request.
     fn queued(&self) -> Result<Option<Queued>, Error> {
-        let sql = "SELECT id, tx, net, l1, deadline, wallet FROM requests \
+        let sql = "SELECT id, tx, net, l1, deadline, wallet FROM identities \
                    WHERE status = 'queued' ORDER BY rowid LIMIT 1";
         let row =
             |r: &Row| Ok((b256(r, 0)?, r.get(1)?, cover(r)?, r.get(4)?, address(r, 5)?));
@@ -511,38 +495,42 @@ impl<P: Provider> Relayer<P> {
     /// The included requests whose loss is not yet charged: id, `R - value`.
     fn uncharged(&self) -> Result<Vec<(B256, U256)>, Error> {
         let sql =
-            "SELECT id, net FROM requests WHERE status = 'included' AND loss IS NULL";
+            "SELECT id, net FROM identities WHERE status = 'included' AND loss IS NULL";
         rows(&self.db(), sql, [], |r| Ok((b256(r, 0)?, u256(r, 1)?)))
+    }
+
+    /// Drop the rows that are done: a paid one `receipt_lag_blocks` after its block, a
+    /// failed one or one with a loss `loss_hold` after it was last moved.
+    fn prune(&self, head: &Head) -> Result<(), Error> {
+        let (lag, hold) = (self.config.receipt_lag_blocks, self.config.loss_hold);
+        self.db().execute(
+            "DELETE FROM identities WHERE \
+             (status = 'included' AND loss = zeroblob(32) AND block + ?1 <= ?2) \
+             OR ((status = 'failed' OR loss != zeroblob(32)) AND at <= unixepoch() - ?3)",
+            params![lag, head.number, hold.as_secs()],
+        )?;
+        Ok(())
     }
 
     /// `id`'s status and its transactions.
     pub async fn status(&self, id: B256) -> Result<Report, Error> {
-        let sql = "SELECT status, block, reverted, failure, detail, created_at, \
-                   gas_used, gas_price, l1_fee, included_at FROM requests WHERE id = ?1";
+        let sql = "SELECT status, block, reverted, failure, detail, hashes \
+                   FROM identities WHERE id = ?1";
         let row = |r: &Row| {
             let (block, reverted) =
                 (r.get::<_, Option<_>>(1)?, r.get::<_, Option<_>>(2)?);
             let failure = (r.get::<_, Option<String>>(3)?, r.get(4)?);
-            let cost = match r.get::<_, Option<u64>>(6)? {
-                None => None,
-                Some(gas_used) => Some(Cost {
-                    gas_used,
-                    gas_price: u256(r, 7)?,
-                    l1_fee: u256(r, 8)?,
-                    included_at: r.get(9)?,
-                }),
-            };
+            let hashes = r.get::<_, Option<Vec<u8>>>(5)?.unwrap_or_default();
             Ok((
                 first::<String>(r)?,
                 block.unwrap_or(0),
                 reverted.unwrap_or(false),
                 failure,
-                r.get(5)?,
-                cost,
+                hashes.chunks(32).map(B256::from_slice).collect(),
             ))
         };
         let found = self.db().query_row(sql, [&id[..]], row).optional()?;
-        let (status, block, reverted, (failure, detail), created_at, cost) =
+        let (status, block, reverted, (failure, detail), tx_hashes) =
             found.ok_or(Stop::Unknown)?;
         let status = match &status[..] {
             "queued" => Status::Queued,
@@ -551,18 +539,7 @@ impl<P: Provider> Relayer<P> {
             "cancelled" => Status::Cancelled,
             _ => Status::Failed(decode_failure(&failure.unwrap_or_default(), detail)),
         };
-        let sql = "SELECT hash, sent_at FROM attempts WHERE id = ?1 ORDER BY rowid";
-        let sent = rows(&self.db(), sql, [&id[..]], |r| {
-            Ok((b256(r, 0)?, r.get::<_, u64>(1)?))
-        })?;
-        let (tx_hashes, sent_at) = sent.into_iter().unzip();
-        Ok(Report {
-            status,
-            tx_hashes,
-            sent_at,
-            created_at,
-            cost,
-        })
+        Ok(Report { status, tx_hashes })
     }
 
     /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a first
@@ -586,54 +563,38 @@ impl<P: Provider> Relayer<P> {
         *self.balance.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// How long the oldest queued or sent request has waited, in seconds.
+    /// How long the oldest queued or sent request has stood so, in seconds.
     pub fn oldest_in_flight(&self) -> Result<Option<u64>, Error> {
-        let sql = "SELECT unixepoch() - min(created_at) FROM requests \
+        let sql = "SELECT unixepoch() - min(at) FROM identities \
                    WHERE status IN ('queued', 'sent')";
         Ok(self.db().query_row(sql, [], first)?)
     }
 
     /// What is left of the global loss budget.
     pub fn budget_left(&self) -> Result<U256, Error> {
-        let losses = self.losses(self.config.global_budget.window)?;
-        let lost = losses
-            .values()
-            .fold(U256::ZERO, |sum, l| sum.saturating_add(*l));
-        Ok(self.config.global_budget.wei.saturating_sub(lost))
+        let budget = self.config.global_budget;
+        Ok(budget.wei.saturating_sub(lost(&self.db(), budget.window)?))
     }
 
-    /// Each wallet's losses over the last `window`, by when their receipts were seen; a
-    /// loss not yet charged at its attempts' worst.
-    fn losses(&self, window: Duration) -> Result<BTreeMap<Address, U256>, Error> {
-        let sql = "SELECT wallet, coalesce(loss, \
-                   (SELECT max(worst) FROM attempts a WHERE a.id = r.id)) FROM requests r \
-                   WHERE included_at > unixepoch() - ?1";
-        let row = |r: &Row| Ok((address(r, 0)?, u256(r, 1)?));
-        let mut losses = BTreeMap::<_, U256>::new();
-        for (wallet, loss) in rows(&self.db(), sql, [window.as_secs()], row)? {
-            let sum = losses.entry(wallet).or_default();
-            *sum = sum.saturating_add(loss);
-        }
-        Ok(losses)
-    }
-
-    /// What `a`'s receipt cost the relayer: its gas and L1 fee, plus its value unless it
-    /// reverted, less R when the key's balance over its block rose by at least
-    /// `R - value - cost`. `None` while the balances are unread, until
-    /// `receipt_lag_blocks` past its block, then charged its gas and L1 fee.
+    /// What `receipt` of `id`'s send `send`, or of a cancel, cost the relayer: its gas
+    /// and L1 fee, plus its value unless it reverted, less R when the key's balance over
+    /// its block rose by at least `R - value - cost`. `None` while the balances are
+    /// unread, until `receipt_lag_blocks` past its block, then charged its gas and L1
+    /// fee.
     async fn loss(
         &self,
-        a: &Attempt,
+        cancel: bool,
+        send: &[u8],
         receipt: &AnyTransactionReceipt,
         net: U256,
         head: &Head,
     ) -> Result<Option<U256>, Error> {
         let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
         let cost = gas + l1_fee(receipt).map_err(unreadable)?;
-        if a.cancel || !receipt.status() {
+        if cancel || !receipt.status() {
             return Ok(Some(cost));
         }
-        let value = TxEnvelope::decode_2718(&mut &a.raw[..])
+        let value = TxEnvelope::decode_2718(&mut &send[..])
             .map_err(unreadable)?
             .value();
         let block = receipt.block_number.unwrap_or_default();
@@ -644,7 +605,8 @@ impl<P: Provider> Relayer<P> {
                 return Ok(None)
             }
             Err(e) => {
-                tracing::warn!("{} charged as unrefunded: {e}", a.hash);
+                let hash = receipt.transaction_hash;
+                tracing::warn!("{hash} charged as unrefunded: {e}");
                 cost
             }
         }))
@@ -666,14 +628,17 @@ impl<P: Provider> Relayer<P> {
         Ok((balance(parent).await?, balance(hash).await?))
     }
 
-    /// Record `id`'s receipt from any of its attempts with its loss, unless charged at
-    /// its block already. False with none.
+    /// Record `id`'s receipt from any of its transactions with its loss, unless charged
+    /// at its block already. False with none.
     async fn resolve(&self, id: B256, net: U256, head: &Head) -> Result<bool, Error> {
-        for a in self.attempts(id)? {
+        let Some(sent) = self.sent(id)? else {
+            return Ok(false);
+        };
+        for (i, hash) in sent.hashes.iter().enumerate() {
             // Read as any receipt, which keeps an OP-stack `l1Fee`.
             let get = self
                 .provider
-                .raw_request("eth_getTransactionReceipt".into(), (a.hash,));
+                .raw_request("eth_getTransactionReceipt".into(), (hash,));
             let get: Result<Option<AnyTransactionReceipt>, _> = get.await;
             let read = |e: alloy::transports::TransportError| match e.is_deser_error() {
                 true => unreadable(e),
@@ -682,26 +647,28 @@ impl<P: Provider> Relayer<P> {
             let Some(receipt) = get.map_err(read)? else {
                 continue;
             };
-            let hash = receipt.block_hash.unwrap_or_default();
-            let sql = "SELECT count(*) FROM requests \
+            let block = receipt.block_hash.unwrap_or_default();
+            let sql = "SELECT count(*) FROM identities \
                        WHERE id = ?1 AND block_hash = ?2 AND loss IS NOT NULL";
             let charged =
                 self.db()
-                    .query_row(sql, params![&id[..], &hash[..]], first::<u64>);
+                    .query_row(sql, params![&id[..], &block[..]], first::<u64>);
             if charged? == 1 {
                 return Ok(true);
             }
-            let status = if a.cancel { "cancelled" } else { "included" };
-            let loss = self.loss(&a, &receipt, net, head).await?;
+            let cancel = i > 0;
+            let status = if cancel { "cancelled" } else { "included" };
+            let loss = self.loss(cancel, &sent.send, &receipt, net, head).await?;
             self.set_status(id, status, Some((&receipt, loss)), None)?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    /// Resolve `id` from a receipt of any of its attempts. With none, broadcast its send
-    /// again until its window ends or it no longer runs, then cancel it. Its nonce
-    /// when mined with no receipt of ours: another sender's, or a lagging node's.
+    /// Resolve `id` from a receipt of any of its transactions. With none, broadcast its
+    /// send again until its window ends, or for a send in flight at start its deadline,
+    /// or it no longer runs, then cancel it. Its nonce when mined with no receipt of
+    /// ours: another sender's, or a lagging node's.
     async fn watch(
         &self,
         id: B256,
@@ -717,23 +684,28 @@ impl<P: Provider> Relayer<P> {
             Err(e) if e.is::<Unreadable>() => Some(e),
             Err(e) => return Err(e),
         };
-        let attempts = self.attempts(id)?;
+        let Some(sent) = self.sent(id)? else {
+            return Ok(None);
+        };
         if unread.is_none() {
             self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
         }
-        let (Some(send), Some(last)) = (attempts.first(), attempts.last()) else {
-            return Ok(None);
-        };
-        if mined > last.nonce {
-            return unread.map_or(Ok(Some(last.nonce)), Err);
+        if mined > sent.nonce {
+            return unread.map_or(Ok(Some(sent.nonce)), Err);
         }
-        let late = self.late(send.at);
+        let resumed = self.resumed.contains(&sent.hashes[0]);
+        let late = if resumed {
+            deadline
+        } else {
+            self.late(sent.signed_at)
+        };
+        let last = sent.last()?;
         let run = Some((deadline, late));
         if last.cancel
             || head.time >= late
-            || !self.broadcast(last, cover, run, head).await?
+            || !self.broadcast(&last, cover, run, head).await?
         {
-            self.cancel(id, last, head).await?;
+            self.cancel(id, &last, cover.1, head).await?;
         }
         unread.map_or(Ok(None), Err)
     }
@@ -776,9 +748,10 @@ impl<P: Provider> Relayer<P> {
             .nonce(nonce)
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.map_err(refused)?.min(cap));
-        let attempt = self.sign(tx, false, head, now).await?;
-        let required = affordable(&attempt.raw, (net, now))? + value;
-        if balance < required {
+        let attempt = self.sign(tx, false).await?;
+        let worst = affordable(&attempt.raw, (net, now))? + value;
+        if balance < worst {
+            let required = worst;
             return self.fail(id, &Refusal::RelayerUnderfunded { balance, required });
         }
         let vouched = vouched(&self.provider, &self.config, wallet, create);
@@ -786,7 +759,7 @@ impl<P: Provider> Relayer<P> {
         if let Err(refusal) = async { vouched.await.and(run.await) }.await {
             return self.strike(&mut ticking.send, id, refusal);
         }
-        self.commit(id, &attempt)?;
+        self.commit(id, &attempt, worst, head.time)?;
         match self.broadcast(&attempt, (net, l1), None, head).await {
             Err(e) => match e.downcast::<Refused>() {
                 Ok(refused) => self.strike(&mut ticking.send, id, refused.0),
@@ -831,9 +804,12 @@ impl<P: Provider> Relayer<P> {
             Err(e) if e.is::<Unreadable>() => e,
             Err(e) => return Err(e),
         };
-        let sql = "SELECT max(nonce) FROM attempts WHERE id = ?1";
-        let nonce: Option<u64> = self.db().query_row(sql, [&id[..]], first)?;
-        let landed = nonce.is_some_and(|nonce| mined > nonce);
+        let sql = "SELECT nonce FROM identities WHERE id = ?1";
+        let nonce = self.db().query_row(sql, [&id[..]], first::<Option<u64>>);
+        let landed = nonce
+            .optional()?
+            .flatten()
+            .is_some_and(|nonce| mined > nonce);
         if strikes.strike(id) < self.config.node_error_ticks || !landed {
             return Err(e);
         }
@@ -842,19 +818,17 @@ impl<P: Provider> Relayer<P> {
         self.charge_worst(id, &e).map(|()| None)
     }
 
-    /// Charge `id` with no refund at its attempts' stored worst; with no receipt
-    /// recorded, it fails as `Node`.
+    /// Charge `id` with no refund at its stored worst; with no receipt recorded, it
+    /// fails as `Node`.
     fn charge_worst(&self, id: B256, e: &Error) -> Result<(), Error> {
-        let sql = "SELECT worst FROM attempts WHERE id = ?1";
-        let worst = rows(&self.db(), sql, [&id[..]], |r| u256(r, 0))?;
-        let worst = worst.into_iter().max().unwrap_or_default();
         let unread = Refusal::Node(format!("its receipt does not parse: {e}"));
         let (failure, detail) = encode_failure(&unread);
         self.db().execute(
-            "UPDATE requests SET loss = ?2, status = iif(block IS NULL, 'failed', status), \
-             failure = iif(block IS NULL, ?3, failure), detail = iif(block IS NULL, ?4, \
-             detail), included_at = coalesce(included_at, unixepoch()) WHERE id = ?1",
-            params![&id[..], worst.to_be_bytes::<32>(), failure, detail],
+            "UPDATE identities SET loss = worst, at = unixepoch(), \
+             status = iif(block IS NULL, 'failed', status), \
+             failure = iif(block IS NULL, ?2, failure), \
+             detail = iif(block IS NULL, ?3, detail) WHERE id = ?1",
+            params![&id[..], failure, detail],
         )?;
         Ok(())
     }
@@ -865,14 +839,18 @@ impl<P: Provider> Relayer<P> {
         Ok(true)
     }
 
-    /// A 0-value self-send at `last`'s nonce. The last cancel is sent again while the
-    /// pinned base fee is at most its cap; past it, a new one is signed with its cap
-    /// twice the base fee up to the max cancel fee, and its tip the market's; both at
-    /// least 1.1× `last`'s.
-    async fn cancel(&self, id: B256, last: &Attempt, head: &Head) -> Result<(), Error> {
+    /// A 0-value self-send at `last`'s nonce, its worst at the L1 bound `l1`. The last
+    /// cancel is sent again while the pinned base fee is at most its cap; past it, a new
+    /// one is signed with its cap twice the base fee up to the max cancel fee, and its
+    /// tip the market's; both at least 1.1× `last`'s.
+    async fn cancel(
+        &self,
+        id: B256,
+        last: &Attempt,
+        l1: U256,
+        head: &Head,
+    ) -> Result<(), Error> {
         let tx = TxEnvelope::decode_2718(&mut &last.raw[..])?;
-        // The L1 bound `last` was sent with.
-        let l1 = last.worst.saturating_sub(most(&tx, U256::ZERO));
         if last.cancel && head.base_fee <= tx.max_fee_per_gas() {
             let again = self.broadcast(last, Default::default(), None, head);
             return again.await.map(drop);
@@ -896,8 +874,9 @@ impl<P: Provider> Relayer<P> {
             .max_fee_per_gas(cap)
             .max_priority_fee_per_gas(tip.min(cap))
             .with_chain_id(self.config.chain_id);
-        let attempt = self.sign(cancel, true, head, l1).await?;
-        self.commit(id, &attempt)?;
+        let attempt = self.sign(cancel, true).await?;
+        let worst = most(&TxEnvelope::decode_2718(&mut &attempt.raw[..])?, l1);
+        self.commit(id, &attempt, worst, head.time)?;
         self.broadcast(&attempt, Default::default(), None, head)
             .await
             .map(drop)
@@ -908,26 +887,10 @@ impl<P: Provider> Relayer<P> {
         at + self.config.inclusion_window.as_secs()
     }
 
-    /// `tx` signed at `head`, sent with the L1 bound `l1`.
-    async fn sign(
-        &self,
-        tx: TransactionRequest,
-        cancel: bool,
-        head: &Head,
-        l1: U256,
-    ) -> Result<Attempt, Error> {
-        let nonce = tx.nonce.unwrap_or_default();
+    /// `tx` signed, a cancel when `cancel`.
+    async fn sign(&self, tx: TransactionRequest, cancel: bool) -> Result<Attempt, Error> {
         let signed = self.provider.fill_and_sign_transaction(tx).await?;
-        let (hash, raw) = (*signed.tx_hash(), signed.encoded_2718().into());
-        Ok(Attempt {
-            hash,
-            nonce,
-            cancel,
-            raw,
-            block: head.number,
-            at: head.time,
-            worst: most(&signed, l1),
-        })
+        Attempt::read(signed.encoded_2718().into(), cancel)
     }
 
     /// `raw`, as it is sent but at any nonce, still runs at `head` and at `late`.
@@ -1002,46 +965,49 @@ impl<P: Provider> Relayer<P> {
         Err(Box::new(Refused(refusal(e))))
     }
 
-    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, queue it again.
+    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, queue its row
+    /// again.
     fn uncommit(&self, a: &Attempt) -> Result<(), Error> {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "UPDATE requests SET status = 'queued' \
-             WHERE id = (SELECT id FROM attempts WHERE hash = ?1)",
+            "UPDATE identities SET status = 'queued', nonce = NULL, send = NULL, \
+             hashes = NULL, signed_at = NULL, worst = NULL WHERE hashes = ?1",
             [&a.hash[..]],
         )?;
-        tx.execute("DELETE FROM attempts WHERE hash = ?1", [&a.hash[..]])?;
         tx.execute("UPDATE nonce SET next = ?1 WHERE next = ?1 + 1", [a.nonce])?;
         Ok(tx.commit()?)
     }
 
-    /// Store `a` and the next nonce past it, and mark `id` sent, in one transaction.
-    fn commit(&self, id: B256, a: &Attempt) -> Result<(), Error> {
+    /// Store `a`, signed at a block of time `at`, with the row's worst raised to
+    /// `worst`, and the next nonce past it, in one transaction; a send marks `id` sent.
+    fn commit(&self, id: B256, a: &Attempt, worst: U256, at: u64) -> Result<(), Error> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        tx.execute(
-            "INSERT INTO attempts (hash, id, nonce, cancel, raw, block, at, worst) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                &a.hash[..],
-                &id[..],
-                a.nonce,
-                a.cancel,
-                &a.raw[..],
-                a.block,
-                a.at,
-                a.worst.to_be_bytes::<32>()
-            ],
-        )?;
+        let (raw, worst) = (&a.raw[..], worst.to_be_bytes::<32>());
+        if a.cancel {
+            let sql = "SELECT hashes FROM identities WHERE id = ?1";
+            let mut hashes: Vec<u8> = tx.query_row(sql, [&id[..]], first)?;
+            hashes.extend_from_slice(&a.hash[..]);
+            tx.execute(
+                "UPDATE identities SET cancel = ?2, hashes = ?3, worst = max(worst, ?4) \
+                 WHERE id = ?1",
+                params![&id[..], raw, hashes, worst],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE identities SET status = 'sent', at = unixepoch(), nonce = ?2, \
+                 send = ?3, cancel = NULL, hashes = ?4, signed_at = ?5, worst = ?6 \
+                 WHERE id = ?1",
+                params![&id[..], a.nonce, raw, &a.hash[..], at, worst],
+            )?;
+        }
         tx.execute("UPDATE nonce SET next = max(next, ?1)", [a.nonce + 1])?;
-        tx.execute(
-            "UPDATE requests SET status = 'sent' WHERE id = ?1",
-            [&id[..]],
-        )?;
         Ok(tx.commit()?)
     }
 
+    /// Move `id` to `status`, with a receipt and its loss, or a failure; the row's time
+    /// when the status changes.
     fn set_status(
         &self,
         id: B256,
@@ -1053,17 +1019,12 @@ impl<P: Provider> Relayer<P> {
         let block = receipt.map(|r| r.block_number.unwrap_or_default());
         let hash = receipt.and_then(|r| r.block_hash.map(|h| h.0));
         let (failure, detail) = failed.map(encode_failure).unzip();
-        let l1 = receipt.map(l1_fee).transpose()?;
-        let wei = |r: &AnyTransactionReceipt| U256::from(r.effective_gas_price);
-        let (gas, price) = (receipt.map(|r| r.gas_used), receipt.map(wei));
         let reverted = receipt.map(|r| !r.status());
-        let words = |w: Option<U256>| w.map(|w| w.to_be_bytes::<32>());
-        let (price, l1, loss) = (words(price), words(l1), words(loss.flatten()));
+        let loss = loss.flatten().map(|w| w.to_be_bytes::<32>());
         self.db().execute(
-            "UPDATE requests SET status = ?2, block = ?3, reverted = ?4, failure = ?5, \
-             detail = ?6, gas_used = ?7, gas_price = ?8, l1_fee = ?9, loss = ?10, \
-             block_hash = ?11, included_at = CASE WHEN ?3 IS NULL THEN NULL \
-             ELSE coalesce(included_at, unixepoch()) END WHERE id = ?1",
+            "UPDATE identities SET at = iif(status = ?2, at, unixepoch()), status = ?2, \
+             block = ?3, reverted = ?4, failure = ?5, detail = ?6, loss = ?7, \
+             block_hash = ?8 WHERE id = ?1",
             params![
                 &id[..],
                 status,
@@ -1071,9 +1032,6 @@ impl<P: Provider> Relayer<P> {
                 reverted,
                 failure,
                 detail,
-                gas,
-                price,
-                l1,
                 loss,
                 hash
             ],
@@ -1081,28 +1039,54 @@ impl<P: Provider> Relayer<P> {
         Ok(())
     }
 
-    fn attempts(&self, id: B256) -> Result<Vec<Attempt>, Error> {
-        let sql =
-            "SELECT hash, nonce, cancel, raw, block, at, worst FROM attempts WHERE id = ?1 \
-                   ORDER BY rowid";
-        rows(&self.db(), sql, [&id[..]], |r| {
-            let (hash, nonce, cancel) = (b256(r, 0)?, r.get(1)?, r.get(2)?);
-            let raw = r.get::<_, Vec<u8>>(3)?.into();
-            Ok(Attempt {
-                hash,
-                nonce,
-                cancel,
-                raw,
-                block: r.get(4)?,
-                at: r.get(5)?,
-                worst: u256(r, 6)?,
+    /// `id`'s signed transactions, once sent.
+    fn sent(&self, id: B256) -> Result<Option<Sent>, Error> {
+        let sql = "SELECT nonce, hashes, send, cancel, signed_at FROM identities \
+                   WHERE id = ?1 AND send IS NOT NULL";
+        let row = |r: &Row| {
+            let hashes = r.get::<_, Vec<u8>>(1)?;
+            Ok(Sent {
+                nonce: r.get(0)?,
+                hashes: hashes.chunks(32).map(B256::from_slice).collect(),
+                send: r.get::<_, Vec<u8>>(2)?.into(),
+                cancel: r.get::<_, Option<Vec<u8>>>(3)?.map(Into::into),
+                signed_at: r.get(4)?,
             })
-        })
+        };
+        Ok(self.db().query_row(sql, [&id[..]], row).optional()?)
     }
 
     fn db(&self) -> MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// What the rows lost over the last `window`: each charged loss by when it was
+/// charged, and each send not yet charged at its worst.
+pub(crate) fn lost(db: &Connection, window: Duration) -> Result<U256, Error> {
+    let sql = "SELECT coalesce(loss, worst) FROM identities \
+               WHERE worst IS NOT NULL AND (loss IS NULL OR at > unixepoch() - ?1)";
+    let losses = rows(db, sql, [window.as_secs()], |r| u256(r, 0))?;
+    Ok(losses.into_iter().fold(U256::ZERO, U256::saturating_add))
+}
+
+/// The rows by status, an included one whose batch reverted as `reverted`; the
+/// identities a loss holds for `hold`; and the included rows whose loss is not yet
+/// charged.
+pub(crate) fn counts(
+    db: &Connection,
+    hold: Duration,
+) -> Result<(BTreeMap<String, u64>, u64, u64), Error> {
+    let sql = "SELECT CASE WHEN reverted THEN 'reverted' ELSE status END, count(*) \
+               FROM identities GROUP BY 1";
+    let statuses = rows(db, sql, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let sql = "SELECT count(*) FROM identities \
+               WHERE loss != zeroblob(32) AND at > unixepoch() - ?1";
+    let held = db.query_row(sql, [hold.as_secs()], first)?;
+    let sql =
+        "SELECT count(*) FROM identities WHERE status = 'included' AND loss IS NULL";
+    let pending = db.query_row(sql, [], first)?;
+    Ok((statuses.into_iter().collect(), held, pending))
 }
 
 /// A request's id: its chain, target, calldata and value.
@@ -1113,25 +1097,24 @@ fn request_id(chain_id: u64, call: &TransactionRequest, value: U256) -> B256 {
 }
 
 /// `mined` lies between the lowest nonce in flight and the next nonce, and each nonce
-/// in flight below it has a receipt for one of its attempts.
+/// in flight below it has a receipt for one of its transactions.
 async fn explained<P: Provider>(
     provider: &P,
     db: &Connection,
     mined: u64,
     next: u64,
 ) -> Result<(), Error> {
-    let sql = format!(
-        "SELECT a.nonce, a.hash FROM attempts a JOIN requests r ON a.id = r.id \
-         WHERE {IN_FLIGHT}"
-    );
+    let sql = format!("SELECT nonce, hashes FROM identities WHERE {IN_FLIGHT}");
     let in_flight = rows(db, &sql, [mined], |r| {
-        Ok((r.get::<_, u64>(0)?, b256(r, 1)?))
+        Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
     let below = in_flight.iter().filter(|a| a.0 < mined);
     let mut unexplained: BTreeSet<_> = below.clone().map(|a| a.0).collect();
-    for (nonce, hash) in below {
-        if provider.get_transaction_receipt(*hash).await?.is_some() {
-            unexplained.remove(nonce);
+    for (nonce, hashes) in below {
+        for hash in hashes.chunks(32).map(B256::from_slice) {
+            if provider.get_transaction_receipt(hash).await?.is_some() {
+                unexplained.remove(nonce);
+            }
         }
     }
     let lowest = in_flight.iter().map(|a| a.0).min().unwrap_or(next);
@@ -1144,25 +1127,53 @@ async fn explained<P: Provider>(
     Ok(())
 }
 
-/// `id` and its status when it is stored and has not failed; `WalletBusy` while
-/// another batch of `wallet` is queued, sent, or included with its loss not yet charged.
+/// `id` and its status when it is stored and has not failed.
+#[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
+fn stored(db: &Connection, id: B256) -> Result<Option<(B256, String)>, Refusal> {
+    let status = "SELECT status FROM identities WHERE id = ?1";
+    let status = db.query_row(status, [&id[..]], first::<String>).optional();
+    let status = status.map_err(node)?.filter(|s| s != "failed");
+    Ok(status.map(|status| (id, status)))
+}
+
+/// [`stored`], or room for `id` in `identity`'s row: none, a failed one, or one whose
+/// loss is older than `hold`. `IdentityBusy` while another request of the identity is
+/// queued, sent, or paid and not yet dropped; `IdentityHeld` while a loss holds it.
 #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
 fn admit(
     db: &Connection,
     id: B256,
-    wallet: Address,
+    (platform, id_node): Identity,
+    hold: Duration,
 ) -> Result<Option<(B256, String)>, Refusal> {
-    let status = "SELECT status FROM requests WHERE id = ?1";
-    let status = db.query_row(status, [&id[..]], first::<String>).optional();
-    if let Some(status) = status.map_err(node)?.filter(|s| s != "failed") {
-        return Ok(Some((id, status)));
+    if let Some(stored) = stored(db, id)? {
+        return Ok(Some(stored));
     }
-    let busy = "SELECT id FROM requests WHERE wallet = ?1 \
-         AND (status IN ('queued', 'sent') OR (status = 'included' AND loss IS NULL))";
-    let busy = db.query_row(busy, [&wallet[..]], |r| b256(r, 0));
-    match busy.optional().map_err(node)? {
-        Some(id) => Err(Refusal::WalletBusy { id }),
+    let sql = "SELECT id, status, loss, at, unixepoch() FROM identities \
+               WHERE platform = ?1 AND id_node = ?2";
+    let row = |r: &Row| {
+        let loss = r.get::<_, Option<Vec<u8>>>(2)?;
+        Ok((
+            b256(r, 0)?,
+            r.get::<_, String>(1)?,
+            loss.map(|w| U256::from_be_slice(&w)),
+            r.get::<_, u64>(3)?,
+            r.get::<_, u64>(4)?,
+        ))
+    };
+    let found = db.query_row(sql, [&platform[..], &id_node[..]], row);
+    let until = |at: u64| at + hold.as_secs();
+    match found.optional().map_err(node)? {
         None => Ok(None),
+        Some((_, status, None, ..)) if status == "failed" => Ok(None),
+        Some((id, _, None, ..)) => Err(Refusal::IdentityBusy { id }),
+        Some((id, _, Some(loss), ..)) if loss.is_zero() => {
+            Err(Refusal::IdentityBusy { id })
+        }
+        Some((.., at, now)) if now < until(at) => {
+            Err(Refusal::IdentityHeld { until: until(at) })
+        }
+        Some(_) => Ok(None),
     }
 }
 

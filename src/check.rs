@@ -58,6 +58,9 @@ pub struct Create {
     pub salt: U256,
 }
 
+/// A wallet's genesis identity, `(platformId, idNode)`: what a loss is charged to.
+pub type Identity = (B256, B256);
+
 /// A signed batch to relay. Its `value` is the one `data` carries.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +85,8 @@ pub struct Checked {
     pub(crate) net: U256,
     /// The L1 fee bound with its margin, which the refund covers.
     pub(crate) l1_fee_bound: U256,
+    /// The wallet's genesis identity.
+    pub(crate) identity: Identity,
 }
 
 /// Why a request is not sent.
@@ -142,13 +147,16 @@ pub enum Refusal {
         /// The send's worst cost plus its value.
         required: U256,
     },
-    /// Another batch of the wallet is in flight.
-    WalletBusy {
+    /// Another batch of the wallet's genesis identity is in flight.
+    IdentityBusy {
         /// The request in flight.
         id: B256,
     },
-    /// The wallet lost its loss budget.
-    RateLimited,
+    /// A batch of the wallet's genesis identity cost the relayer a loss.
+    IdentityHeld {
+        /// When the identity is served again, in unix seconds.
+        until: u64,
+    },
     /// Sending paused, for any reason `Relayer::paused` names.
     Paused,
     /// The node could not answer.
@@ -171,8 +179,8 @@ impl Refusal {
             Self::Expired => "Expired",
             Self::Reverted { .. } => "Reverted",
             Self::RelayerUnderfunded { .. } => "RelayerUnderfunded",
-            Self::WalletBusy { .. } => "WalletBusy",
-            Self::RateLimited => "RateLimited",
+            Self::IdentityBusy { .. } => "IdentityBusy",
+            Self::IdentityHeld { .. } => "IdentityHeld",
             Self::Paused => "Paused",
             Self::Node(_) => "Node",
         }
@@ -200,7 +208,7 @@ impl Request {
         let late =
             unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
         let call = target(provider, config, wallet, create, &self.data, message.value);
-        let call = call.await?;
+        let (call, identity) = call.await?;
         let head = gas::head(provider, config).await?;
         let priced = gas::price(provider, config, &call, self.gas_limit, head.floor);
         let (l1_fee_bound, cost) = priced.await?;
@@ -241,6 +249,7 @@ impl Request {
             tx,
             net,
             l1_fee_bound,
+            identity,
         })
     }
 }
@@ -337,7 +346,8 @@ fn covered(deadline: u64, late: u64) -> Result<u64, Refusal> {
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, when the contracts
-/// vouch for the wallet on a supported release.
+/// vouch for the wallet on a supported release, and the wallet's genesis identity:
+/// `create`'s, or read from a vouched wallet.
 pub(crate) async fn target<P: Provider>(
     provider: &P,
     config: &Config,
@@ -345,7 +355,7 @@ pub(crate) async fn target<P: Provider>(
     create: Option<Create>,
     data: &Bytes,
     value: U256,
-) -> Result<TransactionRequest, Refusal> {
+) -> Result<(TransactionRequest, Identity), Refusal> {
     if let Some(c) = create {
         let factory = WalletFactory::new(config.factory, provider);
         let address = factory.walletAddress(c.platform_id, c.id_node, c.salt);
@@ -354,7 +364,15 @@ pub(crate) async fn target<P: Provider>(
         }
     }
     vouched(provider, config, wallet, create.is_some()).await?;
-    Ok(outer(config, wallet, create, data, value))
+    let identity = match create {
+        Some(c) => (c.platform_id, c.id_node),
+        None => {
+            let wallet = IWebWallet::new(wallet, provider);
+            let genesis = wallet.genesisIdentity().call().await.map_err(node)?;
+            (genesis.platformId, genesis.idNode)
+        }
+    };
+    Ok((outer(config, wallet, create, data, value), identity))
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, unchecked.

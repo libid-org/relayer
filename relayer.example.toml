@@ -53,7 +53,8 @@ max_cancel_fee_percent = 1000
 fee_params = "header"
 
 [state]
-# The SQLite ledger, locked by one relayer at a time at `<db>.lock`.
+# The SQLite ledger, one row per genesis identity, locked by one relayer at a time
+# at `<db>.lock`.
 db = "relayer.db"
 # Optional, "30s" by default, above 0: the most a tick and each node request take.
 # A tick past it is dropped and logged; the next resumes its sends.
@@ -69,14 +70,13 @@ request_timeout = "30s"
 concurrency_limit = 64
 
 [limits]
-# What one wallet may cost in unrefunded sends before it is rate limited: at least
-# max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of that
-# much calldata, which start checks: 8M gas at 210% of a 0.1 gwei base fee is
-# 1.68e15 wei.
-wallet_budget = { wei = "2000000000000000", window = "1h" }
-# What all wallets may cost before sending pauses: at least one request's worst
-# loss, which start checks. Each window is above 0.
+# What all identities may lose over `window` before sending pauses: each send counts
+# at its worst, value included, until its receipt, then at its loss. At least one
+# request's worst loss, which start checks: 8M gas at 210% of a 0.1 gwei base fee
+# is 1.68e15 wei. The window is above 0.
 global_budget = { wei = "20000000000000000", window = "1h" }
+# Optional, "24h" by default: how long a loss refuses its identity (`IdentityHeld`).
+loss_hold = "24h"
 # The highest gas limit a request may be priced for: a real-proof onboarding's
 # createAndExecute is priced near 5.6M.
 max_gas_limit = 8000000
@@ -87,7 +87,8 @@ supported_releases = [1]
 # Ticks of node errors on a request before it fails, and of a receipt that does
 # not parse before it is charged at its worst.
 node_error_ticks = 5
-# Blocks a receipt may lag its mined nonce before sending pauses, at least 1.
+# Blocks a receipt may lag its mined nonce before sending pauses, at least 1; a
+# paid request's row is dropped this many blocks after its receipt.
 receipt_lag_blocks = 50
 # The balance below which start refuses and sending pauses.
 min_balance = "50000000000000000"

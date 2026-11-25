@@ -95,7 +95,7 @@ impl Draft {
             &outer(config, wallet, create, &self.data, message.value),
         )?;
         let call = target(provider, config, wallet, create, &self.data, message.value);
-        let call = call.await?;
+        let (call, _) = call.await?;
         // After the latest block: nodes refuse a simulated block that is not.
         let now = gas::latest_time(provider).await?;
         let late = now + config.inclusion_window.as_secs();

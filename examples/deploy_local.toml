@@ -33,7 +33,6 @@ request_timeout = "30s"
 concurrency_limit = 64
 
 [limits]
-wallet_budget = { wei = "1000000000000000000", window = "1h" }
 global_budget = { wei = "10000000000000000000", window = "1h" }
 max_gas_limit = 8000000
 supported_releases = [{release}]

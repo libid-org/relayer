@@ -283,7 +283,8 @@ impl Provider for Racing {
 }
 
 /// One id and one transaction for a request delivered twice, across a restart
-/// too; another batch for the busy wallet is refused; a foreign nonce refuses start.
+/// too; another batch of the busy identity is refused; its paid row is dropped
+/// `receipt_lag_blocks` after its receipt; a foreign nonce refuses start after that.
 #[tokio::test]
 async fn the_same_request_twice_is_one_id_and_one_transaction() {
     let o = Onboarding::new(true).await;
@@ -291,8 +292,9 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     let r = o.start(&db).await.unwrap();
     let id = r.relay(&request).await.unwrap();
     assert_eq!(r.relay(&request).await.unwrap(), id, "a second id");
-    let busy = matches!(o.onboard(&r, 1800).await, Err(Refusal::WalletBusy { .. }));
-    assert!(busy, "another batch for a busy wallet");
+    let busy = o.onboard(&r, 1800).await;
+    let busy = matches!(busy, Err(Refusal::IdentityBusy { id: first }) if first == id);
+    assert!(busy, "another batch for a busy identity");
     let report = o.settle(&r, id, included).await;
     o.assert_within_refund(&report.tx_hashes, U256::ZERO).await;
     drop(r);
@@ -302,6 +304,17 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
     r.tick().await.unwrap();
     assert_eq!(r.status(id).await.unwrap().tx_hashes, report.tx_hashes);
     assert_eq!(o.relayer_nonce().await, 1, "sent twice");
+    let Status::Included { block, .. } = report.status else {
+        panic!()
+    };
+    let head = o.owner.get_block_number().await.unwrap();
+    let lag = block + o.config().receipt_lag_blocks - head;
+    o.owner.anvil_mine(Some(lag - 1), None).await.unwrap();
+    r.tick().await.unwrap();
+    assert!(r.status(id).await.is_ok(), "dropped before its lag");
+    o.owner.anvil_mine(Some(1), None).await.unwrap();
+    r.tick().await.unwrap();
+    assert!(r.status(id).await.is_err(), "kept past its lag");
     drop(r);
     o.foreign().await;
     let refused = o.restart(&db).await.err().unwrap();
@@ -367,8 +380,9 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
         .unwrap();
 }
 
-/// A send left pending at a restart holds the queue: its stored raw transaction is
-/// sent again, once, and another wallet's batch waits until it lands.
+/// A send left pending at a restart holds the queue: past its inclusion window, its
+/// stored raw transaction is sent again, not cancelled, once, and another identity's
+/// batch waits until it lands.
 #[tokio::test]
 async fn a_send_pending_at_start_lands_once_before_the_next() {
     let (mut o, db) = (Onboarding::new(true).await, db("crash"));
@@ -380,8 +394,11 @@ async fn a_send_pending_at_start_lands_once_before_the_next() {
     o.owner.anvil_drop_transaction(hashes[0]).await.unwrap();
     drop(r);
     let r = o.restart(&db).await.unwrap();
-    o.wallet_at(U256::ONE).await;
+    o.other_identity(1).await;
     let next = o.queue(&r).await;
+    let late = o.now().await + o.config().inclusion_window.as_secs();
+    o.owner.anvil_set_next_block_timestamp(late).await.unwrap();
+    o.owner.evm_mine(None).await.unwrap();
     r.tick().await.unwrap();
     let pending = o.owner.get_transaction_by_hash(hashes[0]).await.unwrap();
     assert!(pending.is_some(), "not sent again");
@@ -392,24 +409,27 @@ async fn a_send_pending_at_start_lands_once_before_the_next() {
     assert!(o.receipt(hashes[0]).await.status(), "reverted");
 }
 
-/// Two wallets' batches that link and bind one identity, queued together: the second
-/// waits until the first lands, then fails its check unsent. The relayer gains the
+/// Two wallets of one identity, at two salts: the second's batch is busy while the
+/// first is queued, and fails its check once the first landed. The relayer gains the
 /// first's refund net of its value and gas, and pays nothing for the second.
 #[tokio::test]
-async fn colliding_batches_are_sent_one_at_a_time() {
+async fn one_identity_is_sent_one_batch_at_a_time() {
     let mut o = Onboarding::new(true).await;
     let r = o.start(&db("collide")).await.unwrap();
     o.owner.anvil_set_auto_mine(false).await.unwrap();
     let first = o.queue(&r).await;
     o.wallet_at(U256::ONE).await;
-    let second = o.queue(&r).await;
+    let second = o.request_for(&o.onboarding()).await;
+    let busy = r.relay(&second).await;
+    let busy = matches!(busy, Err(Refusal::IdentityBusy { id }) if id == first);
+    assert!(busy, "queued beside the first");
     let before = o.owner.get_balance(o.relayer_address).await.unwrap();
-    r.tick().await.unwrap();
-    let held = r.status(second).await.unwrap().status;
-    assert!(matches!(held, Status::Queued), "{held:?}");
     let hash = o.settle(&r, first, included).await.tx_hashes[0];
-    let failed = |s: &Status| matches!(s, Status::Failed(Refusal::Reverted { .. }));
-    assert!(o.settle(&r, second, failed).await.tx_hashes.is_empty());
+    let refused = r.relay(&second).await;
+    assert!(
+        matches!(refused, Err(Refusal::Reverted { .. })),
+        "{refused:?}"
+    );
     let receipt = o.receipt(hash).await;
     let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
     let after = o.owner.get_balance(o.relayer_address).await.unwrap();
@@ -471,10 +491,13 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let again = r.status(id).await.unwrap();
     let kept = cancelled(&again.status) && again.tx_hashes == report.tx_hashes;
     assert!(kept, "queued again: {:?}", again.status);
-    let retry = o.onboard(&r, 1800).await.unwrap();
-    o.settle(&r, retry, included).await;
-    o.assert_onboarded(o.refund()).await;
-    assert_eq!(relayer::stats::stats(&path).unwrap().cancel_rate, 0.5);
+    // The cancel's gas is a loss: the identity is held for `loss_hold`.
+    let retry = o.onboard(&r, 1800).await;
+    assert!(
+        matches!(retry, Err(Refusal::IdentityHeld { .. })),
+        "{retry:?}"
+    );
+    assert_eq!(relayer::stats::stats(&path, &o.config()).unwrap().held, 1);
 }
 
 /// A send the node lost that no longer runs is cancelled at once, inside its window,
@@ -540,7 +563,7 @@ async fn a_foreign_nonce_at_runtime_pauses_sending() {
 
 /// A foreign transaction mined at a stored send's nonce after its window pauses sending
 /// once our receipt is still missing `receipt_lag_blocks` later, with no cancel signed,
-/// and stays paused, another wallet's batch held; the stored send without a receipt
+/// and stays paused, another identity's batch held; the stored send without a receipt
 /// refuses start.
 #[tokio::test]
 async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
@@ -550,7 +573,7 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
     let id = o.onboard(&r, 3600).await.unwrap();
     r.tick().await.unwrap();
     let hash = r.status(id).await.unwrap().tx_hashes[0];
-    o.wallet_at(U256::ONE).await;
+    o.other_identity(1).await;
     let next = o.queue(&r).await;
     o.owner.anvil_drop_transaction(hash).await.unwrap();
     let late = o.now().await + o.config().inclusion_window.as_secs();
@@ -576,7 +599,7 @@ async fn a_foreign_transaction_at_a_stored_nonce_pauses_sending() {
 /// no longer covers fails a send for `value + limit × floor + k × U`; one it covers
 /// sends. A balance below a send's worst cost fails it unpaused, and one of exactly
 /// `gasLimit × maxFeePerGas + k × U + value` sends, within the refund's L1 part, and
-/// less its value is the charge when its receipt does not parse.
+/// is the charge when its receipt does not parse.
 #[tokio::test]
 async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let o = Onboarding::new(true).await;
@@ -634,8 +657,8 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let hashes = r.status(id).await.unwrap().tx_hashes;
     assert_eq!(
         left - r.budget_left().unwrap(),
-        worst - o.value,
-        "not the send's L1 bound"
+        worst,
+        "not the send's worst with its value"
     );
     o.assert_within_refund(&hashes, k_u * U256::from(2)).await;
     let t = o.tx(hashes[0]).await.inner;
@@ -696,7 +719,8 @@ async fn a_max_fee_percent_under_the_window_growth_still_sends() {
     assert!(o.tx(hash).await.inner.max_fee_per_gas() >= floor);
 }
 
-/// A transaction removed by `evm_revert` is sent again, the same raw transaction.
+/// A transaction removed by `evm_revert` is sent again, the same raw transaction, its
+/// paid row kept for it: the identity is busy meanwhile.
 #[tokio::test]
 async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     let o = Onboarding::new(true).await;
@@ -706,18 +730,16 @@ async fn a_transaction_removed_by_evm_revert_is_sent_again() {
     let hashes = o.settle(&r, id, included).await.tx_hashes;
     assert!(o.owner.anvil_revert(snapshot).await.unwrap());
     assert!(!o.mined(hashes[0]).await);
-    // Queued while the node's nonce is below ours; the resent batch then reverts it.
-    let late = o.onboard(&r, 1800).await.unwrap();
+    let late = o.onboard(&r, 1800).await;
+    assert!(
+        matches!(late, Err(Refusal::IdentityBusy { .. })),
+        "{late:?}"
+    );
     o.owner.anvil_set_auto_mine(false).await.unwrap();
-    for _ in 0..50 {
-        r.tick().await.unwrap();
-        o.owner.evm_mine(None).await.unwrap();
-    }
+    let again = o.settle(&r, id, included).await;
     assert!(o.mined(hashes[0]).await, "not sent again");
-    assert_eq!(r.status(id).await.unwrap().tx_hashes, hashes);
-    let late = r.status(late).await.unwrap().status;
-    let reverted = matches!(late, Status::Failed(Refusal::Reverted { .. }));
-    assert!(reverted && !r.paused(), "{late:?}");
+    assert_eq!(again.tx_hashes, hashes);
+    assert!(!r.paused());
 }
 
 /// A queued request whose cap from R falls below the pinned base fee's growth over the
@@ -734,10 +756,10 @@ async fn a_request_priced_out_while_queued_fails_and_the_next_is_sent() {
     let header = latest.unwrap().unwrap().header;
     let base = u128::from(header.base_fee_per_gas.unwrap());
     let refund = o.value + U256::from(GAS_LIMIT) * U256::from(10 * base);
-    o.wallet_at(U256::ONE).await;
+    o.other_identity(1).await;
     let low = o.request_for(&o.batch(o.repay(refund))).await;
     let low = r.relay(&low).await.unwrap();
-    o.wallet_at(U256::from(2)).await;
+    o.other_identity(2).await;
     let next = o.queue(&r).await;
     o.base_fee(100 * base).await;
     let late = header.timestamp + o.config().inclusion_window.as_secs();
@@ -777,11 +799,10 @@ async fn a_request_expired_before_its_send_fails_unsent() {
     );
 }
 
-/// A landed send's receipt cost, its `l1Fee` too, goes on its request row, seen after
-/// it was queued, across a restart before its receipt was read; refunded to the wei
-/// after that fee, it charges no loss.
+/// A landed send whose receipt is read after a restart, refunded to the wei after its
+/// cost and `l1Fee`, charges no loss.
 #[tokio::test]
-async fn a_landed_send_records_its_receipt_cost() {
+async fn a_refunded_send_read_after_a_restart_charges_no_loss() {
     let (o, path) = (Onboarding::new(true).await, db("ledger"));
     let r = o.start(&path).await.unwrap();
     let id = o.onboard(&r, 3600).await.unwrap();
@@ -793,19 +814,15 @@ async fn a_landed_send_records_its_receipt_cost() {
     let r = unlocked(async || start().await.map_err(|e| e.to_string()));
     let r = r.await.unwrap();
     let left = r.budget_left().unwrap();
-    let report = o.settle(&r, id, included).await;
-    assert_eq!(r.budget_left().unwrap(), left, "charged a refunded send");
-    let receipt = o.owner.get_transaction_receipt(report.tx_hashes[0]).await;
-    let receipt = receipt.unwrap().unwrap();
-    let paid = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
-    let cost = report.cost.expect("no cost recorded");
-    assert_eq!(U256::from(cost.gas_used) * cost.gas_price, paid);
-    assert_eq!(cost.l1_fee, U256::ONE, "not the receipt's l1Fee");
-    let profit = U256::from(GAS_BUDGET) - paid - U256::ONE; // the refund less the cost
-    let profit = alloy::primitives::I256::try_from(profit).unwrap();
-    assert_eq!(relayer::stats::stats(&path).unwrap().profit, profit);
-    let (created, sent) = (report.created_at, report.sent_at[0]);
-    assert!(created > 0 && sent >= created && cost.included_at >= sent);
+    o.settle(&r, id, included).await;
+    let stats = relayer::stats::stats(&path, &o.config()).unwrap();
+    assert_eq!(
+        (stats.pending, stats.lost),
+        (0, U256::ZERO),
+        "charged a refunded send"
+    );
+    // In flight it counted at its worst; charged, at its loss.
+    assert!(r.budget_left().unwrap() > left, "not charged at its loss");
 }
 
 /// A balance below `min_balance` pauses sending, even one that covers the send, and
@@ -843,7 +860,7 @@ async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
     let mut o = Onboarding::new(true).await;
     let (r, mode) = o.armable(&db("oversized")).await;
     let id = o.queue(&r).await;
-    o.wallet_at(U256::ONE).await;
+    o.other_identity(1).await;
     let next = o.queue(&r).await;
     mode.store(OVERSIZED, Ordering::Relaxed);
     r.tick().await.unwrap();
@@ -868,7 +885,7 @@ async fn a_first_send_the_node_refuses_for_now_is_tried_again() {
     let mut o = Onboarding::new(true).await;
     let (r, mode) = o.armable(&db("full")).await;
     let id = o.queue(&r).await;
-    o.wallet_at(U256::ONE).await;
+    o.other_identity(1).await;
     let next = o.queue(&r).await;
     mode.store(FULL, Ordering::Relaxed);
     for _ in 1..o.config().node_error_ticks {
@@ -1019,8 +1036,9 @@ async fn a_cancel_is_capped_at_the_max_cancel_fee() {
 }
 
 /// A balance the node cannot serve at a receipt's block leaves its loss pending, in
-/// the budgets at its worst and its wallet busy: charged once read, a dust transfer in its block
-/// still refunded, or as its gas unrefunded `receipt_lag_blocks` later.
+/// the budget at its worst with its value, and another batch of the identity not
+/// accepted: charged once read, a dust transfer in its block still refunded, or as its
+/// gas unrefunded `receipt_lag_blocks` later.
 #[tokio::test]
 async fn a_loss_is_pending_until_its_balances_are_read() {
     for read in [true, false] {
@@ -1028,7 +1046,7 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         let (r, mode) = o.armable(&path).await;
         let left = r.budget_left().unwrap();
         let lost = || left - r.budget_left().unwrap();
-        let pending = || relayer::stats::stats(&path).unwrap().pending;
+        let pending = || relayer::stats::stats(&path, &o.config()).unwrap().pending;
         o.owner.anvil_set_auto_mine(false).await.unwrap();
         let id = o.queue(&r).await;
         r.tick().await.unwrap();
@@ -1043,11 +1061,11 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         r.tick().await.unwrap();
         let t = o.tx(report.tx_hashes[0]).await.inner;
         let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
+        let worst = worst + o.value;
         assert_eq!((pending(), lost()), (1, worst), "pending not at its worst");
         let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
         let again = o.request(o.sign_until(calls, o.value, now, now + 1800));
-        let busy = matches!(r.relay(&again).await, Err(Refusal::WalletBusy { .. }));
-        assert!(busy, "relayed again uncharged");
+        assert!(r.relay(&again).await.is_err(), "relayed again uncharged");
         if read {
             mode.store(0, Ordering::Relaxed);
         } else {
@@ -1063,16 +1081,17 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         }
         r.tick().await.unwrap();
         assert_eq!(pending(), 0, "uncharged");
-        let cost = report.cost.unwrap();
-        let unrefunded = U256::from(cost.gas_used) * cost.gas_price;
+        let receipt = o.receipt(report.tx_hashes[0]).await;
+        let unrefunded =
+            U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
         assert_eq!(lost(), if read { U256::ZERO } else { unrefunded }, "{read}");
     }
 }
 
 /// A receipt the node fails to serve holds the queue uncharged. One that does not parse
 /// of a mined send holds it for `node_error_ticks` ticks, then its request fails as
-/// `Node`, charged at its send's worst cost from the ledger alone, in the budgets and
-/// the stats. A retry of the landed batch is refused and keeps the charge.
+/// `Node`, charged at its send's worst cost and value from the ledger alone, in the
+/// budget and the stats. A retry of the landed batch is refused and keeps the charge.
 #[tokio::test]
 async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("garbled"));
@@ -1093,7 +1112,7 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     mode.store(GARBLED, Ordering::Relaxed);
     let ledger = rusqlite::Connection::open(&path).unwrap();
     ledger
-        .execute("UPDATE attempts SET raw = x'00'", [])
+        .execute("UPDATE identities SET send = x'00'", [])
         .unwrap();
     for _ in 1..o.config().node_error_ticks {
         r.tick().await.expect_err("no parse error");
@@ -1103,10 +1122,10 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let node = matches!(report.status, Status::Failed(Refusal::Node(_)));
     assert!(node, "{:?}", report.status);
     let t = o.tx(hash).await.inner;
-    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + o.value;
     assert_eq!(lost(&r), worst, "not charged at its worst");
-    let profit = relayer::stats::stats(&path).unwrap().profit;
-    assert_eq!(profit, -alloy::primitives::I256::try_from(worst).unwrap());
+    let stats = relayer::stats::stats(&path, &o.config()).unwrap();
+    assert_eq!((stats.lost, stats.held), (worst, 1));
     assert!(
         r.relay(&request).await.is_err(),
         "a landed batch relayed again"
@@ -1152,16 +1171,14 @@ async fn strikes_reset_and_count_apart() {
     ticks(GARBLED, 1).await;
     let report = r.status(id).await.unwrap();
     assert!(matches!(report.status, Status::Sent), "{:?}", report.status);
-    assert_eq!(
-        relayer::stats::stats(&path).unwrap().profit,
-        Default::default()
-    );
+    let stats = relayer::stats::stats(&path, &o.config()).unwrap();
+    assert_eq!(stats.held, 0, "charged");
 }
 
 /// A receipt that does not parse for a send not yet mined holds no charge: the send
 /// stays watched, struck past `node_error_ticks`, and is cancelled when its window ends.
 /// Once its cancel is mined it is charged, and a retry, whose batch never landed, is
-/// queued again with the charge kept.
+/// held with the charge kept.
 #[tokio::test]
 async fn an_unparsed_receipt_of_an_unmined_send_is_watched_and_cancelled() {
     let (o, path) = (Onboarding::new(true).await, db("unmined-garbled"));
@@ -1195,8 +1212,11 @@ async fn an_unparsed_receipt_of_an_unmined_send_is_watched_and_cancelled() {
     );
     let lost = left - r.budget_left().unwrap();
     assert!(lost > U256::ZERO, "uncharged");
-    r.relay(&request).await.unwrap();
-    assert!(matches!(r.status(id).await.unwrap().status, Status::Queued));
+    let retry = r.relay(&request).await;
+    assert!(
+        matches!(retry, Err(Refusal::IdentityHeld { .. })),
+        "{retry:?}"
+    );
     assert_eq!(
         left - r.budget_left().unwrap(),
         lost,
@@ -1220,11 +1240,10 @@ async fn an_unparsed_receipt_of_a_pending_loss_is_charged_after_its_ticks() {
     }
     r.tick().await.unwrap();
     r.tick().await.unwrap();
-    let stats = relayer::stats::stats(&path).unwrap();
+    let stats = relayer::stats::stats(&path, &o.config()).unwrap();
     let t = o.tx(report.tx_hashes[0]).await.inner;
-    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
-    let worst = alloy::primitives::I256::try_from(worst).unwrap();
-    assert_eq!((stats.pending, stats.profit), (0, -worst));
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + o.value;
+    assert_eq!((stats.pending, stats.lost), (0, worst));
     assert!(included(&r.status(id).await.unwrap().status));
 }
 
@@ -1238,8 +1257,8 @@ async fn a_charged_loss_is_not_recomputed() {
     o.settle(&r, id, included).await;
     r.tick().await.unwrap();
     let charged = || {
-        let stats = relayer::stats::stats(&path).unwrap();
-        (stats.pending, stats.profit)
+        let stats = relayer::stats::stats(&path, &o.config()).unwrap();
+        (stats.pending, stats.lost)
     };
     let before = charged();
     assert_eq!(before.0, 0, "no loss charged");

@@ -78,15 +78,20 @@ proof would take each payload format's layout or a second `verify` call.
    both in wei.
 5. Relays it. On `GasLimitTooLow` it quotes and signs once more.
 
-It returns the request `id`, the `wallet`, the `quote`, the claimed `tokens`
-(`native` is the chain's coin), and the refund's parts: `linkFee`, `gasRefund`
-(`minRefund`) and `swapped` (`{token, amountIn, ethOutMin}`). With `client`
+It returns the request `id`, the `wallet`, the genesis session `key`, the
+`quote`, the claimed `tokens` (`native` is the chain's coin), and the refund's
+parts: `linkFee`, `gasRefund` (`minRefund`) and `swapped`
+(`{token, amountIn, ethOutMin}`). With `client`
 and the onboarding, `waitFor` also returns `received`: what the new wallet
 holds of ETH and of each claimed token at the inclusion block, net of the
-swap and the refund.
+swap and the refund. The relayer drops a paid request `receipt_lag_blocks`
+after its receipt: polled later, the id is `UnknownRequest`, and `waitFor`
+with `client` and the onboarding reads the chain instead, settled once the
+wallet has code and `key` is its admin session (at the latest block, with no
+`txHashes`).
 
 A refusal throws `RelayerError` with the HTTP `status` and the relayer's
-`name`, `message` and `args`; `WalletBusy` carries the request in flight as
+`name`, `message` and `args`; `IdentityBusy` carries the request in flight as
 `args.id`. A quote refused as `LinkSessionRefused` means the proof is not
 this wallet's genesis identity. `waitFor` throws on a reverted inclusion, a
 failure or a cancellation.

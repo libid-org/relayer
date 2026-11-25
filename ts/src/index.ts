@@ -16,6 +16,7 @@ import {
   walletRegistryAbi,
   walletSalt,
   walletTransactionData,
+  webWalletAbi,
 } from '@libid/contracts'
 import {
   type Address,
@@ -181,6 +182,8 @@ export async function relayerConfig(relayerUrl: string): Promise<RelayerConfig> 
 export type Onboarded = {
   id: Hex
   wallet: Address
+  /// The genesis session key, admin once the onboarding lands.
+  key: Hex
   quote: Quote
   /// `HandleEscrow.NATIVE`, the chain's coin among `tokens`.
   native: Address
@@ -299,7 +302,7 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
         ? [{ token: swap.route.token, amountIn: swap.amountIn, ethOutMin: swap.minOut }]
         : []
       const parts = { linkFee: fee, gasRefund: quote.minRefund, swapped }
-      return { id, wallet, quote, native: coin, tokens, ...parts }
+      return { id, wallet, key: o.signer.key, quote, native: coin, tokens, ...parts }
     } catch (e) {
       if (retried || !(e instanceof RelayerError) || e.name !== 'GasLimitTooLow') throw e
       ;({ quote, swap } = await priced(swap))
@@ -311,13 +314,17 @@ type WaitOptions = {
   intervalMs?: number
   timeoutMs?: number
   client?: PublicClient
-  onboarded?: Pick<Onboarded, 'wallet' | 'native' | 'tokens'>
+  onboarded?: Pick<Onboarded, 'wallet' | 'key' | 'native' | 'tokens'>
 }
 
 /// `GET /v1/relay/{id}` every `intervalMs` until the request settles. An
 /// inclusion that reverted, a failure and a cancellation throw. With `client`
 /// and an onboarding, also what the new wallet holds of its claimed tokens at
 /// the inclusion block: what it received, net of the swap and the refund.
+/// A request the relayer dropped, past its receipt's lag, is `UnknownRequest`:
+/// with `client` and an onboarding the chain answers instead, settled once the
+/// wallet has code and the genesis key is its admin session, at the latest
+/// block, with no hashes.
 export async function waitFor(
   relayerUrl: string,
   id: Hex,
@@ -325,7 +332,14 @@ export async function waitFor(
 ): Promise<{ txHashes: Hex[]; blockNumber: number; received: Holding[] }> {
   const http = relayerHttp(relayerUrl)
   for (const end = Date.now() + timeoutMs; Date.now() < end; ) {
-    const s = (await http('GET', `/v1/relay/${id}`)) as RelayStatus
+    const s = await (http('GET', `/v1/relay/${id}`) as Promise<RelayStatus>).catch(
+      async (e): Promise<RelayStatus> => {
+        const unknown = e instanceof RelayerError && e.name === 'UnknownRequest'
+        if (!unknown || !client || !onboarded) throw e
+        const at = await landedAt(client, onboarded)
+        return { status: at === undefined ? 'sent' : 'included', txHashes: [], blockNumber: at }
+      },
+    )
     if (s.status === 'included' && !s.reverted) {
       const blockNumber = s.blockNumber as number
       const received =
@@ -339,6 +353,19 @@ export async function waitFor(
     await new Promise((r) => setTimeout(r, intervalMs))
   }
   throw new Error(`request ${id} did not settle in ${timeoutMs} ms`)
+}
+
+/// The latest block once `wallet` has code and `key` is its admin session.
+async function landedAt(
+  client: PublicClient,
+  { wallet, key }: Pick<Onboarded, 'wallet' | 'key'>,
+): Promise<number | undefined> {
+  const blockNumber = await client.getBlockNumber()
+  const code = await client.getCode({ address: wallet, blockNumber })
+  if (!code || code === '0x') return undefined
+  const read = { address: wallet, abi: webWalletAbi, functionName: 'sessionOf' } as const
+  const session = await client.readContract({ ...read, args: [key], blockNumber })
+  return session.admin ? Number(blockNumber) : undefined
 }
 
 /// `wallet`'s balance of ETH (`native`) and of each of `tokens` at `blockNumber`.

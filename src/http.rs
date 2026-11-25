@@ -398,8 +398,8 @@ fn described(refusal: &Refusal) -> (C, Value) {
             "the deadline ends within the inclusion window",
         ),
         Reverted { .. } => (C::BAD_REQUEST, "the batch reverts"),
-        WalletBusy { .. } => (C::CONFLICT, "a batch of the wallet is in flight"),
-        RateLimited => (C::TOO_MANY_REQUESTS, "the wallet's loss budget is spent"),
+        IdentityBusy { .. } => (C::CONFLICT, "a batch of the identity is in flight"),
+        IdentityHeld { .. } => (C::TOO_MANY_REQUESTS, "a loss holds the identity"),
         RelayerUnderfunded { .. } | Paused => (C::SERVICE_UNAVAILABLE, "sending paused"),
         Node(_) => (C::SERVICE_UNAVAILABLE, "the node could not answer"),
     };
@@ -413,7 +413,8 @@ fn described(refusal: &Refusal) -> (C, Value) {
         GasLimitTooHigh { max } | TooLarge { max } => json!({ "max": max }),
         ValueTooHigh { max } => json!({ "max": wei(max) }),
         UnsupportedRelease { version } => json!({ "version": version }),
-        WalletBusy { id } => json!({ "id": id }),
+        IdentityBusy { id } => json!({ "id": id }),
+        IdentityHeld { until } => json!({ "until": until }),
         Reverted { data, .. } => json!({ "data": data }),
         _ => return (status, body),
     };

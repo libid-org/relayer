@@ -115,6 +115,8 @@ struct Onboarding {
     create: Create,
     wallet: Address,
     handle: B256,
+    /// X's verifier version that reports the identity.
+    version: u16,
     /// `HandleEscrow.NATIVE`, the escrowed token.
     native: Address,
     list: Bytes,
@@ -144,22 +146,30 @@ impl Onboarding {
         let stack = deploy_wallet_stack(&owner, &artifacts, anvil.addresses()[0])
             .await
             .unwrap();
-        let fee = U256::from(LINK_FEE);
-        let paid =
-            deploy_stub_platform_verifier(&owner, &artifacts, stack.platform, fee, None);
-        let paid = paid.await.unwrap();
+        let (fee, amount) = (U256::from(LINK_FEE), U256::from(CLAIMED));
         let verifiers = CeremonyProofVerifier::new(stack.proof_verifier, &owner);
-        mined!(verifiers.setVerifier(stack.platform, 2, paid));
-        let (id_node, handle) = (B256::repeat_byte(0xa1), B256::repeat_byte(0xb2));
-        mined!(StubPlatformVerifier::new(paid, &owner).setNodes(id_node, handle));
         let escrow = HandleEscrow::new(stack.escrow, &depositor);
         let native = escrow.NATIVE().call().await.unwrap();
-        if escrowed {
-            let amount = U256::from(CLAIMED);
-            mined!(escrow
-                .deposit(stack.platform, handle, native, amount)
-                .value(amount));
+        // Identity `n`, reported by a paid verifier of its own as X's version `2 + n`.
+        for n in 0..=OTHERS {
+            let paid = deploy_stub_platform_verifier(
+                &owner,
+                &artifacts,
+                stack.platform,
+                fee,
+                None,
+            );
+            let paid = paid.await.unwrap();
+            mined!(verifiers.setVerifier(stack.platform, 2 + u16::from(n), paid));
+            let (id_node, handle) = identity(n);
+            mined!(StubPlatformVerifier::new(paid, &owner).setNodes(id_node, handle));
+            if escrowed {
+                mined!(escrow
+                    .deposit(stack.platform, handle, native, amount)
+                    .value(amount));
+            }
         }
+        let (id_node, handle) = identity(0);
         let registry = WalletRegistry::new(stack.wallet_registry, &owner);
         let value = registry.quote(stack.platform, 2).call().await.unwrap();
         assert!(value > U256::ZERO, "the relayer fronts no value");
@@ -179,12 +189,23 @@ impl Onboarding {
             create,
             wallet: Address::ZERO,
             handle,
+            version: 2,
             native,
             list: Bytes::new(),
             value,
         };
         o.wallet_at(U256::ZERO).await;
         o
+    }
+
+    /// Identity `n`, from 1 to [`OTHERS`], its handle escrowed for as the first's;
+    /// then a fresh K onboarding its wallet at salt 0.
+    async fn other_identity(&mut self, n: u8) {
+        assert!((1..=OTHERS).contains(&n), "no identity {n}");
+        let (id_node, handle) = identity(n);
+        (self.create.id_node, self.handle) = (id_node, handle);
+        self.version = 2 + u16::from(n);
+        self.wallet_at(U256::ZERO).await;
     }
 
     /// A fresh K onboarding the identity's wallet at `salt`.
@@ -225,9 +246,10 @@ impl Onboarding {
     /// Link, bind, claim to the wallet, then `refund`.
     fn batch(&self, refund: Execution) -> Vec<Execution> {
         let (platform, list) = (self.stack.platform, self.list.clone());
+        let version = self.version;
         let link =
-            IWebWallet::linkIdentityCall::new((platform, 2, list.clone(), admin()));
-        let bind = (platform, 2, list, U256::ZERO, Address::ZERO);
+            IWebWallet::linkIdentityCall::new((platform, version, list.clone(), admin()));
+        let bind = (platform, version, list, U256::ZERO, Address::ZERO);
         let bind = IdentityRegistry::bindPrivatelyCall::new(bind);
         let claim =
             HandleEscrow::claimCall::new((self.handle, vec![self.native], self.wallet));
@@ -440,6 +462,17 @@ impl Onboarding {
             expected,
             "the wallet's funds"
         );
+    }
+}
+
+/// The identities beside the first that the fixture sets up.
+const OTHERS: u8 = 2;
+
+/// Identity `n`'s id node and handle node.
+fn identity(n: u8) -> (B256, B256) {
+    match n {
+        0 => (B256::repeat_byte(0xa1), B256::repeat_byte(0xb2)),
+        n => (B256::repeat_byte(0xc0 + n), B256::repeat_byte(0xd0 + n)),
     }
 }
 

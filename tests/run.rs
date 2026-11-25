@@ -58,7 +58,8 @@ fn the_example_loads_with_its_overrides() {
         (7, 9090, 84532)
     );
     assert_eq!(s.config.fee_params, FeeParams::Header);
-    assert_eq!(s.config.wallet_budget.window, Duration::from_secs(3600));
+    assert_eq!(s.config.global_budget.window, Duration::from_secs(3600));
+    assert_eq!(s.config.loss_hold, Duration::from_secs(24 * 3600));
     assert!(s.db.ends_with("relayer.db") && s.db.is_absolute());
     assert_eq!(s.config.max_value, None);
     let unset = load(&EXAMPLE.replace("tick_timeout = \"30s\"", ""), &|_| None);
@@ -91,7 +92,7 @@ fn settings_it_cannot_run_with_are_refused() {
         move |n: &str| (n == name).then(|| value.to_owned())
     };
     #[rustfmt::skip]
-    let rows: [(&str, &str, &str, &str); 16] = [
+    let rows: [(&str, &str, &str, &str); 15] = [
         ("poll_interval = \"1s\"", "poll_interval = \"0s\"", "", "poll_interval"),
         ("concurrency_limit = 64", "concurrency_limit = 0", "", "concurrency_limit"),
         ("request_timeout = \"30s\"", "request_timeout = \"0s\"", "", "request_timeout"),
@@ -106,7 +107,6 @@ fn settings_it_cannot_run_with_are_refused() {
         ("max_gas_limit = 8000000", "max_gas_limit = 16777216", "", ""),
         ("l1_margin_percent = 130", "l1_margin_percent = 99", "", "l1_margin"),
         ("receipt_lag_blocks = 50", "receipt_lag_blocks = 0", "", "receipt_lag_blocks"),
-        ("\"2000000000000000\", window = \"1h\"", "\"2000000000000000\", window = \"0s\"", "", "wallet_budget"),
         ("\"20000000000000000\", window = \"1h\"", "\"20000000000000000\", window = \"0s\"", "", "global_budget"),
     ];
     for (from, to, name, hint) in rows {
@@ -146,7 +146,7 @@ async fn each_startup_check_refuses_with_its_hint() {
     o.set_code(oracle, zero).await;
     let huge = "60043560e61b60005260206000f3";
     let costly = with(&|c| {
-        (c.l1_fee, c.wallet_budget.wei) = (L1Fee::OpStack, U256::MAX >> 10);
+        (c.l1_fee, c.global_budget.wei) = (L1Fee::OpStack, U256::MAX >> 10);
         c.max_gas_limit = 5_000_000; // 1 250 000 zero bytes: an L1 bound over 2^250
     });
     let balance = o.owner.get_balance(o.relayer_address).await.unwrap();
@@ -164,13 +164,12 @@ async fn each_startup_check_refuses_with_its_hint() {
         (ok.clone(), Some((o.stack.factory, "60406000f3")), "published no release"),
         (with(&|c| c.supported_releases = vec![2]), None, "run a relayer that decodes"),
         (with(&|c| c.min_balance = U256::MAX), None, "fund"),
-        (with(&|c| c.wallet_budget.wei = U256::ONE), None, "wallet_budget 1 is below"),
         (with(&|c| c.global_budget.wei = U256::ONE), None, "global_budget 1 is below"),
         // Blocks a second apart below, not the 2 s set.
         (with(&|c| (c.l1_fee, c.block_time) = (L1Fee::OpStack, Duration::from_secs(2))),
          None, "block_time 2s"),
         // 5M gas at a fee bound over 2e5 wei is over 1e12 wei.
-        (with(&|c| (c.max_gas_limit, c.wallet_budget.wei) = (5_000_000, U256::from(10u64.pow(12)))),
+        (with(&|c| (c.max_gas_limit, c.global_budget.wei) = (5_000_000, U256::from(10u64.pow(12)))),
          None, "below one request's worst loss"),
         (costly, Some((oracle, huge)), "the L1 fee bound"),
         (op.clone(), Some((l1_block, one)), "operator fee is on"),
@@ -190,9 +189,9 @@ async fn each_startup_check_refuses_with_its_hint() {
         }
         o.owner.anvil_set_code(at, kept).await.unwrap();
     }
-    // A wallet budget of exactly one request's worst loss passes.
+    // A global budget of exactly one request's worst loss passes.
     let budget =
-        |wei| with(&|c| (c.max_gas_limit, c.wallet_budget.wei) = (5_000_000, wei));
+        |wei| with(&|c| (c.max_gas_limit, c.global_budget.wei) = (5_000_000, wei));
     let e = check(&o.relayer, &budget(U256::ONE), o.relayer_address).await;
     let e = e.unwrap_err().to_string();
     let worst = e.split("worst loss ").nth(1).unwrap();
@@ -259,7 +258,7 @@ async fn run_serves_from_a_file_and_no_output_carries_a_secret() {
             ("max_fee_percent = 210", "max_fee_percent = 181"), ("\"200ms\"", "\"1s\""),
             ("poll_interval = \"1s\"", "poll_interval = \"100ms\""), ("\"10s\"", "\"5s\""),
             ("port = 8080", "port = 0"), ("metrics_port = 9090", "metrics_port = 0"),
-            ("\"2000000000000000\"", "\"1000000000000000000\""),
+            ("\"20000000000000000\"", "\"1000000000000000000\""),
         ];
         let pairs = anvil.iter().chain(extra);
         let replace = |t: String, (a, b): &(&str, &str)| {

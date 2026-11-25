@@ -28,6 +28,9 @@ pub const TICK_TIMEOUT: Duration = Duration::from_secs(30);
 /// The fee-history percentile a send's tip is read at, between 50 and 90.
 pub const TIP_PERCENTILE: f64 = 75.0;
 
+/// How long a loss refuses its identity on a production chain.
+pub const LOSS_HOLD: Duration = Duration::from_secs(24 * 3600);
+
 const UNLIMITED: Budget = Budget {
     wei: U256::MAX,
     window: Duration::from_secs(3600),
@@ -174,11 +177,11 @@ pub struct Config {
     /// node, before sending pauses; and a receipt's loss stays pending for the key's
     /// balances before it is charged as unrefunded.
     pub receipt_lag_blocks: u64,
-    /// The loss budget of each wallet: past it, its requests are `RateLimited`.
-    pub wallet_budget: Budget,
-    /// The loss budget of all wallets: past it, sending pauses and requests are
-    /// `Paused`.
+    /// The loss budget of all identities, each loss at its worst until its receipt:
+    /// past it, sending pauses and requests are `Paused`.
     pub global_budget: Budget,
+    /// How long a loss refuses its identity as `IdentityHeld`.
+    pub loss_hold: Duration,
     /// The most a tick may take: past it, the tick is dropped where it stands.
     pub tick_timeout: Duration,
 }
@@ -188,7 +191,7 @@ impl Config {
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
-    /// budgets or value cap, gas limits up to [`MAX_TX_GAS`], and release 1, the one the
+    /// budget or value cap, a day's hold on a loss, gas limits up to [`MAX_TX_GAS`], and release 1, the one the
     /// contracts' test stack publishes.
     pub fn anvil(chain_id: u64, factory: Address, relayer: Address) -> Self {
         let mut config = Self {
@@ -210,8 +213,8 @@ impl Config {
             min_balance: U256::ZERO,
             node_error_ticks: 5,
             receipt_lag_blocks: 10,
-            wallet_budget: UNLIMITED,
             global_budget: UNLIMITED,
+            loss_hold: LOSS_HOLD,
             tick_timeout: TICK_TIMEOUT,
         };
         let window = config.blocks(config.inclusion_window);
@@ -231,12 +234,8 @@ impl Config {
             let k = self.l1_margin;
             return Err(format!("l1_margin_percent {k} is under 100; raise it"));
         }
-        let budgets = [
-            ("wallet_budget", self.wallet_budget),
-            ("global_budget", self.global_budget),
-        ];
-        if let Some((name, _)) = budgets.iter().find(|(_, b)| b.window.is_zero()) {
-            return Err(format!("{name}'s window is 0; set it above 0"));
+        if self.global_budget.window.is_zero() {
+            return Err("global_budget's window is 0; set it above 0".into());
         }
         if self.receipt_lag_blocks == 0 {
             return Err("receipt_lag_blocks is 0; set it to 1 or more".into());

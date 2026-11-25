@@ -91,7 +91,7 @@ pub async fn run(
 /// The chain `provider` reads is the one `config` names, for the key at `signer`:
 /// the chain id and block time, the signer's address and balance, the factory's code
 /// and the addresses it names, the factory's latest release, its EntryPoint, the loss
-/// budgets against one request's worst loss, and no OP-stack operator fee.
+/// budget against one request's worst loss, and no OP-stack operator fee.
 pub async fn check<P: Provider>(
     provider: &P,
     config: &Config,
@@ -169,13 +169,10 @@ pub async fn check<P: Provider>(
     let l1 = l1.await.map_err(refused)?;
     let gas = U256::from(config.max_gas_limit) * U256::from(head.fee_bound(config));
     let worst = gas.saturating_add(l1);
-    let budgets = [
-        ("wallet_budget", config.wallet_budget.wei),
-        ("global_budget", config.global_budget.wei),
-    ];
-    if let Some((name, budget)) = budgets.iter().find(|(_, wei)| *wei < worst) {
+    let budget = config.global_budget.wei;
+    if budget < worst {
         return fail(format!(
-            "[limits] {name} {budget} is below one request's worst loss {worst}, \
+            "[limits] global_budget {budget} is below one request's worst loss {worst}, \
              max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of \
              that much calldata: raise it"
         ));
