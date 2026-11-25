@@ -49,6 +49,10 @@ async fn main() -> Result<(), Error> {
     let provider = ProviderBuilder::new()
         .wallet(deployer)
         .connect_http(rpc_url.parse()?);
+    // Receipts every 100 ms: alloy polls a host it does not take for local every 7 s.
+    provider
+        .client()
+        .set_poll_interval(std::time::Duration::from_millis(100));
     if out.exists() {
         let factory = Settings::load(&out, |_| None)?.config.factory;
         if !provider.get_code_at(factory).await?.is_empty() {

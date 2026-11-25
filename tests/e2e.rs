@@ -70,6 +70,9 @@ async fn an_onboarding_lands_through_the_stack() {
     let (factory, registry, relayer) =
         (address("factory"), address("registry"), address("relayer"));
     let chain = ProviderBuilder::new().connect_http(ANVIL.parse().unwrap());
+    chain
+        .client()
+        .set_poll_interval(std::time::Duration::from_millis(100));
     let chain_id = chain.get_chain_id().await.unwrap();
     let anyone = chain.get_accounts().await.unwrap()[2];
 

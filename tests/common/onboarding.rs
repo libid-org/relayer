@@ -134,10 +134,14 @@ impl Onboarding {
         let anvil = anvil.spawn();
         let connect = |i: usize| {
             let key = PrivateKeySigner::from(anvil.keys()[i].clone());
-            ProviderBuilder::new()
+            let provider = ProviderBuilder::new()
                 .wallet(key)
-                .connect_http(anvil.endpoint_url())
-                .erased()
+                .connect_http(anvil.endpoint_url());
+            // Receipts every 10 ms, not alloy's 250 ms for a local node.
+            provider
+                .client()
+                .set_poll_interval(std::time::Duration::from_millis(10));
+            provider.erased()
         };
         let (owner, relayer, depositor) = (connect(0), connect(1), connect(2));
         let relayer_address = anvil.addresses()[1];
