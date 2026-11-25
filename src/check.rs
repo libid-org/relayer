@@ -220,10 +220,13 @@ impl Request {
         let unchecked = outer(config, wallet, create, &self.data, value);
         gas::under_max_size(config, &unchecked)?;
         let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
+        let call = target(provider, config, wallet, create, &self.data, value);
+        let identity = genesis(provider, wallet, create);
+        let target = async { Ok((call.await?, identity.await?)) };
         // Only the target refuses for the request; the rest fail as the node.
         let (header, (call, identity), tip, l1_fee_bound) = tokio::try_join!(
             gas::latest(provider),
-            target(provider, config, wallet, create, &self.data, value),
+            target,
             gas::tip(provider, config.tip_percentile),
             gas::l1_fee_bound(
                 provider,
@@ -362,8 +365,7 @@ fn covered(deadline: u64, late: u64) -> Result<u64, Refusal> {
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, when the contracts
-/// vouch for the wallet on a supported release, and the wallet's genesis identity:
-/// `create`'s, or read from a vouched wallet.
+/// vouch for the wallet on a supported release.
 pub(crate) async fn target<P: Provider>(
     provider: &P,
     config: &Config,
@@ -371,7 +373,7 @@ pub(crate) async fn target<P: Provider>(
     create: Option<Create>,
     data: &Bytes,
     value: U256,
-) -> Result<(TransactionRequest, Identity), Refusal> {
+) -> Result<TransactionRequest, Refusal> {
     if let Some(c) = create {
         let factory = WalletFactory::new(config.factory, provider);
         let address = factory.walletAddress(c.platform_id, c.id_node, c.salt);
@@ -380,15 +382,22 @@ pub(crate) async fn target<P: Provider>(
         }
     }
     vouched(provider, config, wallet, create.is_some()).await?;
-    let identity = match create {
-        Some(c) => (c.platform_id, c.id_node),
-        None => {
-            let wallet = IWebWallet::new(wallet, provider);
-            let genesis = wallet.genesisIdentity().call().await.map_err(node)?;
-            (genesis.platformId, genesis.idNode)
-        }
-    };
-    Ok((outer(config, wallet, create, data, value), identity))
+    Ok(outer(config, wallet, create, data, value))
+}
+
+/// The genesis identity of a wallet [`target`] vouched for: `create`'s, or read from
+/// the wallet.
+async fn genesis<P: Provider>(
+    provider: &P,
+    wallet: Address,
+    create: Option<Create>,
+) -> Result<Identity, Refusal> {
+    if let Some(c) = create {
+        return Ok((c.platform_id, c.id_node));
+    }
+    let wallet = IWebWallet::new(wallet, provider);
+    let genesis = wallet.genesisIdentity().call().await.map_err(node)?;
+    Ok((genesis.platformId, genesis.idNode))
 }
 
 /// The relayer's call of `wallet`'s batch `data` with `value`, unchecked.

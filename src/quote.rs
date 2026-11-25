@@ -109,7 +109,7 @@ impl Draft {
             &outer(config, wallet, create, &self.data, message.value),
         )?;
         // Only the target refuses for the draft; the rest fail as the node.
-        let ((call, _), header, tip) = tokio::try_join!(
+        let (call, header, tip) = tokio::try_join!(
             target(provider, config, wallet, create, &self.data, message.value),
             gas::latest(provider),
             gas::tip(provider, config.tip_percentile),

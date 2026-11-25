@@ -417,8 +417,8 @@ impl<P: Provider> Relayer<P> {
     /// tick finds it funded, an OP-stack operator fee until a tick finds it off, and a
     /// spent global loss budget until its window passes.
     async fn step(&self) -> Result<(), Error> {
-        let started = tokio::time::Instant::now();
         let mut ticking = self.ticking.lock().await;
+        let started = tokio::time::Instant::now();
         let head = gas::head(&self.provider, &self.config)
             .await
             .map_err(refused)?;
