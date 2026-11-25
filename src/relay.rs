@@ -312,9 +312,9 @@ impl<P: Provider> Relayer<P> {
         self.submit(request).await.map(|(id, _)| id)
     }
 
-    /// Check `request` and queue it under its id, within the loss budgets: its id and
-    /// status. The same request again returns its id and stored status unchecked; one
-    /// that failed is queued again under it.
+    /// Check `request` and queue it under its id, within the wallet's loss budget and
+    /// while sending is not paused: its id and status. The same request again returns
+    /// its id and stored status unchecked; one that failed is queued again under it.
     pub(crate) async fn submit(
         &self,
         request: &Request,
@@ -332,7 +332,7 @@ impl<P: Provider> Relayer<P> {
         if lost.get(&wallet).is_some_and(|lost| *lost >= budget.wei) {
             return Err(Refusal::RateLimited);
         }
-        if self.budget_left().map_err(node)?.is_zero() {
+        if self.budget_left().map_err(node)?.is_zero() || self.paused() {
             return Err(Refusal::Paused);
         }
         let checked = request.check(p, c).await?;

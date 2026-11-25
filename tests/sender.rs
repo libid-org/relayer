@@ -510,15 +510,19 @@ async fn the_original_landing_before_its_cancel_resolves_from_its_receipt() {
     assert!(!r.paused(), "an alarm on our own receipt");
 }
 
-/// A foreign nonce pauses sending, and our stored nonce under it refuses start.
+/// A foreign nonce pauses sending, and requests are refused `Paused`; our stored nonce
+/// under it refuses start.
 #[tokio::test]
 async fn a_foreign_nonce_at_runtime_pauses_sending() {
-    let (o, db) = (Onboarding::new(true).await, db("pause"));
+    let (mut o, db) = (Onboarding::new(true).await, db("pause"));
     let r = o.start(&db).await.unwrap();
     o.foreign().await;
     o.onboard(&r, 3600).await.unwrap();
     let _ = r.tick().await;
     assert!(r.paused(), "no pause on a foreign nonce");
+    o.wallet_at(U256::ONE).await;
+    let refused = o.onboard(&r, 3600).await;
+    assert!(matches!(refused, Err(Refusal::Paused)), "{refused:?}");
     let _ = r.tick().await;
     assert_eq!(o.relayer_nonce().await, 1, "sent while paused");
     drop(r);

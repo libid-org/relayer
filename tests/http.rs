@@ -281,26 +281,36 @@ async fn an_onboarding_relayed_over_http_lands_and_is_counted() {
 }
 
 /// Refusals carry their names: the relayer's own with their fields, and a revert
-/// decoded on the wallet route; a wallet with a batch queued is busy.
+/// decoded on the wallet route; a wallet with a batch queued is busy; a low balance
+/// is a heartbeat and pauses relays.
 #[tokio::test]
 async fn refusals_carry_their_decoded_names() {
     let o = Onboarding::new(false).await;
     let mut underfunded = o.config();
     (underfunded.min_balance, underfunded.max_gas_limit) = (U256::MAX, GAS_LIMIT);
-    let s = Server::start(&o, underfunded, &db("names"), Duration::from_secs(3600)).await;
+    let hour = Duration::from_secs(3600);
+    let low = Server::start(&o, underfunded.clone(), &db("low"), hour).await;
     tokio::time::sleep(Duration::from_millis(600)).await; // no tick before an hour
     assert_eq!(
-        s.call("/health", None).await.0,
+        low.call("/health", None).await.0,
         503,
         "healthy before a tick"
     );
-    s.service.tick().await; // finds the balance low: a heartbeat all the same
+    low.service.tick().await; // finds the balance low: a heartbeat all the same
     assert_eq!(
-        s.call("/health", None).await.0,
+        low.call("/health", None).await.0,
         200,
         "unhealthy on a low balance"
     );
-    assert_eq!(s.gauge("since_last_tick_seconds").await, 0.0, "since start");
+    assert_eq!(
+        low.gauge("since_last_tick_seconds").await,
+        0.0,
+        "since start"
+    );
+    let (code, paused) = low.relay(&o.request_for(&o.onboarding()).await).await;
+    assert_eq!((code, name(&paused)), (503, "Paused"), "{paused}");
+    // Unticked: the balance not read low.
+    let s = Server::start(&o, underfunded, &db("names"), hour).await;
     let (code, low) = s
         .relay(&o.request_for(&o.batch(o.repay(o.value))).await)
         .await;

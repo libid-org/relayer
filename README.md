@@ -130,6 +130,13 @@ the nonce check.
   file, not on another host.
 - Fund the key. Under `min_balance` the relayer pauses sending and answers
   `503`; watch `libid_relayer_key_balance_wei` and `libid_relayer_paused`.
+- While sending is paused, for any reason, a relay answers `503 Paused`.
+  Sending resumes on its own once the key is funded, the operator fee is off,
+  the global budget's window has passed, or a lagging node serves our missing
+  receipt. Another sender's transaction on the key, pending at our nonce or
+  mined, holds the pause until a restart, and start refuses while the key's
+  nonce is past the ledger's: inspect the key, then start on a fresh `db`,
+  which drops the budgets' history.
 - For a KMS key, set `RELAYER_SIGNER=alias/<name>` and `[key] address` to the
   key's address.
 

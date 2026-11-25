@@ -151,7 +151,7 @@ pub enum Refusal {
     },
     /// The wallet lost its loss budget.
     RateLimited,
-    /// Sending paused: all wallets lost the global loss budget.
+    /// Sending paused, for any reason `Relayer::paused` names.
     Paused,
     /// The node could not answer.
     Node(String),
