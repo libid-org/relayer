@@ -2,12 +2,14 @@
 
 use alloy::{
     eips::BlockId,
+    network::TransactionBuilder,
     primitives::{
         Address,
         Bytes,
         U256,
     },
     providers::Provider,
+    rpc::types::TransactionRequest,
     sol_types::{
         SolError,
         SolValue,
@@ -155,9 +157,8 @@ impl Draft {
         })
     }
 
-    /// 1.25 × the gas of the batch's dearest call: the run of the draft cut after it,
-    /// less the run cut before it and its calldata's gas. Each cut is run in one block
-    /// at `time`. `None` with over [`PREFIXES`] calls, or a cut that does not run to the
+    /// 1.25 × the gas of the batch's [`dearest`] call. Each cut is run in one block at
+    /// `time`. `None` with over [`PREFIXES`] calls, or a cut that does not run to the
     /// dummy signatures.
     async fn call_gas<P: Provider>(
         &self,
@@ -178,7 +179,10 @@ impl Draft {
             let data = message.authorized_data(authorization.clone());
             outer(config, self.wallet, self.create, &data, message.value)
         };
-        let cuts = (0..=executions.len()).map(cut).collect();
+        let cuts: Vec<_> = (0..=executions.len()).map(cut).collect();
+        let input =
+            |c: &TransactionRequest| c.input().map(|i| floor(i)).unwrap_or_default();
+        let floors: Vec<_> = cuts.iter().map(input).collect();
         let runs = gas::simulate_all(provider, cuts, time).await.ok()?;
         let signed = IWebWallet::ExecutionNotSigned::SELECTOR;
         let ran = |r: &alloy::rpc::types::simulate::SimCallResult| {
@@ -187,12 +191,34 @@ impl Draft {
         if runs.len() != executions.len() + 1 || !runs.iter().all(ran) {
             return None;
         }
-        let each = runs.windows(2).zip(executions).map(|(runs, e)| {
-            let used = runs[1].gas_used.saturating_sub(runs[0].gas_used);
-            used.saturating_sub(calldata_gas(&e.abi_encode()))
-        });
-        Some((each.max().unwrap_or_default() * 5).div_ceil(4))
+        let used: Vec<_> = runs.iter().map(|r| r.gas_used).collect();
+        let calls = executions.iter().map(|e| calldata_gas(&e.abi_encode()));
+        Some((dearest(&used, &floors, calls)? * 5).div_ceil(4))
     }
+}
+
+/// The gas of the dearest call: the cut after it `used` less the cut before it and its
+/// calldata gas `calls`. `None` when a cut used at most its EIP-7623 floor in `floors`,
+/// which hides its execution.
+fn dearest(
+    used: &[u64],
+    floors: &[u64],
+    calls: impl Iterator<Item = u64>,
+) -> Option<u64> {
+    if used.iter().zip(floors).any(|(used, floor)| used <= floor) {
+        return None;
+    }
+    let each = used.windows(2).zip(calls);
+    let each =
+        each.map(|(used, call)| used[1].saturating_sub(used[0]).saturating_sub(call));
+    Some(each.max().unwrap_or_default())
+}
+
+/// The EIP-7623 floor of a transaction with `input`: 21000 and 10 a token, a zero byte
+/// one token and any other four.
+fn floor(input: &[u8]) -> u64 {
+    let zeros = input.iter().filter(|&&b| b == 0).count() as u64;
+    21_000 + 10 * (zeros + 4 * (input.len() as u64 - zeros))
 }
 
 /// The calldata gas of `bytes` (EIP-2028).
@@ -233,4 +259,24 @@ fn unmeasured(
         + unchecked.sum::<u64>()
         + rules
         + transfers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cut_at_its_calldata_floor_falls_back_to_the_whole_run() {
+        // 21000, and 40 a nonzero byte, 10 a zero one.
+        assert_eq!(floor(&[1; 100]), 25_000);
+        assert_eq!(floor(&[0; 1000]), 31_000);
+        let calls = || [10, 10].into_iter();
+        assert_eq!(
+            dearest(&[50_000, 80_000, 90_000], &[40_000; 3], calls()),
+            Some(29_990)
+        );
+        // The last cut billed at its floor: call 2's 10_000 shows, not its execution.
+        let floors = [40_000, 40_000, 90_000];
+        assert_eq!(dearest(&[50_000, 80_000, 90_000], &floors, calls()), None);
+    }
 }

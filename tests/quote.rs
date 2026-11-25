@@ -372,6 +372,30 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     );
 }
 
+/// A batch whose cuts anvil bills at their EIP-7623 calldata floor is quoted the whole
+/// run's gas as `callGas`: the cuts' differences would show the floor, not execution.
+#[tokio::test]
+async fn cuts_at_their_calldata_floor_are_quoted_the_whole_run() {
+    let o = Onboarding::new(true).await;
+    o.land(&o.sign(&o.onboarding()).await, o.value).await;
+    let wide = call(Address::repeat_byte(0x55), U256::ZERO, vec![0xff; 40_000]);
+    let r = U256::from(CLAIMED / 10);
+    let b = Batch(vec![wide, o.repay(r)], U256::ZERO, vec![&o.k], None);
+    let data = o.authorize(&b, None).await;
+    let draft = Draft {
+        wallet: o.wallet,
+        create: None,
+        data: data.clone(),
+        below_quorum: false,
+    };
+    let q = draft.quote(&o.relayer, &o.config()).await.unwrap();
+    let run = o.simulated(&data, U256::ZERO).await.gas_used;
+    // The floor of the wide call's bytes and of at most 2000 more.
+    let floor = 21_000 + 40 * 40_000;
+    assert!((floor..floor + 80_000).contains(&run), "{run}");
+    assert_eq!(q.call_gas, run);
+}
+
 /// A `callGas` far beyond the run's margin, on the create path and then on the wallet
 /// it created, and the relayer lands each at the relay-time limit. On the wallet, the
 /// same data one 64/63 factor of the reserve below that limit reverts
