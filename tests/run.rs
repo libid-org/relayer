@@ -89,7 +89,7 @@ fn settings_it_cannot_run_with_are_refused() {
         move |n: &str| (n == name).then(|| value.to_owned())
     };
     #[rustfmt::skip]
-    let rows: [(&str, &str, &str, &str); 9] = [
+    let rows: [(&str, &str, &str, &str); 11] = [
         ("poll_interval = \"1s\"", "poll_interval = \"0s\"", "", "poll_interval"),
         ("concurrency_limit = 64", "concurrency_limit = 0", "", "concurrency_limit"),
         ("request_timeout = \"30s\"", "request_timeout = \"0s\"", "", "request_timeout"),
@@ -99,6 +99,8 @@ fn settings_it_cannot_run_with_are_refused() {
         ("", "", "RELAYER_PORT", "RELAYER_PORT 9090 is [http] metrics_port"),
         ("", "", "RELAYER_SIGNER", "RELAYER_SIGNER is empty"),
         ("tip_percentile = 75.0", "tip_percentile = 90.0", "", ""),
+        ("max_gas_limit = 8000000", "max_gas_limit = 16777217", "", "max_gas_limit"),
+        ("max_gas_limit = 8000000", "max_gas_limit = 16777216", "", ""),
     ];
     for (from, to, name, hint) in rows {
         let value = if name == "RELAYER_PORT" { "9090" } else { "" };

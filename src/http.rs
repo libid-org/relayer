@@ -80,6 +80,7 @@ use crate::{
         Refusal,
         Request,
     },
+    gas,
     quote::Draft,
     relay::{
         Relayer,
@@ -242,6 +243,7 @@ async fn config<P: Provider + 'static>(State(s): S<P>) -> Answer {
         "forwarder": c.forwarder,
         "supportedReleases": c.supported_releases,
         "maxGasLimit": c.max_gas_limit,
+        "maxTransactionBytes": gas::MAX_TX_BYTES,
         "maxValue": c.max_value.map(|v| v.to_string()),
         "maxFeePercent": c.max_fee_percent,
         "maxCancelFeePercent": c.max_cancel_fee_percent,
@@ -381,6 +383,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
         RefundTooLow { .. } => (C::BAD_REQUEST, "sign a refund of at least `required`"),
         GasLimitTooLow { .. } => (C::BAD_REQUEST, "quote again for `required` gas"),
         GasLimitTooHigh { .. } => (C::BAD_REQUEST, "the batch needs over `max` gas"),
+        TooLarge { .. } => (C::BAD_REQUEST, "the transaction is over `max` bytes"),
         ValueTooHigh { .. } => (C::BAD_REQUEST, "the batch's value is over `max` wei"),
         UnknownWallet => (C::BAD_REQUEST, "the contracts do not vouch for the wallet"),
         ValueNotAllowed => (C::BAD_REQUEST, "an EIP-7702 account's batch carries value"),
@@ -404,7 +407,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
             json!({"refund": wei(refund), "required": wei(required)})
         }
         GasLimitTooLow { required } => json!({ "required": required }),
-        GasLimitTooHigh { max } => json!({ "max": max }),
+        GasLimitTooHigh { max } | TooLarge { max } => json!({ "max": max }),
         ValueTooHigh { max } => json!({ "max": wei(max) }),
         UnsupportedRelease { version } => json!({ "version": version }),
         WalletBusy { id } => json!({ "id": id }),

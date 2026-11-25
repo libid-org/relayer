@@ -25,6 +25,7 @@ use serde::Deserialize;
 use crate::{
     check::{
         decode,
+        outer,
         refunds,
         reverted,
         target,
@@ -89,6 +90,10 @@ impl Draft {
             decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
         under_max_value(message.value, config)?;
         let (wallet, create) = (self.wallet, self.create);
+        gas::under_max_size(
+            config,
+            &outer(config, wallet, create, &self.data, message.value),
+        )?;
         let call = target(provider, config, wallet, create, &self.data, message.value);
         let call = call.await?;
         // After the latest block: nodes refuse a simulated block that is not.

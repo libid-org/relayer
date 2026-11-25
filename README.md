@@ -22,8 +22,8 @@ once. `stats` opens the ledger read-only, so it works beside a running relayer.
 means. Durations are humantime (`"10s"`); wei amounts are decimal strings.
 Relative paths are read from the file's directory. Loading refuses, naming the
 setting, a zero `poll_interval`, `request_timeout` or `concurrency_limit`, a
-`tip_percentile` outside 50 to 90, an API port equal to `metrics_port`, and an
-empty `RELAYER_SIGNER`.
+`tip_percentile` outside 50 to 90, a `max_gas_limit` above 2^24 (EIP-7825), an
+API port equal to `metrics_port`, and an empty `RELAYER_SIGNER`.
 
 The environment overrides the file:
 
@@ -76,7 +76,11 @@ On `[http] port`:
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
 signatures. A status is `queued`, `sent`, `included`, `cancelled` or `failed`.
 Relaying the same request again answers its current status; a failed one is
-queued again. A receipt that does not parse for `node_error_ticks` ticks, once
+queued again. A batch whose signed transaction would be over 128 KiB, which node
+pools refuse, is `TooLarge`; `/v1/config` gives that bound as
+`maxTransactionBytes`. A first send the node refuses fails its request as `Node`,
+unless a pending transaction of the key holds its nonce, which pauses sending.
+A receipt that does not parse for `node_error_ticks` ticks, once
 its nonce is mined, is charged at its send's worst cost, and its request fails
 as `Node`; until then the send is watched, sent again and cancelled as usual.
 
@@ -84,7 +88,7 @@ A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 
 | Status | Names |
 | ------ | ----- |
-| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `ValueTooHigh`, `UnknownWallet`, `ValueNotAllowed`, `UnsupportedRelease`, `Expired`, a reverting batch's decoded error (`Reverted` when unknown) |
+| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `TooLarge`, `ValueTooHigh`, `UnknownWallet`, `ValueNotAllowed`, `UnsupportedRelease`, `Expired`, a reverting batch's decoded error (`Reverted` when unknown) |
 | `404`  | `UnknownRequest` |
 | `408`  | past `request_timeout` |
 | `409`  | `WalletBusy` |

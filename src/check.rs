@@ -109,6 +109,11 @@ pub enum Refusal {
         /// The highest gas limit relayed.
         max: u64,
     },
+    /// The signed transaction would be over the bytes a node's pool accepts.
+    TooLarge {
+        /// The most bytes of a signed transaction.
+        max: u64,
+    },
     /// The batch's value is above the configured `max_value`.
     ValueTooHigh {
         /// The most value relayed, in wei.
@@ -161,6 +166,7 @@ impl Refusal {
             Self::RefundTooLow { .. } => "RefundTooLow",
             Self::GasLimitTooLow { .. } => "GasLimitTooLow",
             Self::GasLimitTooHigh { .. } => "GasLimitTooHigh",
+            Self::TooLarge { .. } => "TooLarge",
             Self::ValueTooHigh { .. } => "ValueTooHigh",
             Self::UnknownWallet => "UnknownWallet",
             Self::ValueNotAllowed => "ValueNotAllowed",
@@ -188,10 +194,14 @@ impl Request {
         let (message, authorization, executions) =
             decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
         under_max_value(message.value, config)?;
+        let (wallet, create) = (self.wallet, self.create);
+        gas::under_max_size(
+            config,
+            &outer(config, wallet, create, &self.data, message.value),
+        )?;
         let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
         let late =
             unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
-        let (wallet, create) = (self.wallet, self.create);
         let call = target(provider, config, wallet, create, &self.data, message.value);
         let call = call.await?;
         let head = gas::head(provider, config).await?;

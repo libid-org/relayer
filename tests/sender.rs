@@ -132,6 +132,8 @@ const LAGGING: u8 = 7;
 const L1_WEI: u8 = 8;
 /// Fails `eth_getTransactionReceipt` with a node error.
 const DOWN: u8 = 9;
+/// Refuses the next raw transaction unsent, as geth's pool refuses one over 128 KiB.
+const OVERSIZED: u8 = 10;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -249,6 +251,11 @@ impl Provider for Racing {
                 let any = TransactionRequest::default().with_to(Address::repeat_byte(1));
                 let sent = self.0.send_transaction(any).await?;
                 sent.get_receipt().await.unwrap();
+            }
+            if mode == OVERSIZED {
+                let refused = r#"{"code": -32000, "message": "oversized data"}"#;
+                let refused = serde_json::from_str(refused).unwrap();
+                return Err(alloy::transports::RpcError::ErrorResp(refused));
             }
             let sent = self.0.send_raw_transaction(raw).await?;
             if mode != ECHO {
@@ -786,7 +793,32 @@ async fn an_underfunded_relayer_pauses_before_its_send() {
     assert!(!r.paused(), "paused while funded");
 }
 
-/// A first send the node refuses is uncommitted, queued again, and pauses.
+/// A first send the node refuses for itself fails its request unpaused, its nonce sent
+/// by the next in the same tick.
+#[tokio::test]
+async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
+    let mut o = Onboarding::new(true).await;
+    let (r, mode) = o.armable(&db("oversized")).await;
+    let id = o.queue(&r).await;
+    o.wallet_at(U256::ONE).await;
+    let next = o.queue(&r).await;
+    mode.store(OVERSIZED, Ordering::Relaxed);
+    r.tick().await.unwrap();
+    let report = r.status(id).await.unwrap();
+    let failed = |e: &str| e.contains("oversized");
+    let failed = matches!(&report.status, Status::Failed(Refusal::Node(e)) if failed(e));
+    assert!(failed && report.tx_hashes.is_empty(), "{:?}", report.status);
+    assert!(!r.paused(), "paused by one request");
+    let sent = r.status(next).await.unwrap().tx_hashes;
+    assert_eq!(
+        o.tx(sent[0]).await.inner.nonce(),
+        0,
+        "not at the freed nonce"
+    );
+}
+
+/// A first send the node refuses as underpriced against a pending transaction of the
+/// key is uncommitted, queued again, and pauses.
 #[tokio::test]
 async fn a_refused_first_send_is_queued_again_and_pauses() {
     let o = Onboarding::new(true).await;

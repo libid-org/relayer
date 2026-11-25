@@ -19,6 +19,9 @@ pub const L1_MARGIN: u64 = 130;
 /// How long a quote stays valid on a production chain.
 pub const QUOTE_VALIDITY: Duration = Duration::from_secs(10);
 
+/// The most gas a transaction may have (EIP-7825): the highest `max_gas_limit`.
+pub const MAX_TX_GAS: u64 = 1 << 24;
+
 /// The fee-history percentile a send's tip is read at, between 50 and 90.
 pub const TIP_PERCENTILE: f64 = 75.0;
 
@@ -182,8 +185,8 @@ impl Config {
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
-    /// budgets, gas limit or value cap, and release 1, the one the contracts' test stack
-    /// publishes.
+    /// budgets or value cap, gas limits up to [`MAX_TX_GAS`], and release 1, the one the
+    /// contracts' test stack publishes.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -195,7 +198,7 @@ impl Config {
             factory,
             forwarder,
             supported_releases: vec![1],
-            max_gas_limit: u64::MAX,
+            max_gas_limit: MAX_TX_GAS,
             max_value: None,
             relayer,
             l1_fee: L1Fee::None,
@@ -218,12 +221,17 @@ impl Config {
         config
     }
 
-    /// Refuses settings the sender cannot keep: no supported release, an inclusion
-    /// window shorter than two blocks, a max cancel fee below 1.1 × M, or a tip
-    /// percentile outside 50 to 90.
+    /// Refuses settings the sender cannot keep: no supported release, a max gas limit
+    /// above [`MAX_TX_GAS`], an inclusion window shorter than two blocks, a max cancel
+    /// fee below 1.1 × M, or a tip percentile outside 50 to 90.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.supported_releases.is_empty() {
             return Err("supported_releases is empty; list a release".into());
+        }
+        if self.max_gas_limit > MAX_TX_GAS {
+            let max = self.max_gas_limit;
+            let most = format!("a transaction's {MAX_TX_GAS} (EIP-7825)");
+            return Err(format!("max_gas_limit {max} is above {most}; lower it"));
         }
         if self.inclusion_window < 2 * self.block_time {
             let (w, b) = (self.inclusion_window, self.block_time);

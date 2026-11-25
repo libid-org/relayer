@@ -55,6 +55,14 @@ pub(crate) const NONZERO_BYTE: u64 = 12;
 /// Calldata gas per zero byte (EIP-2028), the least a byte costs.
 pub(crate) const ZERO_BYTE: u64 = 4;
 
+/// The most bytes of a signed transaction a node's pool accepts: geth's, op-geth's and
+/// reth's 128 KiB.
+pub(crate) const MAX_TX_BYTES: u64 = 128 * 1024;
+
+/// The most bytes a signature adds to an unsigned EIP-1559 transaction: its y parity,
+/// two 32-byte words with their RLP headers, and the list header's growth.
+const SIGNATURE_BYTES: usize = 1 + 33 + 33 + 2;
+
 /// The blocks of fee history a tip is read over.
 const TIP_BLOCKS: u64 = 10;
 
@@ -276,7 +284,18 @@ pub(crate) async fn l1_fee_bound<P: Provider>(
     if config.l1_fee == L1Fee::None {
         return Ok(U256::ZERO);
     }
-    // The nonce and fees are set at send; the largest ones size the bound.
+    let size = unsigned_size(config, call, gas_limit)?;
+    l1_bound(provider, config, U256::from(size), block).await
+}
+
+/// `call`'s unsigned EIP-1559 size at `gas_limit`, at the largest nonce and fees: at
+/// least its size as sent.
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+pub(crate) fn unsigned_size(
+    config: &Config,
+    call: &TransactionRequest,
+    gas_limit: u64,
+) -> Result<usize, Refusal> {
     let tx = call
         .clone()
         .with_gas_limit(gas_limit)
@@ -284,8 +303,20 @@ pub(crate) async fn l1_fee_bound<P: Provider>(
         .nonce(u64::MAX)
         .max_fee_per_gas(u128::MAX)
         .max_priority_fee_per_gas(u128::MAX);
-    let size = tx.build_1559().map_err(node)?.encoded_for_signing().len();
-    l1_bound(provider, config, U256::from(size), block).await
+    Ok(tx.build_1559().map_err(node)?.encoded_for_signing().len())
+}
+
+/// `call` signed at any gas limit, nonce and fees is at most [`MAX_TX_BYTES`].
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+pub(crate) fn under_max_size(
+    config: &Config,
+    call: &TransactionRequest,
+) -> Result<(), Refusal> {
+    let size = unsigned_size(config, call, u64::MAX)? + SIGNATURE_BYTES;
+    let max = MAX_TX_BYTES;
+    (size as u64 <= max)
+        .then_some(())
+        .ok_or(Refusal::TooLarge { max })
 }
 
 /// `k × getL1FeeUpperBound(size)` read at `block`; 0 on a chain without an L1 fee.
@@ -319,6 +350,37 @@ mod tests {
         };
         let id = serde_json::to_value(head.at()).unwrap();
         assert_eq!(id["requireCanonical"], true, "{id}");
+    }
+
+    #[test]
+    fn a_signature_adds_at_most_its_bytes() {
+        use alloy::{
+            consensus::TxEnvelope,
+            eips::Encodable2718,
+            primitives::Signature,
+        };
+        let config = Config::anvil(1, Address::ZERO, Address::ZERO, Address::ZERO);
+        for len in [0, 55, 300, 70_000] {
+            let call = TransactionRequest::default()
+                .with_to(Address::ZERO)
+                .with_input(vec![0xff; len]);
+            let tx = call
+                .clone()
+                .with_gas_limit(u64::MAX)
+                .with_chain_id(1)
+                .nonce(u64::MAX)
+                .max_fee_per_gas(u128::MAX)
+                .max_priority_fee_per_gas(u128::MAX);
+            let tx = tx.build_1559().unwrap();
+            let word = U256::MAX;
+            let signed =
+                TxEnvelope::from(tx.into_signed(Signature::new(word, word, true)));
+            let unsigned = unsigned_size(&config, &call, u64::MAX).unwrap();
+            assert!(
+                signed.encoded_2718().len() <= unsigned + SIGNATURE_BYTES,
+                "{len}"
+            );
+        }
     }
 
     #[test]

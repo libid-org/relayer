@@ -147,8 +147,8 @@ pub enum Status {
     },
     /// Replaced by a cancel that landed; not queued again.
     Cancelled,
-    /// Refused before its first broadcast, or charged at its worst as `Node` when its
-    /// receipt did not parse; queued again when relayed again.
+    /// Refused before or at its first broadcast, or charged at its worst as `Node` when
+    /// its receipt did not parse; queued again when relayed again.
     Failed(Refusal),
 }
 
@@ -507,9 +507,9 @@ impl<P: Provider> Relayer<P> {
         })
     }
 
-    /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a
-    /// refused first send, our nonce mined with no receipt of ours for
-    /// `receipt_lag_blocks`, or a spent global loss budget.
+    /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a first
+    /// send refused for a pending transaction of the key, our nonce mined with no
+    /// receipt of ours for `receipt_lag_blocks`, or a spent global loss budget.
     pub fn paused(&self) -> bool {
         let spent = self.budget_left().map_or(true, |left| left.is_zero());
         let (low, unexplained) = (self.low.load(Relaxed), self.unexplained.load(Relaxed));
@@ -680,8 +680,8 @@ impl<P: Provider> Relayer<P> {
     /// block's fee bound and the tip read now, check its target and run it again at the
     /// pinned block, then commit and broadcast it. True when it failed instead, and the
     /// next may be sent: its refund no longer covering the floor at the L1 bound read
-    /// now, its target or run failing for good, or a node error on them for
-    /// `node_error_ticks` ticks in a row.
+    /// now, its target or run failing for good, a node error on them for
+    /// `node_error_ticks` ticks in a row, or the node refusing it.
     async fn send(
         &self,
         ticking: &mut Ticking,
@@ -731,8 +731,7 @@ impl<P: Provider> Relayer<P> {
             Ok(()) => {}
         }
         self.commit(id, &attempt)?;
-        self.broadcast(&attempt, (net, l1), None, head).await?;
-        Ok(false)
+        Ok(!self.broadcast(&attempt, (net, l1), None, head).await?)
     }
 
     /// `result`, of reading `id`'s receipt: a success clears its strikes; a receipt that
@@ -868,7 +867,9 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Broadcast `a` unless the node has it. With `run`, a send's deadline and window
-    /// end, false when a send no longer runs at `head`, to cancel at once.
+    /// end, false when a send no longer runs at `head`, to cancel at once. A first send
+    /// the node refuses is uncommitted: queued again when its nonce was taken, pausing
+    /// sending when a pending transaction of the key holds it, else failed with false.
     async fn broadcast(
         &self,
         a: &Attempt,
@@ -905,24 +906,36 @@ impl<P: Provider> Relayer<P> {
             tracing::warn!("broadcast of {} refused, retried next tick: {e}", a.hash);
             return Ok(true);
         }
-        self.uncommit(a)?;
-        if e.as_error_resp()
-            .is_some_and(|r| r.message.contains("nonce too low"))
-        {
+        let message = e.as_error_resp().map(|r| r.message.to_string());
+        let message = message.unwrap_or_default();
+        if message.contains("nonce too low") {
+            self.uncommit(a, None)?;
             return Ok(true); // checked again from the next tick's block
         }
-        self.paused.store(true, Relaxed);
-        Err(format!("the node refused send {}: {e}; sending paused", a.hash).into())
+        if message.contains("replacement") {
+            self.uncommit(a, None)?;
+            self.paused.store(true, Relaxed);
+            let held = format!("the node refused send {}: {e}", a.hash);
+            let held = format!("{held}; a pending transaction of the key holds it");
+            return Err(format!("{held}: sending paused").into());
+        }
+        tracing::warn!("the node refused send {}, its request failed: {e}", a.hash);
+        let refused = Refusal::Node(format!("the node refused its send: {message}"));
+        self.uncommit(a, Some(&refused))?;
+        Ok(false)
     }
 
-    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, queue it again.
-    fn uncommit(&self, a: &Attempt) -> Result<(), Error> {
+    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, and queue it
+    /// again, or fail it for `failed`.
+    fn uncommit(&self, a: &Attempt, failed: Option<&Refusal>) -> Result<(), Error> {
+        let (failure, detail) = failed.map(encode_failure).unzip();
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "UPDATE requests SET status = 'queued' \
+            "UPDATE requests SET status = iif(?2 IS NULL, 'queued', 'failed'), \
+             failure = ?2, detail = ?3 \
              WHERE id = (SELECT id FROM attempts WHERE hash = ?1)",
-            [&a.hash[..]],
+            params![&a.hash[..], failure, detail],
         )?;
         tx.execute("DELETE FROM attempts WHERE hash = ?1", [&a.hash[..]])?;
         tx.execute("UPDATE nonce SET next = ?1 WHERE next = ?1 + 1", [a.nonce])?;

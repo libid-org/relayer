@@ -6,6 +6,7 @@
 include!("common/onboarding.rs");
 
 use libid_contracts::wallet_target::Release;
+use relayer::quote::Draft;
 
 type Case = (&'static str, Request, fn(&Refusal) -> bool);
 
@@ -161,6 +162,14 @@ async fn refuses_before_sending() {
     // Both: reverts only by the window's end at the limit sent.
     let both = format!("{end}11622625a05a1016601657005b5f80fd");
     let late_starved = first_call(0x7f, both).await;
+    // Over a node pool's 128 KiB once signed.
+    let mut large = o.onboarding();
+    large.insert(
+        0,
+        call(Address::repeat_byte(0x55), U256::ZERO, vec![0; 140_000]),
+    );
+    let large = o.request_for(&large).await;
+    let too_large = |r: &Refusal| matches!(r, Refusal::TooLarge { max: 131_072 });
 
     #[rustfmt::skip]
     let cases: Vec<Case> = vec![
@@ -184,6 +193,7 @@ async fn refuses_before_sending() {
         ("fails by the window's end", o.request_for(&late).await, failed_call),
         ("fails at the limit sent", o.request_for(&starved).await, failed_call),
         ("fails at the limit sent by the window's end", o.request_for(&late_starved).await, failed_call),
+        ("too large", large.clone(), too_large),
         ("create for another wallet", another, unknown),
         ("fake genesisIdentity", impostor, unknown),
         ("account with value", on(account, good.clone()), value_not_allowed),
@@ -202,6 +212,14 @@ async fn refuses_before_sending() {
         );
     }
     assert_eq!(o.relayer_nonce().await, nonce, "the relayer sent");
+    let draft = Draft {
+        wallet: large.wallet,
+        create: large.create,
+        data: large.data,
+        below_quorum: false,
+    };
+    let refused = draft.quote(&o.relayer, &o.config()).await.err();
+    assert!(refused.as_ref().is_some_and(too_large), "{refused:?}");
     assert!(
         o.owner.get_code_at(o.wallet).await.unwrap().is_empty(),
         "a wallet was created"

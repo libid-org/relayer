@@ -169,8 +169,9 @@ pub async fn check<P: Provider>(
     }
     let refused = |e| format!("{e:?}");
     let head = gas::head(provider, config).await.map_err(refused)?;
-    // The largest transaction of max_gas_limit gas: all its calldata zero bytes.
-    let size = U256::from(config.max_gas_limit / gas::ZERO_BYTE);
+    // The largest transaction of max_gas_limit gas: all its calldata zero bytes, at
+    // most the bytes a pool accepts.
+    let size = U256::from((config.max_gas_limit / gas::ZERO_BYTE).min(gas::MAX_TX_BYTES));
     let l1 = gas::l1_bound(provider, config, size, head.at());
     let l1 = l1.await.map_err(refused)?;
     let gas = U256::from(config.max_gas_limit) * U256::from(head.fee_bound(config));
