@@ -21,9 +21,14 @@ once. `stats` opens the ledger read-only, so it works beside a running relayer.
 [`relayer.example.toml`](relayer.example.toml) lists every key, with what it
 means. Durations are humantime (`"10s"`); wei amounts are decimal strings.
 Relative paths are read from the file's directory. Loading refuses, naming the
-setting, a zero `poll_interval`, `request_timeout` or `concurrency_limit`, a
-`tip_percentile` outside 50 to 90, a `max_gas_limit` above 2^24 (EIP-7825), an
-API port equal to `metrics_port`, and an empty `RELAYER_SIGNER`.
+setting, a zero `poll_interval`, `request_timeout`, `tick_timeout` or
+`concurrency_limit`, a `tip_percentile` outside 50 to 90, a `max_gas_limit`
+above 2^24 (EIP-7825), an API port equal to `metrics_port`, and an empty
+`RELAYER_SIGNER`.
+
+A tick, and each node request, ends at `tick_timeout`: a tick past it is dropped
+and logged, and the next resumes its sends, which are committed before they are
+broadcast.
 
 The environment overrides the file:
 

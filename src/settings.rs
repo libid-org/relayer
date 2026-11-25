@@ -22,6 +22,7 @@ use crate::{
         Config,
         FeeParams,
         L1Fee,
+        TICK_TIMEOUT,
     },
     http::Limits,
     relay::Error,
@@ -105,6 +106,12 @@ struct Fees {
 #[serde(deny_unknown_fields)]
 struct State {
     db: PathBuf,
+    #[serde(default = "tick_timeout", with = "humantime_serde")]
+    tick_timeout: Duration,
+}
+
+fn tick_timeout() -> Duration {
+    TICK_TIMEOUT
 }
 
 #[derive(Deserialize)]
@@ -184,6 +191,7 @@ impl Settings {
         let zero = [
             (chain.poll_interval.is_zero(), "[chain] poll_interval"),
             (http.request_timeout.is_zero(), "[http] request_timeout"),
+            (state.tick_timeout.is_zero(), "[state] tick_timeout"),
             (http.concurrency_limit == 0, "[http] concurrency_limit"),
         ];
         if let Some((_, name)) = zero.iter().find(|(zero, _)| *zero) {
@@ -217,6 +225,7 @@ impl Settings {
             receipt_lag_blocks: limits.receipt_lag_blocks,
             wallet_budget: limits.wallet_budget,
             global_budget: limits.global_budget,
+            tick_timeout: state.tick_timeout,
         };
         config.validate()?;
         Ok(Self {

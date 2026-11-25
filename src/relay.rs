@@ -364,12 +364,20 @@ impl<P: Provider> Relayer<P> {
         Ok((id, "queued".into()))
     }
 
+    /// [`Self::step`] within `tick_timeout`. Past it the tick is dropped where it
+    /// stands: each send is committed before its broadcast, so the next tick resumes it.
+    pub async fn tick(&self) -> Result<(), Error> {
+        let limit = self.config.tick_timeout;
+        let step = tokio::time::timeout(limit, self.step()).await;
+        step.map_err(|_| format!("a tick ran over tick_timeout {limit:?}: dropped"))?
+    }
+
     /// Resolve or rebroadcast each request in flight, then send the oldest queued one
     /// when none is in flight and the key's count at the pinned block is the stored
     /// next nonce. Above it a foreign nonce pauses sending; below it ours is unmined.
     /// A balance below `min_balance` pauses sending until a tick finds it funded, and
     /// so does a spent global loss budget until its window passes.
-    pub async fn tick(&self) -> Result<(), Error> {
+    async fn step(&self) -> Result<(), Error> {
         let mut ticking = self.ticking.lock().await;
         let head = gas::head(&self.provider, &self.config)
             .await

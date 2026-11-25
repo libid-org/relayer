@@ -134,6 +134,8 @@ const L1_WEI: u8 = 8;
 const DOWN: u8 = 9;
 /// Refuses the next raw transaction unsent, as geth's pool refuses one over 128 KiB.
 const OVERSIZED: u8 = 10;
+/// Never answers `eth_getTransactionCount`, as a node that accepts and stalls.
+const HANG: u8 = 11;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -193,6 +195,10 @@ impl Provider for Racing {
     > {
         let (inner, mode) = (self.0.clone(), self.1.clone());
         alloy::providers::RpcWithBlock::new_provider(move |block| {
+            if mode.load(Ordering::Relaxed) == HANG {
+                let hang = std::future::pending();
+                return alloy::providers::ProviderCall::BoxedFuture(Box::pin(hang));
+            }
             let (inner, lag) = (inner.clone(), mode.load(Ordering::Relaxed) == LAGGING);
             let count = async move {
                 let count = inner.get_transaction_count(address).block_id(block).await?;
@@ -815,6 +821,22 @@ async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
         0,
         "not at the freed nonce"
     );
+}
+
+/// A node that stops answering drops a tick at `tick_timeout`; the next tick runs.
+#[tokio::test]
+async fn a_tick_the_node_stalls_times_out() {
+    let o = Onboarding::new(true).await;
+    let (r, mode) = o.armable(&db("stall")).await;
+    mode.store(HANG, Ordering::Relaxed);
+    let ticked = tokio::time::timeout(std::time::Duration::from_secs(10), r.tick());
+    let e = ticked
+        .await
+        .expect("the tick hung")
+        .expect_err("no node answered");
+    assert!(e.to_string().contains("tick_timeout"), "{e}");
+    mode.store(0, Ordering::Relaxed);
+    r.tick().await.unwrap();
 }
 
 /// A first send the node refuses as underpriced against a pending transaction of the

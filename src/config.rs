@@ -22,6 +22,9 @@ pub const QUOTE_VALIDITY: Duration = Duration::from_secs(10);
 /// The most gas a transaction may have (EIP-7825): the highest `max_gas_limit`.
 pub const MAX_TX_GAS: u64 = 1 << 24;
 
+/// The most a tick and each node request take on a production chain.
+pub const TICK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The fee-history percentile a send's tip is read at, between 50 and 90.
 pub const TIP_PERCENTILE: f64 = 75.0;
 
@@ -178,6 +181,8 @@ pub struct Config {
     /// The loss budget of all wallets: past it, sending pauses and requests are
     /// `Paused`.
     pub global_budget: Budget,
+    /// The most a tick may take: past it, the tick is dropped where it stands.
+    pub tick_timeout: Duration,
 }
 
 impl Config {
@@ -185,8 +190,8 @@ impl Config {
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
-    /// budgets or value cap, gas limits up to [`MAX_TX_GAS`], and release 1, the one the
-    /// contracts' test stack publishes.
+    /// budgets or value cap, gas limits up to [`MAX_TX_GAS`], ticks of at most 3 s, and
+    /// release 1, the one the contracts' test stack publishes.
     pub fn anvil(
         chain_id: u64,
         factory: Address,
@@ -215,6 +220,7 @@ impl Config {
             receipt_lag_blocks: 10,
             wallet_budget: UNLIMITED,
             global_budget: UNLIMITED,
+            tick_timeout: Duration::from_secs(3),
         };
         let window = config.blocks(config.inclusion_window);
         config.max_fee_percent = Eip1559::L1.growth_percent(window);

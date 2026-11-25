@@ -61,6 +61,8 @@ fn the_example_loads_with_its_overrides() {
     assert_eq!(s.config.wallet_budget.window, Duration::from_secs(3600));
     assert!(s.db.ends_with("relayer.db") && s.db.is_absolute());
     assert_eq!(s.config.max_value, None);
+    let unset = load(&EXAMPLE.replace("tick_timeout = \"30s\"", ""), &|_| None);
+    assert_eq!(unset.unwrap().config.tick_timeout, Duration::from_secs(30));
     let capped = EXAMPLE.replace("# max_value", "max_value");
     let max = load(&capped, &|_| None).unwrap().config.max_value;
     assert_eq!(max, Some(U256::from(10u64.pow(16))));
@@ -89,10 +91,11 @@ fn settings_it_cannot_run_with_are_refused() {
         move |n: &str| (n == name).then(|| value.to_owned())
     };
     #[rustfmt::skip]
-    let rows: [(&str, &str, &str, &str); 11] = [
+    let rows: [(&str, &str, &str, &str); 12] = [
         ("poll_interval = \"1s\"", "poll_interval = \"0s\"", "", "poll_interval"),
         ("concurrency_limit = 64", "concurrency_limit = 0", "", "concurrency_limit"),
         ("request_timeout = \"30s\"", "request_timeout = \"0s\"", "", "request_timeout"),
+        ("tick_timeout = \"30s\"", "tick_timeout = \"0s\"", "", "tick_timeout"),
         ("tip_percentile = 75.0", "tip_percentile = 49.9", "", "tip_percentile"),
         ("tip_percentile = 75.0", "tip_percentile = 90.1", "", "tip_percentile"),
         ("tip_percentile = 75.0", "tip_percentile = nan", "", "tip_percentile"),

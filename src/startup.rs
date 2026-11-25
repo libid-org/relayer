@@ -16,6 +16,7 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
+    transports::http::reqwest,
 };
 use libid_contracts::bindings::wallet::{
     IWebWallet,
@@ -77,9 +78,12 @@ pub async fn run(
     })?;
     tracing::info!("signing with {}", source.describe());
     let signer = source.build_managed(Some(config.chain_id)).await?;
+    let http = reqwest::Client::builder()
+        .timeout(config.tick_timeout)
+        .build()?;
     let provider = ProviderBuilder::new()
         .wallet(signer.wallet())
-        .connect_http(rpc_url.parse()?);
+        .connect_reqwest(http, rpc_url.parse()?);
     check(&provider, &config, signer.address()).await?;
     let relayer = Relayer::start(provider, config, &db).await?;
     let api = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;

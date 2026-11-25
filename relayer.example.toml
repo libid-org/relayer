@@ -55,6 +55,9 @@ fee_params = "header"
 [state]
 # The SQLite ledger, locked by one relayer at a time at `<db>.lock`.
 db = "relayer.db"
+# Optional, "30s" by default, above 0: the most a tick and each node request take.
+# A tick past it is dropped and logged; the next resumes its sends.
+tick_timeout = "30s"
 
 [http]
 # The API and /health, on every interface. RELAYER_PORT overrides it.
