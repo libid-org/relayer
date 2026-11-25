@@ -307,9 +307,9 @@ async fn relay_limit<P: Provider>(
     if !sim.status {
         return Err(reverted(sim.return_data));
     }
-    let required = gas::limit(sim.gas_used, call_gas, create);
+    let required = gas::limit(&sim, 0, call_gas, create);
     if required > priced_for {
-        let required = gas::limit(sim.gas_used + fillable, call_gas, create);
+        let required = gas::limit(&sim, fillable, call_gas, create);
         return Err(Refusal::GasLimitTooLow { required });
     }
     Ok(required)

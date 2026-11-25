@@ -356,6 +356,43 @@ impl Onboarding {
             .with_gas_limit(10_000_000)
     }
 
+    /// This test's own `eth_simulateV1` of the outer call for `data`.
+    async fn simulated(
+        &self,
+        data: &Bytes,
+        value: U256,
+    ) -> alloy::rpc::types::simulate::SimCallResult {
+        use alloy::rpc::types::simulate::{
+            SimBlock,
+            SimulatePayload,
+        };
+        let outer = self.outer(data, value).await; // at the block's gas limit
+        let calls = vec![TransactionRequest { gas: None, ..outer }];
+        let block_state_calls = vec![SimBlock {
+            calls,
+            ..Default::default()
+        }];
+        let payload = SimulatePayload {
+            block_state_calls,
+            ..Default::default()
+        };
+        let mut blocks = self.relayer.simulate(&payload).await.unwrap();
+        blocks.remove(0).calls.remove(0)
+    }
+
+    /// The relay-time limit by hand, of `data` run with `extra` gas more: [`run_limit`]
+    /// and the reserve.
+    async fn limit_with(&self, data: &Bytes, value: U256, call_gas: u64, extra: u64) -> u64 {
+        let sim = self.simulated(data, value).await;
+        assert!(sim.status, "{sim:?}");
+        run_limit(&sim, extra) + reserve(call_gas, self.path().await.is_some())
+    }
+
+    /// The relay-time limit by hand of `data`.
+    async fn limit(&self, data: &Bytes, value: U256, call_gas: u64) -> u64 {
+        self.limit_with(data, value, call_gas, 0).await
+    }
+
     /// `data` sent directly, and mined successfully.
     async fn land(&self, data: &Bytes, value: U256) {
         let sent = self.relayer.send_transaction(self.outer(data, value).await);
@@ -489,6 +526,16 @@ fn db(name: &str) -> PathBuf {
 /// Included, not reverted.
 fn included(s: &Status) -> bool {
     matches!(s, Status::Included { reverted: false, .. })
+}
+
+/// The relay-time limit of `sim`'s run with `extra` gas more, before the reserve:
+/// `max(ceil(1.05 × maxUsedGas), maxUsedGas + 50 000)`, or `ceil(1.25 × gasUsed)` from
+/// a node with no `maxUsedGas`.
+fn run_limit(sim: &alloy::rpc::types::simulate::SimCallResult, extra: u64) -> u64 {
+    match sim.max_used_gas {
+        Some(peak) => ((peak + extra) * 105).div_ceil(100).max(peak + extra + 50_000),
+        None => ((sim.gas_used + extra) * 5).div_ceil(4),
+    }
 }
 
 /// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the

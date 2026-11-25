@@ -130,17 +130,29 @@ fn reverted(e: &alloy::contract::Error) -> bool {
     }
 }
 
-/// `ceil(1.25 × gas) + (callGas + CALL_OVERHEAD) × (64/63)^d`. The 1.25 is the gas
-/// a transaction needs while it runs above its gas used after the refund (EIP-3529).
-/// Each 64/63 is a frame's kept 1/64: the wallet's check, and the delegatecall of the
-/// wallet proxy, so `d` is 2; the create path adds the factory proxy's delegatecall
-/// and its call of the wallet, so 4.
-pub(crate) fn limit(gas: u64, call_gas: u64, create: bool) -> u64 {
+/// The least gas a run is sent with above its peak: two storage slots that turn fresh
+/// between the run and the block.
+const PEAK_MARGIN: u128 = 50_000;
+
+/// The gas limit of the run `sim` with `extra` gas more:
+/// `max(ceil(1.05 × peak), peak + 50 000) + (callGas + CALL_OVERHEAD) × (64/63)^d`, the
+/// peak being `maxUsedGas`, what the run needs before its refund (EIP-3529); from a
+/// node that gives none, `ceil(1.25 × gasUsed)` instead. Each 64/63 is a frame's kept
+/// 1/64: the wallet's check, and the delegatecall of the wallet proxy, so `d` is 2;
+/// the create path adds the factory proxy's delegatecall and its call of the wallet,
+/// so 4.
+pub(crate) fn limit(sim: &SimCallResult, extra: u64, call_gas: u64, create: bool) -> u64 {
     let d = if create { 4 } else { 2 };
     let reserve = u128::from(call_gas) + u128::from(CALL_OVERHEAD);
     let reserve = (reserve * 64u128.pow(d)).div_ceil(63u128.pow(d));
-    let run = u128::from(gas) * 5;
-    u64::try_from(run.div_ceil(4) + reserve).unwrap_or(u64::MAX)
+    let run = match sim.max_used_gas {
+        Some(peak) => {
+            let peak = u128::from(peak) + u128::from(extra);
+            (peak * 105).div_ceil(100).max(peak + PEAK_MARGIN)
+        }
+        None => (u128::from(sim.gas_used + extra) * 5).div_ceil(4),
+    };
+    u64::try_from(run + reserve).unwrap_or(u64::MAX)
 }
 
 /// The gas of the zero bytes a client fills when it signs, priced as nonzero: the

@@ -110,29 +110,6 @@ impl Onboarding {
         request.check(&self.relayer, &self.config()).await
     }
 
-    /// This test's own `eth_simulateV1` of the outer call for `data`.
-    async fn simulated(&self, data: &Bytes, value: U256) -> SimCallResult {
-        let outer = self.outer(data, value).await; // at the block's gas limit
-        let calls = vec![TransactionRequest { gas: None, ..outer }];
-        let block_state_calls = vec![SimBlock {
-            calls,
-            ..Default::default()
-        }];
-        let payload = SimulatePayload {
-            block_state_calls,
-            ..Default::default()
-        };
-        let mut blocks = self.relayer.simulate(&payload).await.unwrap();
-        blocks.remove(0).calls.remove(0)
-    }
-
-    /// The relay-time limit by hand: `ceil(1.25 × gasUsed) + reserve`.
-    async fn limit(&self, data: &Bytes, value: U256, call_gas: u64) -> u64 {
-        let used = self.simulated(data, value).await;
-        assert!(used.status, "{used:?}");
-        (used.gas_used * 5).div_ceil(4) + reserve(call_gas, self.path().await.is_some())
-    }
-
     /// Onboards, then adds K2, an admin session, and K3 and K4, below quorum, whose
     /// scope is a refund of up to 1 ether and `token.transfer`, each 1 ether a day.
     async fn sessions(&self) -> ([PrivateKeySigner; 3], Address, [B256; 2]) {
@@ -237,8 +214,11 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
 
     let above = o.authorize(&b, Some(2 * q.call_gas)).await;
     let expected = o.limit(&above, o.value, 2 * q.call_gas).await;
-    // Reported with its fillable zero bytes as nonzero, at 12 gas × 1.25.
-    let allowance = 15 * fillable(&above, &[o.refund()]);
+    // Reported with its fillable zero bytes as nonzero, at 12 gas, run at the limit's
+    // margin.
+    let fill = 12 * fillable(&above, &[o.refund()]);
+    let filled = o.limit_with(&above, o.value, 2 * q.call_gas, fill).await;
+    let allowance = filled - expected;
     let mut required = 0;
     for gas_limit in [q.gas_limit, expected - 3] {
         let refused = o.check_at(&above, gas_limit).await.err();
@@ -307,8 +287,8 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     assert!(refused.as_ref().is_some_and(spent), "{refused:?}");
 }
 
-/// An existing wallet: two admin signers at quorum are quoted within the 1.25 gas
-/// margin of the gas they use. They, one signer, and below quorum a native refund's
+/// An existing wallet: two admin signers at quorum are quoted at least their run's
+/// limit. They, one signer, and below quorum a native refund's
 /// first spend and an ERC-20 transfer's first spend before one, each land at their
 /// quoted limit.
 #[tokio::test]
@@ -319,26 +299,20 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     let b = Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k, &k2], None);
     let q = o.quote_with(&o.config(), &b).await;
     let data = o.authorize(&b, Some(q.call_gas)).await;
-    let used = o.simulated(&data, U256::ZERO).await.gas_used;
-    let estimate = (q.gas_limit - reserve(q.call_gas, false)) * 4 / 5;
-    assert!(
-        4 * used <= 5 * estimate && 4 * estimate <= 5 * used,
-        "{estimate} for {used}"
-    );
+    let run = o.limit(&data, U256::ZERO, q.call_gas).await;
+    assert!(q.gas_limit >= run, "{} for {run}", q.gas_limit);
     // Signed with a refund of fewer zero bytes than quoted: the quote overshoots the
     // run by exactly the zero bytes left in R, the signatures, `at` and the deadline,
-    // at 12 gas × 1.25.
+    // at 12 gas run at the limit's margin.
     let signed_r = r + U256::from(0x0101_0101_0101u64);
     let signed = Batch(vec![o.repay(signed_r)], U256::ZERO, vec![&o.k, &k2], None);
     let data = o.authorize(&signed, Some(q.call_gas)).await;
-    let filled = fillable(&data, &[signed_r]);
+    let fill = 12 * fillable(&data, &[signed_r]);
     let run = o.limit(&data, U256::ZERO, q.call_gas).await;
+    let filled = o.limit_with(&data, U256::ZERO, q.call_gas, fill).await - run;
     let overshoot = q.gas_limit.saturating_sub(run);
     // 1 for rounding, 15 for a zero byte inside `call_gas`.
-    assert!(
-        overshoot.abs_diff(15 * filled) <= 16,
-        "{overshoot} for {filled}"
-    );
+    assert!(overshoot.abs_diff(filled) <= 16, "{overshoot} for {filled}");
     // R's zero bytes leave the quote unchanged: the draft runs them cheaper by as much.
     let q2 = o.quote_with(&o.config(), &signed).await;
     let unreserved = |q: &Quote| q.gas_limit - reserve(q.call_gas, false);
@@ -394,10 +368,10 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     );
 }
 
-/// A `callGas` far beyond the 1.25 margin, on the create path and then on the wallet
+/// A `callGas` far beyond the run's margin, on the create path and then on the wallet
 /// it created, and the relayer lands each at the relay-time limit. On the wallet, the
 /// same data one 64/63 factor of the reserve below that limit reverts
-/// `InsufficientCallGas`. On the create path, under EIP-7825's 2^24 gas, the 1.25
+/// `InsufficientCallGas`. On the create path, under EIP-7825's 2^24 gas, the run's
 /// margin covers one factor, so the least gas it runs at is shown above its gas used
 /// plus the whole depth-4 reserve instead.
 #[tokio::test]
@@ -406,7 +380,7 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     let r = U256::from(CLAIMED / 10);
     let onboarding = Batch(o.onboarding(), o.value, vec![&o.k], None);
     let repay = Batch(vec![o.repay(r)], U256::ZERO, vec![&o.k], None);
-    for (b, times) in [(onboarding, 8), (repay, 50)] {
+    for (b, times) in [(onboarding, 8), (repay, 100)] {
         let call_gas = times * o.quote_with(&o.config(), &b).await.call_gas;
         let data = o.authorize(&b, Some(call_gas)).await;
         let limit = o.limit(&data, b.1, call_gas).await;
