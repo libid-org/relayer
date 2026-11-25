@@ -944,8 +944,8 @@ async fn a_cancel_is_capped_at_the_max_cancel_fee() {
     assert_eq!(cancel.max_fee_per_gas(), u128::from(base) * 3 / 2);
 }
 
-/// A balance the node cannot serve at a receipt's block leaves its loss pending, out of
-/// the budgets and its wallet busy: charged once read, a dust transfer in its block
+/// A balance the node cannot serve at a receipt's block leaves its loss pending, in
+/// the budgets at its worst and its wallet busy: charged once read, a dust transfer in its block
 /// still refunded, or as its gas unrefunded `receipt_lag_blocks` later.
 #[tokio::test]
 async fn a_loss_is_pending_until_its_balances_are_read() {
@@ -967,7 +967,9 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
         mode.store(BLIND, Ordering::Relaxed);
         let report = o.settle(&r, id, included).await;
         r.tick().await.unwrap();
-        assert_eq!((pending(), lost()), (1, U256::ZERO), "charged unread");
+        let t = o.tx(report.tx_hashes[0]).await.inner;
+        let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
+        assert_eq!((pending(), lost()), (1, worst), "pending not at its worst");
         let (now, calls) = (o.now().await, encode_executions(&o.onboarding()));
         let again = o.request(o.sign_until(calls, o.value, now, now + 1800));
         let busy = matches!(r.relay(&again).await, Err(Refusal::WalletBusy { .. }));

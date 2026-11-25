@@ -550,10 +550,12 @@ impl<P: Provider> Relayer<P> {
         Ok(self.config.global_budget.wei.saturating_sub(lost))
     }
 
-    /// Each wallet's losses over the last `window`, by when their receipts were seen.
+    /// Each wallet's losses over the last `window`, by when their receipts were seen; a
+    /// loss not yet charged at its attempts' worst.
     fn losses(&self, window: Duration) -> Result<BTreeMap<Address, U256>, Error> {
-        let sql = "SELECT wallet, loss FROM requests \
-                   WHERE loss IS NOT NULL AND included_at > unixepoch() - ?1";
+        let sql = "SELECT wallet, coalesce(loss, \
+                   (SELECT max(worst) FROM attempts a WHERE a.id = r.id)) FROM requests r \
+                   WHERE included_at > unixepoch() - ?1";
         let row = |r: &Row| Ok((address(r, 0)?, u256(r, 1)?));
         let mut losses = BTreeMap::<_, U256>::new();
         for (wallet, loss) in rows(&self.db(), sql, [window.as_secs()], row)? {
