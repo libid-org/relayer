@@ -21,9 +21,8 @@ use serde_json::{
 };
 
 use crate::relay::{
-    first,
-    rows,
-    u256,
+    entries,
+    Entry,
     Error,
 };
 
@@ -97,35 +96,24 @@ impl fmt::Display for Stats {
 /// The numbers of the ledger at `db`, opened read-only.
 pub fn stats(db: &Path) -> Result<Stats, Error> {
     let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let sql = "SELECT CASE WHEN r.reverted THEN 'reverted' ELSE r.status END, r.net, \
-               r.gas_used, r.gas_price, r.l1_fee, \
-               max(r.included_at - (SELECT min(sent_at) FROM attempts a WHERE a.id = r.id), 0), \
-               r.loss FROM requests r";
-    let row = |r: &rusqlite::Row| {
-        let cost = match r.get::<_, Option<u64>>(2)? {
-            Some(gas) => Some(U256::from(gas) * u256(r, 3)? + u256(r, 4)?),
-            None => None,
-        };
-        let loss = r.get::<_, Option<Vec<u8>>>(6)?;
-        let cost = (cost, loss.map(|w| U256::from_be_slice(&w)));
-        Ok((
-            first::<String>(r)?,
-            u256(r, 1)?,
-            cost,
-            r.get::<_, Option<u64>>(5)?,
-        ))
-    };
     let mut stats = Stats::default();
     let (mut receipts, mut cancelled) = (0u64, 0u64);
     let (mut costs, mut nets) = (U256::ZERO, U256::ZERO);
     let mut times = vec![];
     let signed = |w: U256| I256::try_from(w).unwrap_or(I256::MAX);
-    for (status, net, cost, inclusion) in rows(&db, sql, [], row)? {
+    for Entry {
+        status,
+        net,
+        cost,
+        loss,
+        inclusion,
+    } in entries(&db)?
+    {
         *stats.requests.entry(status.clone()).or_default() += 1;
         times.extend(inclusion.filter(|_| status != "cancelled"));
         // A loss charged with no receipt read has no cost.
-        let (cost, Some(loss)) = cost else {
-            stats.pending += u64::from(cost.0.is_some());
+        let Some(loss) = loss else {
+            stats.pending += u64::from(cost.is_some());
             continue;
         };
         receipts += 1;
