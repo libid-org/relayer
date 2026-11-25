@@ -4,9 +4,11 @@
 use std::{
     future::Future,
     net::Ipv4Addr,
+    time::Duration,
 };
 
 use alloy::{
+    eips::BlockNumberOrTag,
     primitives::{
         address,
         Address,
@@ -29,6 +31,7 @@ use tokio::net::TcpListener;
 use crate::{
     config::{
         Config,
+        FeeParams,
         L1Fee,
     },
     gas,
@@ -42,6 +45,9 @@ use crate::{
     },
     settings::Settings,
 };
+
+/// How far back the chain's block time is measured.
+const BLOCK_TIME_SPAN: Duration = Duration::from_secs(10);
 
 /// The OP-stack `L1Block` predeploy.
 const L1_BLOCK: Address = address!("4200000000000000000000000000000000000015");
@@ -93,9 +99,9 @@ pub async fn run(
 }
 
 /// The chain `provider` reads is the one `config` names, for the key at `signer`:
-/// the chain id, the signer's address and balance, the contracts' code and the
-/// addresses they name, the factory's latest release, its EntryPoint, the wallet budget
-/// against one request's worst loss, and no OP-stack operator fee.
+/// the chain id and block time, the signer's address and balance, the contracts' code
+/// and the addresses they name, the factory's latest release, its EntryPoint, the loss
+/// budgets against one request's worst loss, and no OP-stack operator fee.
 pub async fn check<P: Provider>(
     provider: &P,
     config: &Config,
@@ -108,6 +114,7 @@ pub async fn check<P: Provider>(
             "the node is on chain {chain_id}, [chain] chain_id {ours}: point rpc_url at it"
         ));
     }
+    block_time(provider, config).await?;
     if signer != config.relayer {
         let at = config.relayer;
         return fail(format!(
@@ -180,15 +187,48 @@ pub async fn check<P: Provider>(
     let l1 = l1.await.map_err(refused)?;
     let gas = U256::from(config.max_gas_limit) * U256::from(head.fee_bound(config));
     let worst = gas.saturating_add(l1);
-    let budget = config.wallet_budget.wei;
-    if budget < worst {
+    let budgets = [
+        ("wallet_budget", config.wallet_budget.wei),
+        ("global_budget", config.global_budget.wei),
+    ];
+    if let Some((name, budget)) = budgets.iter().find(|(_, wei)| *wei < worst) {
         return fail(format!(
-            "[limits] wallet_budget {budget} is below one request's worst loss {worst}, \
+            "[limits] {name} {budget} is below one request's worst loss {worst}, \
              max_gas_limit at max_fee_percent of the base fee plus the L1 fee bound of \
              that much calldata: raise it"
         ));
     }
     operator_fee(provider, config).await
+}
+
+/// `block_time` within 25% of the chain's mean over the blocks of the last
+/// [`BLOCK_TIME_SPAN`], on an OP-stack chain or one whose fee rule is in its headers;
+/// anvil mines on demand. A chain younger than the span is not measured.
+async fn block_time<P: Provider>(provider: &P, config: &Config) -> Result<(), Error> {
+    if config.l1_fee != L1Fee::OpStack && config.fee_params != FeeParams::Header {
+        return Ok(());
+    }
+    let n = u64::try_from(config.blocks(BLOCK_TIME_SPAN).max(1))?;
+    let time = async |at: BlockNumberOrTag| -> Result<(u64, u64), Error> {
+        let block = provider.get_block_by_number(at).await?;
+        let header = block.ok_or("the node has no such block")?.header;
+        Ok((header.number, header.timestamp))
+    };
+    let (latest, now) = time(BlockNumberOrTag::Latest).await?;
+    let Some(back) = latest.checked_sub(n) else {
+        return Ok(());
+    };
+    let (_, then) = time(back.into()).await?;
+    let measured = Duration::from_millis(now.saturating_sub(then) * 1000 / n);
+    let ours = config.block_time;
+    if measured.abs_diff(ours) * 4 > ours {
+        return Err(format!(
+            "[chain] block_time {ours:?} is off the chain's {measured:?} a block over its \
+             last {n} blocks: set it"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// No OP-stack operator fee, which no refund bounds; none to read on a chain before

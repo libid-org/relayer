@@ -229,10 +229,25 @@ impl Config {
 
     /// Refuses settings the sender cannot keep: no supported release, a max gas limit
     /// above [`MAX_TX_GAS`], an inclusion window shorter than two blocks, a max cancel
-    /// fee below 1.1 × M, or a tip percentile outside 50 to 90.
+    /// fee below 1.1 × M, a tip percentile outside 50 to 90, an L1 margin under 100%,
+    /// a budget window of 0, or no receipt lag.
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.supported_releases.is_empty() {
             return Err("supported_releases is empty; list a release".into());
+        }
+        if self.l1_margin < 100 {
+            let k = self.l1_margin;
+            return Err(format!("l1_margin_percent {k} is under 100; raise it"));
+        }
+        let budgets = [
+            ("wallet_budget", self.wallet_budget),
+            ("global_budget", self.global_budget),
+        ];
+        if let Some((name, _)) = budgets.iter().find(|(_, b)| b.window.is_zero()) {
+            return Err(format!("{name}'s window is 0; set it above 0"));
+        }
+        if self.receipt_lag_blocks == 0 {
+            return Err("receipt_lag_blocks is 0; set it to 1 or more".into());
         }
         if self.max_gas_limit > MAX_TX_GAS {
             let max = self.max_gas_limit;

@@ -13,7 +13,8 @@ chain_id = 84532
 # Optional: a chain-configurations network file, whose chain_id must equal the one
 # above.
 # network_file = "../chain-configurations/networks/base-sepolia.toml"
-# The chain's block time: the step of the base fee's growth.
+# The chain's block time: the step of the base fee's growth. On an OP-stack chain, or
+# with fee_params = "header", start refuses one 25% off the chain's.
 block_time = "200ms"
 # How often the relayer ticks, above 0. /health answers 503 once no tick succeeded for ten.
 poll_interval = "1s"
@@ -40,7 +41,7 @@ quote_validity = "10s"
 tip_percentile = 75.0
 # "op-stack" bounds the L1 fee with the gas price oracle; "none" on anvil.
 l1_fee = "op-stack"
-# k: the refund covers k percent of getL1FeeUpperBound.
+# k: the refund covers k percent of getL1FeeUpperBound, at least 100.
 l1_margin_percent = 130
 # M: a send's fee cap is at most M percent of the base fee. Keep it at least the
 # base fee's growth over inclusion_window, 201% on Base Sepolia; start warns when
@@ -74,7 +75,8 @@ concurrency_limit = 64
 # much calldata, which start checks: 8M gas at 210% of a 0.1 gwei base fee is
 # 1.68e15 wei.
 wallet_budget = { wei = "2000000000000000", window = "1h" }
-# What all wallets may cost before sending pauses.
+# What all wallets may cost before sending pauses: at least one request's worst
+# loss, which start checks. Each window is above 0.
 global_budget = { wei = "20000000000000000", window = "1h" }
 # The highest gas limit a request may be priced for: a real-proof onboarding's
 # createAndExecute is priced near 5.6M.
@@ -86,7 +88,7 @@ supported_releases = [1]
 # Ticks of node errors on a request before it fails, and of a receipt that does
 # not parse before it is charged at its worst.
 node_error_ticks = 5
-# Blocks a receipt may lag its mined nonce before sending pauses.
+# Blocks a receipt may lag its mined nonce before sending pauses, at least 1.
 receipt_lag_blocks = 50
 # The balance below which start refuses and sending pauses.
 min_balance = "50000000000000000"
