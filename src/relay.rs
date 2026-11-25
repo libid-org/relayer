@@ -840,17 +840,24 @@ impl<P: Provider> Relayer<P> {
         self.charge_worst(id, &e).map(|()| None)
     }
 
-    /// Charge `id` with no refund at its stored worst; with no receipt recorded, it
-    /// fails as `Node`.
+    /// Charge `id` with no refund at its stored worst less its value, which a landed
+    /// send to a vouched wallet cannot lose; with no receipt recorded, it fails as
+    /// `Node`.
     fn charge_worst(&self, id: B256, e: &Error) -> Result<(), Error> {
         let unread = Refusal::Node(format!("its receipt does not parse: {e}"));
         let (failure, detail) = encode_failure(&unread);
-        self.db().execute(
-            "UPDATE identities SET loss = worst, at = unixepoch(), \
+        let db = self.db();
+        let sql = "SELECT worst, tx FROM identities WHERE id = ?1";
+        let row = |r: &Row| Ok((u256(r, 0)?, r.get::<_, String>(1)?));
+        let (worst, tx) = db.query_row(sql, [&id[..]], row)?;
+        let tx: TransactionRequest = serde_json::from_str(&tx)?;
+        let loss = worst.saturating_sub(tx.value.unwrap_or_default());
+        db.execute(
+            "UPDATE identities SET loss = ?4, at = unixepoch(), \
              status = iif(block IS NULL, 'failed', status), \
              failure = iif(block IS NULL, ?2, failure), \
              detail = iif(block IS NULL, ?3, detail) WHERE id = ?1",
-            params![&id[..], failure, detail],
+            params![&id[..], failure, detail, loss.to_be_bytes::<32>()],
         )?;
         Ok(())
     }

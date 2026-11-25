@@ -144,7 +144,8 @@ Any other error, `nonce too low` and a rate limit included, keeps the send
 committed: it is watched, sent again and cancelled at its window's end like
 any other.
 A receipt that does not parse for `node_error_ticks` ticks, once
-its nonce is mined, is charged at its send's worst cost, and its request fails
+its nonce is mined, is charged at its send's worst cost without its value, which
+a landed send to a vouched wallet cannot lose, and its request fails
 as `Node`; until then the send is watched, sent again and cancelled as usual.
 
 A batch's deadline must cover the inclusion window and be at most `max`:

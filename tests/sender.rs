@@ -716,8 +716,8 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     let hashes = r.status(id).await.unwrap().tx_hashes;
     assert_eq!(
         left - r.budget_left().unwrap(),
-        worst,
-        "not the send's worst with its value"
+        worst - o.value,
+        "not the send's worst without its value"
     );
     o.assert_within_refund(&hashes, k_u * U256::from(2)).await;
     let t = o.tx(hashes[0]).await.inner;
@@ -1196,8 +1196,8 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
 
 /// A receipt the node fails to serve holds the queue uncharged. One that does not parse
 /// of a mined send holds it for `node_error_ticks` ticks, then its request fails as
-/// `Node`, charged at its send's worst cost and value from the ledger alone, in the
-/// budget and the stats. A retry of the landed batch is refused and keeps the charge.
+/// `Node`, charged at its send's worst cost without its value from the ledger alone,
+/// in the budget and the stats. A retry of the landed batch is refused and keeps the charge.
 #[tokio::test]
 async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("garbled"));
@@ -1228,8 +1228,9 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let node = matches!(report.status, Status::Failed(Refusal::Node(_)));
     assert!(node, "{:?}", report.status);
     let t = o.tx(hash).await.inner;
-    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + o.value;
-    assert_eq!(lost(&r), worst, "not charged at its worst");
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
+    assert!(o.value > U256::ZERO);
+    assert_eq!(lost(&r), worst, "not charged at its worst less its value");
     let stats = relayer::stats::stats(&path, &o.config()).unwrap();
     assert_eq!((stats.lost, stats.held), (worst, 1));
     assert!(
@@ -1331,7 +1332,7 @@ async fn an_unparsed_receipt_of_an_unmined_send_is_watched_and_cancelled() {
 }
 
 /// An included request whose receipt no longer parses while its loss is pending is
-/// struck, then charged at its worst, and the ticks go on.
+/// struck, then charged at its worst without its value, and the ticks go on.
 #[tokio::test]
 async fn an_unparsed_receipt_of_a_pending_loss_is_charged_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("pending-garbled"));
@@ -1348,7 +1349,7 @@ async fn an_unparsed_receipt_of_a_pending_loss_is_charged_after_its_ticks() {
     r.tick().await.unwrap();
     let stats = relayer::stats::stats(&path, &o.config()).unwrap();
     let t = o.tx(report.tx_hashes[0]).await.inner;
-    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas()) + o.value;
+    let worst = U256::from(t.gas_limit()) * U256::from(t.max_fee_per_gas());
     assert_eq!((stats.pending, stats.lost), (0, worst));
     assert!(included(&r.status(id).await.unwrap().status));
 }

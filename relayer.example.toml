@@ -88,7 +88,7 @@ max_gas_limit = 8000000
 # The wallet releases whose AUTHORIZED data the relayer decodes.
 supported_releases = [1]
 # Ticks of node errors on a request before it fails, and of a receipt that does
-# not parse before it is charged at its worst.
+# not parse before it is charged at its worst without its value.
 node_error_ticks = 5
 # Blocks a receipt may lag its mined nonce before sending pauses, at least 1; a
 # paid request's row is dropped this many blocks after its receipt.
