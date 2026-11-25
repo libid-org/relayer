@@ -113,7 +113,9 @@ impl Onboarding {
 }
 
 /// Fails `eth_sendRawTransaction` once when armed: `RACE` mines a transaction of the
-/// key first, `ECHO` sends the transaction, then answers with an error. `STALL` and
+/// key first, `ECHO` sends the transaction, then answers with an error. `LOST` does so
+/// with a transport error on every send, and shows no transaction by hash, as a node
+/// whose forward to the sequencer looked failed. `STALL` and
 /// `BROKE` make every `eth_call` a node error: a wrong chain id, and no funds.
 #[derive(Clone)]
 struct Racing(DynProvider, std::sync::Arc<std::sync::atomic::AtomicU8>);
@@ -138,6 +140,7 @@ const OVERSIZED: u8 = 10;
 const HANG: u8 = 11;
 /// Refuses every raw transaction unsent, as a node whose pool is full.
 const FULL: u8 = 12;
+const LOST: u8 = 13;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -184,6 +187,16 @@ impl Provider for Racing {
             let balance = async move { inner.get_balance(address).block_id(block).await };
             alloy::providers::ProviderCall::BoxedFuture(Box::pin(balance))
         })
+    }
+
+    fn get_transaction_by_hash(
+        &self,
+        hash: B256,
+    ) -> alloy::providers::ProviderCall<(B256,), Option<Transaction>> {
+        if self.1.load(Ordering::Relaxed) == LOST {
+            return alloy::providers::ProviderCall::ready(Ok(None));
+        }
+        self.0.get_transaction_by_hash(hash)
     }
 
     fn get_transaction_count(
@@ -271,7 +284,14 @@ impl Provider for Racing {
                 let refused = serde_json::from_str(refused).unwrap();
                 return Err(alloy::transports::RpcError::ErrorResp(refused));
             }
+            if mode == LOST {
+                self.1.store(LOST, Ordering::Relaxed);
+            }
             let sent = self.0.send_raw_transaction(raw).await?;
+            if mode == LOST {
+                let lost = "error sending request: connection reset";
+                return Err(alloy::transports::TransportErrorKind::custom_str(lost));
+            }
             if mode != ECHO {
                 return Ok(sent);
             }
@@ -503,6 +523,20 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let twice = 4 * c.max_fee_per_gas(); // twice the base fee it was raised at
     assert_eq!(raised.inner.max_fee_per_gas(), twice, "not 2 × base");
     assert!(tip(&raised) * 10 >= tip(&cancel) * 11);
+    // The landed cancel's cost counts against the budget for its window, no more.
+    let landed = o.receipt(report.tx_hashes[2]).await;
+    let cost = U256::from(landed.gas_used) * U256::from(landed.effective_gas_price);
+    let lost = || relayer::stats::stats(&path, &o.config()).unwrap().lost;
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let back = |secs: u64| {
+        let sql = format!("UPDATE identities SET at = at - {secs}");
+        ledger.execute(&sql, []).unwrap();
+    };
+    assert_eq!(lost(), cost, "not the cancel's cost");
+    back(120);
+    assert_eq!(lost(), cost, "expired inside the window");
+    back(o.config().global_budget.window.as_secs());
+    assert_eq!(lost(), U256::ZERO, "counted past the window");
     drop(r);
     let r = o.restart(&path).await.unwrap();
     assert_eq!(r.relay(&request).await.unwrap(), id);
@@ -1006,14 +1040,54 @@ async fn a_nonce_taken_before_broadcast_keeps_its_commit_and_pauses() {
     assert_eq!(o.relayer_nonce().await, 1, "signed past the taken nonce");
 }
 
-/// A first send the node answers with an error but holds keeps its commit and lands.
+/// A first send the node holds despite an error answer or a transport error keeps its
+/// commit, sent with one hash, and lands.
 #[tokio::test]
 async fn a_first_send_the_node_holds_despite_an_error_keeps_its_commit() {
-    let o = Onboarding::new(true).await;
-    let r = o.racing(ECHO, "echo").await;
+    for mode in [ECHO, LOST] {
+        let o = Onboarding::new(true).await;
+        let r = o.racing(mode, "echo").await;
+        let id = o.queue(&r).await;
+        r.tick().await.unwrap();
+        let report = r.status(id).await.unwrap();
+        let sent = matches!(report.status, Status::Sent) && report.tx_hashes.len() == 1;
+        assert!(sent, "{mode}: {:?}", report.status);
+        o.settle(&r, id, included).await;
+        o.assert_onboarded(o.refund()).await;
+    }
+}
+
+/// A request queued while the budget had room stays queued once the budget is spent,
+/// and sending pauses.
+#[tokio::test]
+async fn a_spent_budget_holds_the_queue() {
+    let (o, path) = (Onboarding::new(true).await, db("spent"));
+    let config = Config {
+        global_budget: relayer::config::Budget {
+            wei: o.refund(),
+            ..o.config().global_budget
+        },
+        ..o.config()
+    };
+    let r = Relayer::start(o.relayer.clone(), config, &path)
+        .await
+        .unwrap();
     let id = o.queue(&r).await;
-    o.settle(&r, id, included).await; // unsettled if uncommitted
-    o.assert_onboarded(o.refund()).await;
+    // Another identity's loss of the whole budget.
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let spent = o.refund().to_be_bytes::<32>();
+    ledger
+        .execute(
+            "INSERT INTO identities (platform, id_node, id, wallet, tx, net, l1, deadline, \
+             status, worst, loss) VALUES (x'01', x'01', x'01', x'', '', x'', x'', 0, \
+             'failed', ?1, ?1)",
+            [spent],
+        )
+        .unwrap();
+    r.tick().await.unwrap();
+    let report = r.status(id).await.unwrap();
+    let queued = matches!(report.status, Status::Queued) && report.tx_hashes.is_empty();
+    assert!(queued && r.paused(), "{:?}", report.status);
 }
 
 /// A node error on a send's run holds the queue for `node_error_ticks` ticks, then

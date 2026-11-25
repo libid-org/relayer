@@ -160,6 +160,8 @@ async fn refuses_before_sending() {
     };
     // Reverts once the timestamp passes now + window - 1: the window's end is simulated.
     let late = first_call(0x7e, format!("{end}11600f57005b5f80fd")).await;
+    // Reverts until then: the present is simulated too.
+    let early = first_call(0x7d, format!("{end}10600f57005b5f80fd")).await;
     // Reverts with under 2.5M gas left: it runs unbounded, not at the limit sent.
     let starved = first_call(0x9a, "622625a05a10600a57005b5f80fd".into()).await;
     // Both: reverts only by the window's end at the limit sent.
@@ -194,6 +196,7 @@ async fn refuses_before_sending() {
         ("deadline = now", o.request(sign_at(o.value, now, now)), expired),
         ("deadline inside the window", o.request(sign_at(o.value, now, now + window - 1)), expired),
         ("fails by the window's end", o.request_for(&late).await, failed_call),
+        ("fails before the window's end", o.request_for(&early).await, failed_call),
         ("fails at the limit sent", o.request_for(&starved).await, failed_call),
         ("fails at the limit sent by the window's end", o.request_for(&late_starved).await, failed_call),
         ("too large", large.clone(), too_large),

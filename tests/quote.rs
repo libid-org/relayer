@@ -537,9 +537,10 @@ async fn an_existing_wallet_relays_and_a_skipped_refund_costs_only_gas() {
         .relay(&o.request_at(&data, q.gas_limit).await)
         .await
         .unwrap();
-    let (before, held) = (
+    let (before, held, left) = (
         o.owner.get_balance(o.relayer_address).await.unwrap(),
         o.owner.get_balance(o.wallet).await.unwrap(),
+        r.budget_left().unwrap(),
     );
     o.owner.anvil_set_auto_mine(false).await.unwrap();
     r.tick().await.unwrap();
@@ -558,6 +559,8 @@ async fn an_existing_wallet_relays_and_a_skipped_refund_costs_only_gas() {
         gas,
         "the relayer paid more than the send's gas"
     );
+    r.tick().await.unwrap();
+    assert_eq!(left - r.budget_left().unwrap(), gas, "not charged its gas");
     assert_eq!(
         o.owner.get_balance(o.wallet).await.unwrap(),
         held,
