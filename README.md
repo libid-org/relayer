@@ -87,8 +87,11 @@ signatures. A status is `queued`, `sent`, `included`, `cancelled` or `failed`.
 Relaying the same request again answers its current status; a failed one is
 queued again. A batch whose signed transaction would be over 128 KiB, which node
 pools refuse, is `TooLarge`; `/v1/config` gives that bound as
-`maxTransactionBytes`. A first send the node refuses fails its request as `Node`,
-unless a pending transaction of the key holds its nonce, which pauses sending.
+`maxTransactionBytes`. A first send the node refuses for good, naming fees, gas,
+funds or an oversized transaction, fails its request as `Node`; refused for now,
+as by a full pool or a rate limit, it holds the queue and fails as `Node` after
+`node_error_ticks` ticks in a row. One refused because a pending transaction of
+the key holds its nonce pauses sending.
 A receipt that does not parse for `node_error_ticks` ticks, once
 its nonce is mined, is charged at its send's worst cost, and its request fails
 as `Node`; until then the send is watched, sent again and cancelled as usual.

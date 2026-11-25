@@ -65,6 +65,7 @@ use crate::{
         decode,
         node,
         outer,
+        refusal,
         rerun,
         reverted,
         vouched,
@@ -714,8 +715,9 @@ impl<P: Provider> Relayer<P> {
     /// block's fee bound and the tip read now, check its target and run it again at the
     /// pinned block, then commit and broadcast it. True when it failed instead, and the
     /// next may be sent: its refund no longer covering the floor at the L1 bound read
-    /// now, its target or run failing for good, a node error on them for
-    /// `node_error_ticks` ticks in a row, or the node refusing it.
+    /// now, its target or run failing for good, or the node refusing it for good; a node
+    /// error on them or a refusal for now does so after `node_error_ticks` ticks in a
+    /// row.
     async fn send(
         &self,
         ticking: &mut Ticking,
@@ -754,18 +756,34 @@ impl<P: Provider> Relayer<P> {
         }
         let vouched = vouched(&self.provider, &self.config, wallet, create, value);
         let run = self.runs(&attempt.raw, deadline, head, self.late(head.time));
-        let n = self.config.node_error_ticks;
-        match async { vouched.await.and(run.await) }.await {
-            Err(Refusal::Node(e))
-                if !deterministic(&e) && ticking.send.strike(id) < n =>
-            {
-                return Err(e.into());
-            }
-            Err(refusal) => return self.fail(id, &refusal),
-            Ok(()) => {}
+        if let Err(refusal) = async { vouched.await.and(run.await) }.await {
+            return self.strike(&mut ticking.send, id, refusal);
         }
         self.commit(id, &attempt)?;
-        Ok(!self.broadcast(&attempt, (net, l1), None, head).await?)
+        match self.broadcast(&attempt, (net, l1), None, head).await {
+            Err(e) => match e.downcast::<Refused>() {
+                Ok(refused) => self.strike(&mut ticking.send, id, refused.0),
+                Err(e) => Err(e),
+            },
+            Ok(_) => Ok(false),
+        }
+    }
+
+    /// `refusal` of `id`'s send: a node error that is not deterministic holds the queue
+    /// as the tick's error for `node_error_ticks` ticks in a row; any other fails it.
+    fn strike(
+        &self,
+        strikes: &mut Strikes,
+        id: B256,
+        refusal: Refusal,
+    ) -> Result<bool, Error> {
+        let n = self.config.node_error_ticks;
+        match refusal {
+            Refusal::Node(e) if !deterministic(&e) && strikes.strike(id) < n => {
+                Err(e.into())
+            }
+            refusal => self.fail(id, &refusal),
+        }
     }
 
     /// `result`, of reading `id`'s receipt: a success clears its strikes; a receipt that
@@ -902,8 +920,9 @@ impl<P: Provider> Relayer<P> {
 
     /// Broadcast `a` unless the node has it. With `run`, a send's deadline and window
     /// end, false when a send no longer runs at `head`, to cancel at once. A first send
-    /// the node refuses is uncommitted: queued again when its nonce was taken, pausing
-    /// sending when a pending transaction of the key holds it, else failed with false.
+    /// the node refuses is uncommitted and queued again: pausing sending when a pending
+    /// transaction of the key holds its nonce, and otherwise, unless its nonce was
+    /// taken, [`Refused`].
     async fn broadcast(
         &self,
         a: &Attempt,
@@ -940,36 +959,30 @@ impl<P: Provider> Relayer<P> {
             tracing::warn!("broadcast of {} refused, retried next tick: {e}", a.hash);
             return Ok(true);
         }
-        let message = e.as_error_resp().map(|r| r.message.to_string());
+        self.uncommit(a)?;
+        let message = e.as_error_resp().map(|r| r.message.to_lowercase());
         let message = message.unwrap_or_default();
         if message.contains("nonce too low") {
-            self.uncommit(a, None)?;
             return Ok(true); // checked again from the next tick's block
         }
-        if message.to_lowercase().contains("replacement") {
-            self.uncommit(a, None)?;
+        if message.contains("replacement") {
             self.paused.store(true, Relaxed);
             let held = format!("the node refused send {}: {e}", a.hash);
             let held = format!("{held}; a pending transaction of the key holds it");
             return Err(format!("{held}: sending paused").into());
         }
-        tracing::warn!("the node refused send {}, its request failed: {e}", a.hash);
-        let refused = Refusal::Node(format!("the node refused its send: {message}"));
-        self.uncommit(a, Some(&refused))?;
-        Ok(false)
+        tracing::warn!("the node refused send {}: {e}", a.hash);
+        Err(Box::new(Refused(refusal(e))))
     }
 
-    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, and queue it
-    /// again, or fail it for `failed`.
-    fn uncommit(&self, a: &Attempt, failed: Option<&Refusal>) -> Result<(), Error> {
-        let (failure, detail) = failed.map(encode_failure).unzip();
+    /// Undo [`Self::commit`] of a first send: drop it, free its nonce, queue it again.
+    fn uncommit(&self, a: &Attempt) -> Result<(), Error> {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "UPDATE requests SET status = iif(?2 IS NULL, 'queued', 'failed'), \
-             failure = ?2, detail = ?3 \
+            "UPDATE requests SET status = 'queued' \
              WHERE id = (SELECT id FROM attempts WHERE hash = ?1)",
-            params![&a.hash[..], failure, detail],
+            [&a.hash[..]],
         )?;
         tx.execute("DELETE FROM attempts WHERE hash = ?1", [&a.hash[..]])?;
         tx.execute("UPDATE nonce SET next = ?1 WHERE next = ?1 + 1", [a.nonce])?;
@@ -1141,14 +1154,16 @@ fn most(tx: &TxEnvelope, l1: U256) -> U256 {
     U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1
 }
 
-/// A node error that the same run meets again: an error response naming fees, gas or
-/// funds.
+/// A node error that the same run or send meets again: an error response naming fees,
+/// gas or funds, or a transaction over the node's size.
 fn deterministic(e: &str) -> bool {
     let Some(message) = answered(e) else {
         return false;
     };
     let message = message.to_lowercase();
-    ["fee", "gas", "funds"].iter().any(|w| message.contains(w))
+    ["fee", "gas", "funds", "oversized"]
+        .iter()
+        .any(|w| message.contains(w))
 }
 
 /// A failure as stored: its name and its fields, a node error's text redacted.
@@ -1239,6 +1254,18 @@ fn refused(refusal: Refusal) -> Error {
     format!("{refusal:?}").into()
 }
 
+/// A first send the node answered with an error and holds no trace of, uncommitted.
+#[derive(Debug)]
+struct Refused(Refusal);
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// A receipt or attempt that does not parse, struck as a node error on a run is.
 #[derive(Debug)]
 struct Unreadable(String);
@@ -1290,6 +1317,7 @@ mod tests {
         let cases = [
             (answer("insufficient funds for gas * price + value"), true),
             (answer("header not found"), false),
+            (answer("oversized data"), true),
             (TransportErrorKind::custom_str(url), false),
         ];
         for (e, expected) in cases {

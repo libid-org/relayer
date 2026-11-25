@@ -136,6 +136,8 @@ const DOWN: u8 = 9;
 const OVERSIZED: u8 = 10;
 /// Never answers `eth_getTransactionCount`, as a node that accepts and stalls.
 const HANG: u8 = 11;
+/// Refuses every raw transaction unsent, as a node whose pool is full.
+const FULL: u8 = 12;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -253,6 +255,12 @@ impl Provider for Racing {
     {
         Box::pin(async move {
             let mode = self.1.swap(0, Ordering::Relaxed);
+            if mode == FULL {
+                self.1.store(FULL, Ordering::Relaxed);
+                let full = r#"{"code": -32000, "message": "txpool is full"}"#;
+                let full = serde_json::from_str(full).unwrap();
+                return Err(alloy::transports::RpcError::ErrorResp(full));
+            }
             if mode == RACE {
                 let any = TransactionRequest::default().with_to(Address::repeat_byte(1));
                 let sent = self.0.send_transaction(any).await?;
@@ -850,6 +858,37 @@ async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
         0,
         "not at the freed nonce"
     );
+}
+
+/// A first send the node refuses for now holds the queue unsent; refused for
+/// `node_error_ticks` ticks in a row, it fails as `Node`, and the next, refused once, is
+/// sent once the node accepts it.
+#[tokio::test]
+async fn a_first_send_the_node_refuses_for_now_is_tried_again() {
+    let mut o = Onboarding::new(true).await;
+    let (r, mode) = o.armable(&db("full")).await;
+    let id = o.queue(&r).await;
+    o.wallet_at(U256::ONE).await;
+    let next = o.queue(&r).await;
+    mode.store(FULL, Ordering::Relaxed);
+    for _ in 1..o.config().node_error_ticks {
+        let e = r.tick().await.expect_err("no refusal");
+        assert!(e.to_string().contains("txpool is full"), "{e}");
+        for id in [id, next] {
+            let report = r.status(id).await.unwrap();
+            let queued = matches!(report.status, Status::Queued);
+            assert!(queued && report.tx_hashes.is_empty(), "{:?}", report.status);
+        }
+    }
+    r.tick().await.expect_err("the next not refused");
+    let failed = r.status(id).await.unwrap().status;
+    assert!(
+        matches!(failed, Status::Failed(Refusal::Node(_))),
+        "{failed:?}"
+    );
+    mode.store(0, Ordering::Relaxed);
+    o.settle(&r, next, included).await;
+    assert!(!r.paused(), "paused by a full pool");
 }
 
 /// A node that stops answering drops a tick at `tick_timeout`; the next tick runs.
