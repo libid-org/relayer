@@ -170,37 +170,22 @@ pub(crate) fn fillable(
     NONZERO_BYTE * (signed.sum::<u64>() + refunds.sum::<u64>() + stamps)
 }
 
-/// `call`'s L1 fee bound at `gas_limit`, and the most it costs the relayer at
-/// `max_fee_per_gas`: `gas_limit × max fee + L1 bound`.
-pub(crate) async fn price<P: Provider>(
-    provider: &P,
-    config: &Config,
-    call: &TransactionRequest,
-    gas_limit: u64,
-    max_fee_per_gas: u128,
-) -> Result<(U256, U256), Refusal> {
-    let latest = BlockId::latest();
-    let l1_fee_bound = l1_fee_bound(provider, config, call, gas_limit, latest).await?;
-    let cost = U256::from(gas_limit)
+/// The most a send at `gas_limit` costs the relayer at `max_fee_per_gas` with the L1
+/// fee bound `l1_fee_bound`: `gas_limit × max fee + L1 bound`.
+pub(crate) fn cost(gas_limit: u64, max_fee_per_gas: u128, l1_fee_bound: U256) -> U256 {
+    U256::from(gas_limit)
         .saturating_mul(U256::from(max_fee_per_gas))
-        .saturating_add(l1_fee_bound);
-    Ok((l1_fee_bound, cost))
-}
-
-/// The latest base fee, at least the chain's minimum, grown by its most over
-/// `time`'s blocks.
-pub(crate) async fn fee_floor<P: Provider>(
-    provider: &P,
-    config: &Config,
-    time: Duration,
-) -> Result<u128, Refusal> {
-    grown(config, &latest(provider).await?, time)
+        .saturating_add(l1_fee_bound)
 }
 
 /// `header`'s base fee, at least the chain's minimum, grown by its most over
 /// `time`'s blocks.
 #[allow(clippy::result_large_err)] // the `Refusal` that its callers return
-fn grown(config: &Config, header: &Header, time: Duration) -> Result<u128, Refusal> {
+pub(crate) fn grown(
+    config: &Config,
+    header: &Header,
+    time: Duration,
+) -> Result<u128, Refusal> {
     let base_fee = header.base_fee_per_gas.unwrap_or_default().into();
     Ok(rule(config, header)?.grow(base_fee, config.blocks(time)))
 }
@@ -257,11 +242,6 @@ fn tip_of(history: &FeeHistory, percentile: f64) -> u128 {
         .max(1)
 }
 
-/// The latest block's timestamp.
-pub(crate) async fn latest_time<P: Provider>(provider: &P) -> Result<u64, Refusal> {
-    Ok(latest(provider).await?.timestamp)
-}
-
 /// The block a send is pinned to: its nonce, balance and runs are read at `hash`.
 pub(crate) struct Head {
     pub(crate) hash: B256,
@@ -273,6 +253,18 @@ pub(crate) struct Head {
 }
 
 impl Head {
+    /// `header`, pinned.
+    #[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+    pub(crate) fn of(config: &Config, header: &Header) -> Result<Self, Refusal> {
+        Ok(Self {
+            hash: header.hash,
+            number: header.number,
+            time: header.timestamp,
+            base_fee: header.base_fee_per_gas.unwrap_or_default().into(),
+            floor: grown(config, header, config.inclusion_window)?,
+        })
+    }
+
     /// Its block, which a read fails at once it leaves the canonical chain.
     pub(crate) fn at(&self) -> BlockId {
         BlockId::hash_canonical(self.hash)
@@ -290,17 +282,11 @@ pub(crate) async fn head<P: Provider>(
     provider: &P,
     config: &Config,
 ) -> Result<Head, Refusal> {
-    let latest = latest(provider).await?;
-    Ok(Head {
-        hash: latest.hash,
-        number: latest.number,
-        time: latest.timestamp,
-        base_fee: latest.base_fee_per_gas.unwrap_or_default().into(),
-        floor: grown(config, &latest, config.inclusion_window)?,
-    })
+    Head::of(config, &latest(provider).await?)
 }
 
-async fn latest<P: Provider>(provider: &P) -> Result<Header, Refusal> {
+/// The latest block's header.
+pub(crate) async fn latest<P: Provider>(provider: &P) -> Result<Header, Refusal> {
     let latest = provider.get_block_by_number(BlockNumberOrTag::Latest);
     let latest = latest.await.map_err(node)?;
     Ok(latest.ok_or_else(|| node("no latest block"))?.header)

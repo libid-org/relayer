@@ -1,6 +1,7 @@
 //! The quote: what a client signs, from one simulation of its draft.
 
 use alloy::{
+    eips::BlockId,
     primitives::{
         Address,
         Bytes,
@@ -105,28 +106,27 @@ impl Draft {
             config,
             &outer(config, wallet, create, &self.data, message.value),
         )?;
-        let call = target(provider, config, wallet, create, &self.data, message.value);
-        let (call, _) = call.await?;
+        // Only the target refuses for the draft; the rest fail as the node.
+        let ((call, _), header, tip) = tokio::try_join!(
+            target(provider, config, wallet, create, &self.data, message.value),
+            gas::latest(provider),
+            gas::tip(provider, config.tip_percentile),
+        )?;
         // After the latest block: nodes refuse a simulated block that is not.
-        let now = gas::latest_time(provider).await?;
+        let now = header.timestamp;
         let late = now + config.inclusion_window.as_secs();
-        let sim = gas::simulate(provider, &call, late).await?;
+        let parts = (&message, &authorization);
+        let (sim, cut) = tokio::join!(
+            gas::simulate(provider, &call, late),
+            self.call_gas(provider, config, parts, &executions, late),
+        );
+        let sim = sim?;
         // Every call ran; only the dummy signatures failed.
         let unsigned = sim.return_data[..] == IWebWallet::ExecutionNotSigned::SELECTOR;
         if !sim.status && !unsigned {
             return Err(reverted(sim.return_data));
         }
-        let call_gas = self
-            .call_gas(
-                provider,
-                config,
-                (&message, &authorization),
-                &executions,
-                late,
-            )
-            .await
-            .unwrap_or(sim.gas_used)
-            .min(sim.gas_used);
+        let call_gas = cut.unwrap_or(sim.gas_used).min(sim.gas_used);
         let below_quorum = self.below_quorum.then_some(executions.len());
         let refunds = refunds(&executions, config.relayer);
         if refunds.clone().next().is_none() {
@@ -137,13 +137,14 @@ impl Draft {
         let gas_limit = gas::limit(&sim, unmeasured, call_gas, create.is_some());
         under_max(gas_limit, config)?;
         let growth = config.quote_validity + config.inclusion_window;
-        let floor = gas::fee_floor(provider, config, growth).await?;
-        let grown = gas::fee_floor(provider, config, config.quote_validity).await?;
+        let floor = gas::grown(config, &header, growth)?;
+        let grown = gas::grown(config, &header, config.quote_validity)?;
         let cap = grown.saturating_mul(config.max_fee_percent.into()) / 100;
-        let tip = gas::tip(provider, config.tip_percentile).await?;
         let max_fee_per_gas = (floor + tip).min(cap).max(floor);
-        let priced = gas::price(provider, config, &call, gas_limit, max_fee_per_gas);
-        let (l1_fee_bound, min_refund) = priced.await?;
+        let latest = BlockId::latest();
+        let l1 = gas::l1_fee_bound(provider, config, &call, gas_limit, latest);
+        let l1_fee_bound = l1.await?;
+        let min_refund = gas::cost(gas_limit, max_fee_per_gas, l1_fee_bound);
         Ok(Quote {
             call_gas,
             gas_limit,

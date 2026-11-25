@@ -1,10 +1,7 @@
 //! The relayer's own preconditions on a request, checked before it sends:
 //! canonical data, the refund, the target, the deadline and the gas limit.
 
-use std::{
-    fmt::Display,
-    time::Duration,
-};
+use std::fmt::Display;
 
 use alloy::{
     eips::BlockId,
@@ -208,20 +205,30 @@ impl Request {
         let (message, authorization, executions) =
             decode(&self.data).ok_or(Refusal::NoncanonicalData)?;
         under_max_value(message.value, config)?;
-        let (wallet, create) = (self.wallet, self.create);
-        gas::under_max_size(
-            config,
-            &outer(config, wallet, create, &self.data, message.value),
-        )?;
+        let (wallet, create, value) = (self.wallet, self.create, message.value);
+        let unchecked = outer(config, wallet, create, &self.data, value);
+        gas::under_max_size(config, &unchecked)?;
         let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
-        let late =
-            unexpired(provider, message.deadline.to(), config.inclusion_window).await?;
-        let call = target(provider, config, wallet, create, &self.data, message.value);
-        let (call, identity) = call.await?;
-        let head = gas::head(provider, config).await?;
-        let priced = gas::price(provider, config, &call, self.gas_limit, head.floor);
-        let (l1_fee_bound, cost) = priced.await?;
-        let value = message.value;
+        // Only the target refuses for the request; the rest fail as the node.
+        let (header, (call, identity), tip, l1_fee_bound) = tokio::try_join!(
+            gas::latest(provider),
+            target(provider, config, wallet, create, &self.data, value),
+            gas::tip(provider, config.tip_percentile),
+            gas::l1_fee_bound(
+                provider,
+                config,
+                &unchecked,
+                self.gas_limit,
+                BlockId::latest()
+            ),
+        )?;
+        let window = config.inclusion_window.as_secs();
+        let late = covered(
+            message.deadline.to(),
+            header.timestamp.saturating_add(window),
+        )?;
+        let head = gas::Head::of(config, &header)?;
+        let cost = gas::cost(self.gas_limit, head.floor, l1_fee_bound);
         let Some(net) = refund.checked_sub(value).filter(|net| *net >= cost) else {
             let required = value.saturating_add(cost);
             return Err(Refusal::RefundTooLow { refund, required });
@@ -237,7 +244,6 @@ impl Request {
         // The fee cap the refund pays for at the limit sent: at least the floor.
         let cap = (net - l1_fee_bound) / U256::from(limit);
         let cap = u128::try_from(cap).unwrap_or(u128::MAX);
-        let tip = gas::tip(provider, config.tip_percentile).await?;
         let at_cap = |cap: u128| {
             call.clone()
                 .with_gas_limit(limit)
@@ -313,18 +319,6 @@ async fn relay_limit<P: Provider>(
         return Err(Refusal::GasLimitTooLow { required });
     }
     Ok(required)
-}
-
-/// The end of the inclusion window after the latest block, which `deadline` is not before.
-async fn unexpired<P: Provider>(
-    provider: &P,
-    deadline: u64,
-    window: Duration,
-) -> Result<u64, Refusal> {
-    let late = gas::latest_time(provider)
-        .await?
-        .saturating_add(window.as_secs());
-    covered(deadline, late)
 }
 
 /// `GasLimitTooHigh` above `config.max_gas_limit`.
