@@ -239,7 +239,7 @@ impl Request {
         let (window, deadline) = (config.inclusion_window, message.deadline.to());
         let late = covered(deadline, header.timestamp.saturating_add(window.as_secs()))?;
         let slack = DEADLINE_SLACK * config.block_time;
-        let max = late + (config.quote_validity + slack).as_secs();
+        let max = late + (config.quote_validity + slack).as_secs_f64().ceil() as u64;
         if deadline > max {
             return Err(Refusal::DeadlineTooFar { max });
         }
