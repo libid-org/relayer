@@ -1,5 +1,7 @@
 //! The wallet stack on a fresh anvil, and a relayer file for it: compose.yaml's
 //! one-shot `deploy`. Dev only: the stack's verifier is a stub that checks no proof.
+//! Beside the file, `stack.json` names the stack's identity registry and escrow,
+//! which the relayer does not read.
 //!
 //! Run again with the file's factory deployed, it leaves both be; on an anvil that is
 //! neither fresh nor deployed by it, it refuses.
@@ -71,6 +73,11 @@ async fn main() -> Result<(), Error> {
         .replace("{release}", &stack.release.version.to_string());
     std::fs::write(&out, file)?;
     Settings::load(&out, |_| None)?;
+    let addresses = serde_json::json!({
+        "identityRegistry": stack.identities,
+        "escrow": stack.escrow,
+    });
+    std::fs::write(out.with_file_name("stack.json"), addresses.to_string())?;
     println!("wrote {}: factory {}", out.display(), stack.factory);
     Ok(())
 }

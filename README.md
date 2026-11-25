@@ -122,7 +122,8 @@ The API is on `127.0.0.1:8080`, metrics on `:9090`, anvil on `:8545`. The
 stack, whose verifier checks no proof, and writes the relayer's file. The
 relayer signs with anvil's dev key #1, a public key: never fund it on a real
 chain. Run `down -v` before starting again: a ledger on a fresh anvil fails
-the nonce check.
+the nonce check. Beside `relayer.toml`, the one-shot writes `stack.json`, the
+identity registry's and the escrow's addresses.
 
 ## Operate
 
