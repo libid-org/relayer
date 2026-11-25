@@ -75,6 +75,7 @@ use crate::{
     gas::{
         self,
         Head,
+        OperatorFee,
     },
 };
 
@@ -88,13 +89,15 @@ pub enum Stop {
     Unknown,
     /// A tick found the balance below `min_balance`, and sending paused.
     LowBalance(String),
+    /// A tick found the OP-stack operator fee on, and sending paused.
+    OperatorFee(String),
 }
 
 impl fmt::Display for Stop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Unknown => "no such request",
-            Self::LowBalance(low) => low,
+            Self::LowBalance(why) | Self::OperatorFee(why) => why,
         })
     }
 }
@@ -232,6 +235,8 @@ pub struct Relayer<P> {
     low: AtomicBool,
     /// One of our nonces mined with no receipt of ours `receipt_lag_blocks` later.
     unexplained: AtomicBool,
+    /// The OP-stack operator fee was on at the last read.
+    operator_fee: AtomicBool,
     /// The balance at the last pinned block.
     balance: Mutex<Option<U256>>,
     ticking: tokio::sync::Mutex<Ticking>,
@@ -295,6 +300,7 @@ impl<P: Provider> Relayer<P> {
             paused: AtomicBool::new(false),
             low: AtomicBool::new(false),
             unexplained: AtomicBool::new(false),
+            operator_fee: AtomicBool::new(false),
             balance: Mutex::new(None),
             ticking: Default::default(),
             _lock: file,
@@ -375,8 +381,9 @@ impl<P: Provider> Relayer<P> {
     /// Resolve or rebroadcast each request in flight, then send the oldest queued one
     /// when none is in flight and the key's count at the pinned block is the stored
     /// next nonce. Above it a foreign nonce pauses sending; below it ours is unmined.
-    /// A balance below `min_balance` pauses sending until a tick finds it funded, and
-    /// so does a spent global loss budget until its window passes.
+    /// A balance below `min_balance` pauses sending until a tick finds it funded, an
+    /// OP-stack operator fee until a tick finds it off, and a spent global loss budget
+    /// until its window passes.
     async fn step(&self) -> Result<(), Error> {
         let mut ticking = self.ticking.lock().await;
         let head = gas::head(&self.provider, &self.config)
@@ -425,6 +432,19 @@ impl<P: Provider> Relayer<P> {
                 "{low}: sending paused until it is funded"
             ))
             .into());
+        }
+        if self.queued()?.is_some() || self.operator_fee.load(Relaxed) {
+            let fee = gas::operator_fee(&self.provider, &self.config, head.at()).await;
+            let fee = fee.map_err(refused)?;
+            self.operator_fee
+                .store(matches!(fee, OperatorFee::On(..)), Relaxed);
+            if let OperatorFee::On(s, c) = fee {
+                let on = format!("the operator fee is on (scalar {s}, constant {c})");
+                return Err(Stop::OperatorFee(format!(
+                    "{on}, which no refund bounds: sending paused until it is off"
+                ))
+                .into());
+            }
         }
         while let Some(queued) = self.queued()? {
             let id = queued.0;
@@ -517,11 +537,13 @@ impl<P: Provider> Relayer<P> {
 
     /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a first
     /// send refused for a pending transaction of the key, our nonce mined with no
-    /// receipt of ours for `receipt_lag_blocks`, or a spent global loss budget.
+    /// receipt of ours for `receipt_lag_blocks`, an OP-stack operator fee, or a spent
+    /// global loss budget.
     pub fn paused(&self) -> bool {
         let spent = self.budget_left().map_or(true, |left| left.is_zero());
         let (low, unexplained) = (self.low.load(Relaxed), self.unexplained.load(Relaxed));
-        self.paused.load(Relaxed) || low || unexplained || spent
+        let fee = self.operator_fee.load(Relaxed);
+        self.paused.load(Relaxed) || low || unexplained || fee || spent
     }
 
     /// The configuration it runs with.

@@ -8,9 +8,11 @@ use std::{
 };
 
 use alloy::{
-    eips::BlockNumberOrTag,
+    eips::{
+        BlockId,
+        BlockNumberOrTag,
+    },
     primitives::{
-        address,
         Address,
         U256,
     },
@@ -48,17 +50,6 @@ use crate::{
 
 /// How far back the chain's block time is measured.
 const BLOCK_TIME_SPAN: Duration = Duration::from_secs(10);
-
-/// The OP-stack `L1Block` predeploy.
-const L1_BLOCK: Address = address!("4200000000000000000000000000000000000015");
-
-alloy::sol! {
-    #[sol(rpc)]
-    interface L1Block {
-        function operatorFeeScalar() external view returns (uint32);
-        function operatorFeeConstant() external view returns (uint64);
-    }
-}
 
 /// Build the signer, check the chain, take the ledger's lock and check its nonces,
 /// then serve until `shutdown` resolves.
@@ -231,40 +222,19 @@ async fn block_time<P: Provider>(provider: &P, config: &Config) -> Result<(), Er
     Ok(())
 }
 
-/// No OP-stack operator fee, which no refund bounds; none to read on a chain before
-/// Isthmus, whose `L1Block` has no getter and reverts.
+/// No OP-stack operator fee, which no refund bounds.
 async fn operator_fee<P: Provider>(provider: &P, config: &Config) -> Result<(), Error> {
-    if config.l1_fee != L1Fee::OpStack {
-        return Ok(());
-    }
-    let l1_block = L1Block::new(L1_BLOCK, provider);
-    let (scalar, constant) = (
-        l1_block.operatorFeeScalar().call().await,
-        l1_block.operatorFeeConstant().call().await,
-    );
-    match (scalar, constant) {
-        (Ok(0), Ok(0)) => Ok(()),
-        (Ok(s), Ok(c)) => Err(format!(
+    let fee = gas::operator_fee(provider, config, BlockId::latest()).await;
+    match fee.map_err(|e| format!("{e:?}"))? {
+        gas::OperatorFee::On(s, c) => Err(format!(
             "the operator fee is on (scalar {s}, constant {c}), which no refund bounds: \
              relay on a chain without one"
         )
         .into()),
-        (Err(e), _) | (_, Err(e)) if reverted(&e) => {
+        gas::OperatorFee::Unread => {
             tracing::warn!("L1Block has no operator fee getters: none to check");
             Ok(())
         }
-        (Err(e), _) | (_, Err(e)) => Err(e.into()),
-    }
-}
-
-/// The call reverted, or found no code.
-fn reverted(e: &alloy::contract::Error) -> bool {
-    use alloy::contract::Error::*;
-    match e {
-        ZeroData(..) => true,
-        TransportError(e) => e
-            .as_error_resp()
-            .is_some_and(|r| r.code == 3 || r.message.contains("revert")),
-        _ => false,
+        gas::OperatorFee::Off => Ok(()),
     }
 }

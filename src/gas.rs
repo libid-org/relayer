@@ -69,10 +69,64 @@ const TIP_BLOCKS: u64 = 10;
 /// The OP-stack `GasPriceOracle` predeploy.
 const GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
 
+/// The OP-stack `L1Block` predeploy.
+const L1_BLOCK: Address = address!("4200000000000000000000000000000000000015");
+
 alloy::sol! {
     #[sol(rpc)]
     interface GasPriceOracle {
         function getL1FeeUpperBound(uint256 unsignedTxSize) external view returns (uint256);
+    }
+
+    #[sol(rpc)]
+    interface L1Block {
+        function operatorFeeScalar() external view returns (uint32);
+        function operatorFeeConstant() external view returns (uint64);
+    }
+}
+
+/// The OP-stack operator fee, which no refund bounds.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OperatorFee {
+    /// Off, or no L1 fee.
+    Off,
+    /// On, at its scalar and constant.
+    On(u32, u64),
+    /// No getters to read, as before Isthmus, whose `L1Block` reverts.
+    Unread,
+}
+
+/// The OP-stack operator fee at `block`; off on a chain without an L1 fee.
+pub(crate) async fn operator_fee<P: Provider>(
+    provider: &P,
+    config: &Config,
+    block: BlockId,
+) -> Result<OperatorFee, Refusal> {
+    if config.l1_fee != L1Fee::OpStack {
+        return Ok(OperatorFee::Off);
+    }
+    let l1_block = L1Block::new(L1_BLOCK, provider);
+    let (scalar, constant) = (
+        l1_block.operatorFeeScalar().call().block(block).await,
+        l1_block.operatorFeeConstant().call().block(block).await,
+    );
+    match (scalar, constant) {
+        (Ok(0), Ok(0)) => Ok(OperatorFee::Off),
+        (Ok(s), Ok(c)) => Ok(OperatorFee::On(s, c)),
+        (Err(e), _) | (_, Err(e)) if reverted(&e) => Ok(OperatorFee::Unread),
+        (Err(e), _) | (_, Err(e)) => Err(node(e)),
+    }
+}
+
+/// The call reverted, or found no code.
+fn reverted(e: &alloy::contract::Error) -> bool {
+    use alloy::contract::Error::*;
+    match e {
+        ZeroData(..) => true,
+        TransportError(e) => e
+            .as_error_resp()
+            .is_some_and(|r| r.code == 3 || r.message.contains("revert")),
+        _ => false,
     }
 }
 

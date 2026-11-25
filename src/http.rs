@@ -83,6 +83,7 @@ use crate::{
     gas,
     quote::Draft,
     relay::{
+        Error,
         Relayer,
         Status,
         Stop,
@@ -134,12 +135,16 @@ impl<P: Provider + 'static> Service<P> {
     }
 
     /// One tick, logged when it fails. A tick that ran, one that found the balance
-    /// low included, is the heartbeat.
+    /// low or the operator fee on included, is the heartbeat.
     pub async fn tick(&self) {
+        let paused = |e: &Error| {
+            matches!(
+                e.downcast_ref(),
+                Some(Stop::LowBalance(_) | Stop::OperatorFee(_))
+            )
+        };
         match self.relayer.tick().await {
-            Err(e) if matches!(e.downcast_ref(), Some(Stop::LowBalance(_))) => {
-                tracing::warn!("{e}")
-            }
+            Err(e) if paused(&e) => tracing::warn!("{e}"),
             Err(e) => return tracing::error!("tick failed: {e}"),
             Ok(()) => {}
         }

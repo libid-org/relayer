@@ -634,6 +634,31 @@ async fn a_balance_of_the_worst_cost_sends_on_an_op_stack_chain() {
     assert_eq!(required, o.value + U256::from(t.gas_limit()) * floor + l1);
 }
 
+/// On an OP-stack chain an operator fee turned on pauses sending, the request held,
+/// until a tick finds it off.
+#[tokio::test]
+async fn an_operator_fee_pauses_sending_until_it_is_off() {
+    let o = Onboarding::new(true).await;
+    let config = Config {
+        l1_fee: L1Fee::OpStack,
+        ..o.config()
+    };
+    let l1_block =
+        alloy::primitives::address!("4200000000000000000000000000000000000015");
+    o.set_code(ORACLE, "60206000f3").await; // an L1 bound of 0
+    let r = Relayer::start(o.relayer.clone(), config, &db("operator"))
+        .await
+        .unwrap();
+    let id = o.queue(&r).await;
+    o.set_code(l1_block, "600160005260206000f3").await; // scalar and constant 1
+    let e = r.tick().await.expect_err("sent with the operator fee on");
+    assert!(e.to_string().contains("operator fee") && r.paused(), "{e}");
+    assert!(r.status(id).await.unwrap().tx_hashes.is_empty(), "sent");
+    o.set_code(l1_block, "60206000f3").await;
+    o.settle(&r, id, included).await;
+    assert!(!r.paused(), "paused with the fee off");
+}
+
 /// With M under the fee rule's growth over the window, a request sends at the floor.
 #[tokio::test]
 async fn a_max_fee_percent_under_the_window_growth_still_sends() {
