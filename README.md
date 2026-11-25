@@ -113,11 +113,15 @@ once its row is dropped (see [Ledger](#ledger)) the request is
 `404 UnknownRequest`. Relaying the same request again answers its current
 status; a failed one is checked and queued again. A batch whose signed transaction would be over 128 KiB, which node
 pools refuse, is `TooLarge`; `/v1/config` gives that bound as
-`maxTransactionBytes`. A first send the node refuses for good, naming fees, gas,
-funds or an oversized transaction, fails its request as `Node`; refused for now,
-as by a full pool or a rate limit, it holds the queue and fails as `Node` after
-`node_error_ticks` ticks in a row. One refused because a pending transaction of
-the key holds its nonce pauses sending.
+`maxTransactionBytes`. A first send the node's pool refuses, naming in whole
+words a replacement, an underpriced or oversized transaction, a full pool
+(`is full`), fees, gas or funds, is uncommitted: refused for good (fees, gas,
+funds, oversized) it fails its request as `Node`; refused for now it holds the
+queue and fails as `Node` after `node_error_ticks` ticks in a row; refused
+because a pending transaction of the key holds its nonce it pauses sending.
+Any other error, `nonce too low` and a rate limit included, keeps the send
+committed: it is watched, sent again and cancelled at its window's end like
+any other.
 A receipt that does not parse for `node_error_ticks` ticks, once
 its nonce is mined, is charged at its send's worst cost, and its request fails
 as `Node`; until then the send is watched, sent again and cancelled as usual.
@@ -164,6 +168,9 @@ when the claimed ETH falls short, and refund, in one relayed transaction.
   balancer). The relayer bounds losses per identity and in total, not per
   caller.
 - Keep `/metrics` private: it has its own port for that.
+- Watch `libid_relayer_oldest_in_flight_seconds`: a node that refuses sends
+  and cancels with errors that name no pool refusal stalls the queue with no
+  tick failing.
 - Run one instance per key. The ledger's lock stops a second one on the same
   file, not on another host.
 - Fund the key. Under `min_balance` the relayer pauses sending and answers

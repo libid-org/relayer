@@ -966,19 +966,25 @@ async fn a_refused_first_send_is_queued_again_and_pauses() {
 }
 
 /// The key's nonce taken between the pinned block and the broadcast: the node answers
-/// "nonce too low", the attempt is dropped unpaused, and the next pinned block's check
-/// finds the foreign nonce and pauses, nothing signed past it.
+/// "nonce too low", which names no pool refusal, so the send stays committed, as a
+/// gateway that sent it again would answer; its nonce, mined with no receipt of ours,
+/// pauses sending `receipt_lag_blocks` later, nothing signed past it.
 #[tokio::test]
-async fn a_nonce_taken_before_broadcast_is_checked_again_from_a_new_block() {
+async fn a_nonce_taken_before_broadcast_keeps_its_commit_and_pauses() {
     let o = Onboarding::new(true).await;
     let r = o.racing(RACE, "low").await;
     let id = o.queue(&r).await;
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
-    let dropped = matches!(report.status, Status::Queued) && report.tx_hashes.is_empty();
-    assert!(dropped && !r.paused(), "{:?}", report.status);
+    let kept = matches!(report.status, Status::Sent) && report.tx_hashes.len() == 1;
+    assert!(kept, "{:?}", report.status);
+    for lag in 0..=o.config().receipt_lag_blocks {
+        assert!(!r.paused(), "paused {lag} blocks after a missing receipt");
+        r.tick().await.unwrap();
+        o.owner.evm_mine(None).await.unwrap();
+    }
     r.tick().await.unwrap();
-    assert!(r.paused(), "no pause on the foreign nonce");
+    assert!(r.paused(), "no pause on the taken nonce");
     assert_eq!(o.relayer_nonce().await, 1, "signed past the taken nonce");
 }
 

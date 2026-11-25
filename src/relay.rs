@@ -910,9 +910,9 @@ impl<P: Provider> Relayer<P> {
 
     /// Broadcast `a` unless the node has it. With `run`, a send's deadline and window
     /// end, false when a send no longer runs at `head`, to cancel at once. A first send
-    /// the node refuses is uncommitted and queued again: pausing sending when a pending
-    /// transaction of the key holds its nonce, and otherwise, unless its nonce was
-    /// taken, [`Refused`].
+    /// the node's pool refuses, naming why ([`pool_refused`]), is uncommitted and queued
+    /// again: pausing sending when a pending transaction of the key holds its nonce, and
+    /// otherwise [`Refused`]. On any other error it stays committed, to be watched.
     async fn broadcast(
         &self,
         a: &Attempt,
@@ -937,24 +937,23 @@ impl<P: Provider> Relayer<P> {
         let Err(e) = self.provider.send_raw_transaction(&a.raw).await else {
             return Ok(true);
         };
-        // The node may hold `a` unless it answered with an error and has no such hash.
+        // The node may hold `a` unless its pool named a refusal and it has no such hash.
         let first = run.is_none() && !a.cancel;
-        let rejected = e.as_error_resp().is_some()
-            && self
+        let message = e.as_error_resp().map(|r| r.message.to_lowercase());
+        let message = message.filter(|m| first && pool_refused(m));
+        let rejected = match &message {
+            Some(_) => self
                 .provider
                 .get_transaction_by_hash(a.hash)
                 .await?
-                .is_none();
-        if !first || !rejected {
+                .is_none(),
+            None => false,
+        };
+        let Some(message) = message.filter(|_| rejected) else {
             tracing::warn!("broadcast of {} refused, retried next tick: {e}", a.hash);
             return Ok(true);
-        }
+        };
         self.uncommit(a)?;
-        let message = e.as_error_resp().map(|r| r.message.to_lowercase());
-        let message = message.unwrap_or_default();
-        if message.contains("nonce too low") {
-            return Ok(true); // checked again from the next tick's block
-        }
         if message.contains("replacement") {
             self.paused.store(true, Relaxed);
             let held = format!("the node refused send {}: {e}", a.hash);
@@ -1192,16 +1191,38 @@ fn most(tx: &TxEnvelope, l1: U256) -> U256 {
     U256::from(tx.gas_limit()) * U256::from(tx.max_fee_per_gas()) + l1
 }
 
-/// A node error that the same run or send meets again: an error response naming fees,
-/// gas or funds, or a transaction over the node's size.
+/// Words of a pool's refusal that the same send meets again: fees, gas, funds, or a
+/// transaction over the node's size.
+const FOR_GOOD: [&str; 4] = ["fee", "gas", "funds", "oversized"];
+
+/// Words of a pool's refusal that may pass: a replacement or an underpriced send.
+const FOR_NOW: [&str; 2] = ["replacement", "underpriced"];
+
+/// The lowercase words of `message`.
+fn words(message: &str) -> Vec<String> {
+    let words = message.split(|c: char| !c.is_ascii_alphanumeric());
+    words
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// A node's answer that names a refusal of its pool, in whole words: [`FOR_GOOD`],
+/// [`FOR_NOW`], or a pool that "is full". Not "nonce too low", which a gateway that
+/// sends again answers for a send it landed, nor a rate limit.
+fn pool_refused(message: &str) -> bool {
+    let words = words(message);
+    let named = |w: &String| FOR_GOOD.contains(&&w[..]) || FOR_NOW.contains(&&w[..]);
+    words.iter().any(named) || words.windows(2).any(|w| w == ["is", "full"])
+}
+
+/// A node error that the same run or send meets again: an error response naming
+/// [`FOR_GOOD`] in whole words.
 fn deterministic(e: &str) -> bool {
     let Some(message) = answered(e) else {
         return false;
     };
-    let message = message.to_lowercase();
-    ["fee", "gas", "funds", "oversized"]
-        .iter()
-        .any(|w| message.contains(w))
+    words(message).iter().any(|w| FOR_GOOD.contains(&&w[..]))
 }
 
 /// A failure as stored: its name and its fields, a node error's text redacted.
@@ -1362,6 +1383,23 @@ mod tests {
                 panic!()
             };
             assert_eq!(deterministic(&text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn only_a_pool_refusal_in_whole_words_uncommits_a_send() {
+        let cases = [
+            ("replacement transaction underpriced", true),
+            ("txpool is full", true),
+            ("insufficient funds for gas * price + value", true),
+            ("oversized data", true),
+            ("nonce too low", false),
+            ("already known", false),
+            ("rate limit exceeded", false),
+            ("bad gateway (ray id 8feeb2c1)", false),
+        ];
+        for (message, refused) in cases {
+            assert_eq!(pool_refused(message), refused, "{message}");
         }
     }
 
