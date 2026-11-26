@@ -78,7 +78,7 @@ concurrency_limit = 64
 # whose worst loss, value included, is over what is left is OverBudget; at its
 # send, each send not yet charged counts at its worst too. Keep it above one
 # request's worst loss, which start warns of: 8M gas at 210% of a 0.1 gwei base
-# fee is 1.68e15 wei, plus a fronted value. The window is above 0.
+# fee is 1.68e15 wei, plus a fronted value. The window is at least 1s.
 global_budget = { wei = "20000000000000000", window = "1h" }
 # Optional, "24h" by default: how long a reverted batch or a skipped refund refuses
 # its identity (`IdentityHeld`); a landed cancel holds it for global_budget's window.
