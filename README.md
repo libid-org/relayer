@@ -158,11 +158,15 @@ used with the calldata of the calls it leaves out, at that margin, plus
 otherwise; without cuts, the run plus that of the highest floor. A relay
 measures the signed batch the same way. A call that needs more than its run
 showed, made dearer by an earlier call or swallowing a failure deep down, may
-be starved by whoever sends the signed batch. A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
+be starved by whoever sends the signed batch.
+
+A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
 once its row is dropped (see [Ledger](#ledger)) the request is
 `404 UnknownRequest`. Relaying the same request again answers its current
 status; a failed one is checked and queued again. A later request of the same
-identity replaces a failed one, and the failed id is then `UnknownRequest`. A batch whose signed transaction would be over 128 KiB, which node
+identity replaces a failed one, and the failed id is then `UnknownRequest`.
+
+A batch whose signed transaction would be over 128 KiB, which node
 pools refuse, is `TooLarge`; `/v1/config` gives that bound as
 `maxTransactionBytes`. A first send the node's pool refuses, naming in whole
 words a replacement, an underpriced or oversized transaction, a full pool
@@ -173,6 +177,7 @@ because a pending transaction of the key holds its nonce it pauses sending.
 Any other error, `nonce too low` and a rate limit included, keeps the send
 committed: it is watched, sent again and cancelled at its window's end like
 any other.
+
 A receipt that does not parse for `node_error_ticks` ticks, once
 its nonce is mined, is charged at its send's worst cost without its value, which
 a landed send to a vouched wallet cannot lose, and its request fails
