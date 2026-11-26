@@ -406,10 +406,12 @@ async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
         .await;
     let (code, held) = s.relay(&again).await;
     assert_eq!((code, name(&held)), (429, "IdentityHeld"), "{held}");
-    assert!(
-        held["error"]["args"]["until"].as_u64().unwrap() > 0,
-        "{held}"
-    );
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let at: u64 = ledger
+        .query_row("SELECT at FROM identities", [], |r| r.get(0))
+        .unwrap();
+    let until = at + config.loss_hold.as_secs();
+    assert_eq!(held["error"]["args"]["until"], until, "{held}");
     o.other_identity(1).await;
     // Accepted within the global budget; STOP: mined, status 1, its value lost too.
     let second = s.unrefunded(&o, "00").await;
@@ -433,7 +435,6 @@ async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
     );
     // Past the budget's window both still hold their identities; past the hold, the
     // rows go: nothing is held or counted.
-    let ledger = rusqlite::Connection::open(&path).unwrap();
     let back = |secs: u64| {
         let sql = format!("UPDATE identities SET at = at - {secs}");
         ledger.execute(&sql, []).unwrap();
