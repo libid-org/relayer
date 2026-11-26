@@ -417,7 +417,11 @@ impl Onboarding {
             let left_out = calls[k..].iter().map(|c| eip2028(&c.abi_encode()));
             let before = used + left_out.sum::<u64>() + extra;
             let reserve = reserve(floor.to(), create);
-            limit = limit.max(((before * 5).div_ceil(4)) + reserve);
+            let margin = match sim.max_used_gas {
+                Some(_) => (before * 105).div_ceil(100).max(before + 50_000),
+                None => (before * 5).div_ceil(4),
+            };
+            limit = limit.max(margin + reserve);
         }
         limit
     }
