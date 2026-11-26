@@ -1295,12 +1295,13 @@ fn words(message: &str) -> Vec<String> {
 }
 
 /// A node's answer that names a refusal of its pool, in whole words: [`FOR_GOOD`],
-/// [`FOR_NOW`], or a pool that "is full". Not "nonce too low", which a gateway that
+/// [`FOR_NOW`], "under priced" (`UnderPriced`), or a pool that "is full". Not "nonce too low", which a gateway that
 /// sends again answers for a send it landed, nor a rate limit.
 fn pool_refused(message: &str) -> bool {
     let words = words(message);
     let named = |w: &String| FOR_GOOD.contains(&&w[..]) || FOR_NOW.contains(&&w[..]);
-    words.iter().any(named) || words.windows(2).any(|w| w == ["is", "full"])
+    let pair = |w: &[String]| w == ["is", "full"] || w == ["under", "priced"];
+    words.iter().any(named) || words.windows(2).any(pair)
 }
 
 /// A node error that the same run or send meets again: an error response naming
@@ -1489,6 +1490,7 @@ mod tests {
             ("InsufficientFunds", true),
             ("FeeTooLow", true),
             ("ReplacementTransactionUnderpriced", true),
+            ("UnderPriced", true),
             ("nonce too low", false),
             ("NonceTooLow", false),
             ("already known", false),
