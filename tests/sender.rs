@@ -1638,3 +1638,20 @@ async fn a_loss_counts_the_receipts_l1_fee() {
     let lost = relayer::stats::stats(&path, &o.config()).unwrap().lost;
     assert_eq!(lost, gas + U256::ONE, "not its gas and l1Fee");
 }
+
+/// A ledger whose lowest nonce in flight is above the key's mined count is refused at
+/// start.
+#[tokio::test]
+async fn a_mined_count_below_the_lowest_nonce_in_flight_is_refused() {
+    let (o, path) = (Onboarding::new(true).await, db("below-lowest"));
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let r = o.start(&path).await.unwrap();
+    o.queue(&r).await;
+    r.tick().await.unwrap();
+    drop(r);
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let ahead = "UPDATE identities SET nonce = nonce + 1; UPDATE nonce SET next = next + 1";
+    ledger.execute_batch(ahead).unwrap();
+    let refused = o.restart(&path).await.err().unwrap();
+    assert!(refused.contains("nonce drift"), "{refused}");
+}
