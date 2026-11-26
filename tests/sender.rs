@@ -125,9 +125,9 @@ impl Onboarding {
 }
 
 /// Fails `eth_sendRawTransaction` once when armed: `RACE` mines a transaction of the
-/// key first, `ECHO` sends the transaction, then answers with an error. `LOST` does so
-/// with a transport error on every send, and shows no transaction by hash, as a node
-/// whose forward to the sequencer looked failed. `STALL` and
+/// key first, `ECHO` sends the transaction, then answers with a pool's refusal. `LOST`
+/// sends it with a transport error on every send, and shows no transaction by hash, as
+/// a node whose forward to the sequencer looked failed. `STALL` and
 /// `BROKE` make every `eth_call` a node error: a wrong chain id, and no funds.
 #[derive(Clone)]
 struct Racing(DynProvider, std::sync::Arc<std::sync::atomic::AtomicU8>);
@@ -312,7 +312,7 @@ impl Provider for Racing {
             if mode != ECHO {
                 return Ok(sent);
             }
-            let echoed = r#"{"code": -32000, "message": "echoed"}"#;
+            let echoed = r#"{"code": -32000, "message": "transaction underpriced"}"#;
             let echoed = serde_json::from_str(echoed).unwrap();
             Err(alloy::transports::RpcError::ErrorResp(echoed))
         })
