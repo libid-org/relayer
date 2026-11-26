@@ -1116,8 +1116,8 @@ async fn a_spent_budget_holds_the_queue() {
     ledger
         .execute(
             "INSERT INTO identities (platform, id_node, id, wallet, tx, net, l1, deadline, \
-             status, worst, loss) VALUES (x'01', x'01', x'01', x'', '', x'', x'', 0, \
-             'failed', ?1, ?1)",
+             status, worst, loss, holds) VALUES (x'01', x'01', x'01', x'', '', x'', x'', \
+             0, 'failed', ?1, ?1, 1)",
             [spent],
         )
         .unwrap();
