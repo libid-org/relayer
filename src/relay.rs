@@ -277,18 +277,13 @@ impl<P: Provider> Relayer<P> {
         let mut conn = Connection::open(db)?;
         let tables: u64 =
             conn.query_row("SELECT count(*) FROM sqlite_master", [], first)?;
-        let version: i32 = conn.query_row("PRAGMA user_version", [], first)?;
         if tables == 0 {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.commit()?;
-        } else if version != VERSION {
-            let old = format!(
-                "{} has schema version {version}, not {VERSION}",
-                db.display()
-            );
-            return Err(format!("{old}: start on a fresh database file").into());
+        } else {
+            versioned(&conn, db)?;
         }
         let mined = provider.get_transaction_count(config.relayer).latest();
         let (mined, next) = (
@@ -1126,6 +1121,19 @@ impl<P: Provider> Relayer<P> {
     fn db(&self) -> MutexGuard<'_, Connection> {
         self.db.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// `conn`, the ledger at `db`, has the schema version [`VERSION`].
+pub(crate) fn versioned(conn: &Connection, db: &Path) -> Result<(), Error> {
+    let version: i32 = conn.query_row("PRAGMA user_version", [], first)?;
+    if version != VERSION {
+        let old = format!(
+            "{} has schema version {version}, not {VERSION}",
+            db.display()
+        );
+        return Err(format!("{old}: start on a fresh database file").into());
+    }
+    Ok(())
 }
 
 /// What the rows lost over the last `window`: each charged loss by when it was

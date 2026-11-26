@@ -23,6 +23,7 @@ use crate::{
     relay::{
         counts,
         lost,
+        versioned,
         Error,
     },
 };
@@ -68,10 +69,12 @@ impl fmt::Display for Stats {
     }
 }
 
-/// The numbers of the ledger at `db`, opened read-only, under `config`'s budget window
-/// and loss hold.
+/// The numbers of the ledger at `db`, opened read-only and of the schema version a
+/// relayer runs, under `config`'s budget window and loss hold.
 pub fn stats(db: &Path, config: &Config) -> Result<Stats, Error> {
-    let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let path = db;
+    let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    versioned(&db, path)?;
     let (requests, held, pending) =
         counts(&db, (config.loss_hold, config.global_budget.window))?;
     Ok(Stats {

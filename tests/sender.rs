@@ -360,8 +360,8 @@ async fn the_same_request_twice_is_one_id_and_one_transaction() {
 }
 
 /// An instance holds `flock` on `<db>.lock`; any other holder refuses start. A
-/// database of another schema version is refused, naming the fix, and so are settings
-/// under the least the sender keeps.
+/// database of another schema version is refused, naming the fix, by start and by
+/// `stats`, and so are settings under the least the sender keeps.
 #[tokio::test]
 async fn a_second_instance_or_an_older_schema_is_refused() {
     let (o, db) = (Onboarding::new(false).await, db("lock"));
@@ -432,6 +432,14 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
     Relayer::start(o.relayer.clone(), least, &crate::db("least"))
         .await
         .unwrap();
+    // `stats` refuses a ledger of another schema version too.
+    let ledger = rusqlite::Connection::open(&db).unwrap();
+    ledger.pragma_update(None, "user_version", 5).unwrap();
+    let refused = relayer::stats::stats(&db, &o.config()).err().unwrap();
+    assert!(
+        refused.to_string().contains("schema version 5"),
+        "{refused}"
+    );
 }
 
 /// A send left pending at a restart holds the queue: past its inclusion window, its
