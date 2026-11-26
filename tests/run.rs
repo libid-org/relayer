@@ -64,6 +64,13 @@ fn the_example_loads_with_its_overrides() {
     assert_eq!(s.config.max_value, None);
     let unset = load(&EXAMPLE.replace("tick_timeout = \"30s\"", ""), &|_| None);
     assert_eq!(unset.unwrap().config.tick_timeout, Duration::from_secs(30));
+    let waits = load(
+        &EXAMPLE.replace("queue_wait = \"60s\"", "queue_wait = \"90s\""),
+        &|_| None,
+    );
+    assert_eq!(waits.unwrap().config.queue_wait, Duration::from_secs(90));
+    let unset = load(&EXAMPLE.replace("queue_wait = \"60s\"", ""), &|_| None);
+    assert_eq!(unset.unwrap().config.queue_wait, Duration::from_secs(60));
     let capped = EXAMPLE.replace("# max_value", "max_value");
     let max = load(&capped, &|_| None).unwrap().config.max_value;
     assert_eq!(max, Some(U256::from(10u64.pow(16))));

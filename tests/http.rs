@@ -318,6 +318,7 @@ async fn refusals_carry_their_decoded_names() {
     let max = config["maxGasLimit"].as_u64().unwrap();
     assert_eq!(config["maxTransactionBytes"], 131_072);
     assert_eq!(config["registry"], json!(o.stack.wallet_registry));
+    assert_eq!(config["queueWaitSeconds"], o.config().queue_wait.as_secs());
     let mut over = wire(&unclaimed);
     over["gasLimit"] = (max + 1).into();
     let (code, high) = s.call("/v1/relay", Some(over)).await;
