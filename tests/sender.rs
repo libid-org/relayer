@@ -382,7 +382,8 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
     assert!(o.start(&db).await.err().unwrap().contains(&lock));
     let old = crate::db("schema");
     let conn = rusqlite::Connection::open(&old).unwrap();
-    conn.execute_batch("CREATE TABLE nonce (next)").unwrap();
+    conn.execute_batch("CREATE TABLE nonce (next); PRAGMA user_version = 5")
+        .unwrap();
     let refused = o.start(&old).await.err().unwrap();
     assert!(refused.contains("fresh database file"), "{refused}");
     let short = Config {
