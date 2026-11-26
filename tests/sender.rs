@@ -156,6 +156,13 @@ const FULL: u8 = 12;
 const LOST: u8 = 13;
 /// Sends the next raw transaction, then never answers.
 const SILENT: u8 = 14;
+/// Refuses every raw transaction unsent as oversized, each after [`SLOWLY`].
+const SLOW: u8 = 15;
+/// Refuses the next raw transaction unsent as Nethermind does one that a pending
+/// transaction of the key holds its nonce against.
+const NOT_ALLOWED: u8 = 16;
+
+const SLOWLY: std::time::Duration = std::time::Duration::from_secs(3);
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -294,7 +301,16 @@ impl Provider for Racing {
                 let sent = self.0.send_transaction(any).await?;
                 sent.get_receipt().await.unwrap();
             }
-            if mode == OVERSIZED {
+            if mode == SLOW {
+                self.1.store(SLOW, Ordering::Relaxed);
+                tokio::time::sleep(SLOWLY).await;
+            }
+            if mode == NOT_ALLOWED {
+                let refused = r#"{"code": -32010, "message": "ReplacementNotAllowed"}"#;
+                let refused = serde_json::from_str(refused).unwrap();
+                return Err(alloy::transports::RpcError::ErrorResp(refused));
+            }
+            if mode == OVERSIZED || mode == SLOW {
                 let refused = r#"{"code": -32000, "message": "OversizedData"}"#;
                 let refused = serde_json::from_str(refused).unwrap();
                 return Err(alloy::transports::RpcError::ErrorResp(refused));
@@ -427,6 +443,7 @@ async fn a_second_instance_or_an_older_schema_is_refused() {
         inclusion_window: 2 * o.config().block_time,
         max_fee_percent: 100,
         max_cancel_fee_percent: 110,
+        loss_hold: window,
         ..o.config()
     };
     Relayer::start(o.relayer.clone(), least, &crate::db("least"))
@@ -987,6 +1004,28 @@ async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
     );
 }
 
+/// Sends the node refuses slowly fail one after another until the tick has run
+/// `FAILING_TICK`; the rest wait for the next tick.
+#[tokio::test]
+async fn a_tick_of_failing_sends_ends_with_the_rest_queued() {
+    let mut o = Onboarding::new(true).await;
+    let (r, mode) = o.armable(&db("slow")).await;
+    let mut ids = vec![o.queue(&r).await];
+    for n in 1..=2 {
+        o.other_identity(n).await;
+        ids.push(o.queue(&r).await);
+    }
+    mode.store(SLOW, Ordering::Relaxed);
+    r.tick().await.unwrap();
+    let mut statuses = Vec::new();
+    for id in &ids {
+        statuses.push(r.status(*id).await.unwrap().status);
+    }
+    let failed = matches!(statuses[0], Status::Failed(Refusal::Node(_)));
+    assert!(failed, "{statuses:?}");
+    assert!(matches!(statuses[2], Status::Queued), "{statuses:?}");
+}
+
 /// A first send the node refuses for now holds the queue unsent; refused for
 /// `node_error_ticks` ticks in a row, it fails as `Node`, and the next, refused once, is
 /// sent once the node accepts it.
@@ -1073,6 +1112,22 @@ async fn a_refused_first_send_is_queued_again_and_pauses() {
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
     assert!(report.tx_hashes.is_empty(), "sent while paused");
+}
+
+/// A first send refused as `ReplacementNotAllowed`, in camelCase, is queued again and
+/// pauses.
+#[tokio::test]
+async fn a_send_refused_in_camel_case_as_a_replacement_pauses() {
+    let o = Onboarding::new(true).await;
+    let (r, mode) = o.armable(&db("not-allowed")).await;
+    let id = o.queue(&r).await;
+    mode.store(NOT_ALLOWED, Ordering::Relaxed);
+    let refused = r.tick().await.expect_err("refusal unreported").to_string();
+    assert!(refused.contains("ReplacementNotAllowed"), "{refused}");
+    let report = r.status(id).await.unwrap();
+    let queued = matches!(report.status, Status::Queued);
+    assert!(queued && report.tx_hashes.is_empty(), "{:?}", report.status);
+    assert!(r.paused(), "not paused");
 }
 
 /// The key's nonce taken between the pinned block and the broadcast: the node answers
