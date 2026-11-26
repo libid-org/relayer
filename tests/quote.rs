@@ -193,10 +193,10 @@ async fn anvil_simulates_a_draft_to_execution_not_signed() {
     assert_eq!(data[..], IWebWallet::ExecutionNotSigned::SELECTOR);
 }
 
-/// The create path: `callGas` is quoted for its dearest call; a `callGas` signed above
-/// the quote is `GasLimitTooLow` with the
-/// relay-time limit; the quoted one lands at that limit, and a last call that swallows
-/// a failed inner call (`ReferralSplitter._deliver`) gets `callGas` and succeeds.
+/// The create path: `callGas` is quoted per call, each under the whole run; a
+/// `callGas` signed above the quote is `GasLimitTooLow` with the relay-time limit;
+/// the quoted one lands at that limit, and a last call that swallows a failed inner
+/// call (`ReferralSplitter._deliver`) gets `callGas` and succeeds.
 #[tokio::test]
 async fn the_create_path_lands_at_the_relay_time_limit() {
     let o = Onboarding::new(true).await;
@@ -704,7 +704,11 @@ async fn an_existing_wallet_is_relayed_only_signing_in_again() {
         "{refused:?}"
     );
     let fresh = key_of(&PrivateKeySigner::random());
-    let b = Batch(vec![o.login(&fresh, 2), refund], o.value, vec![&o.k], None);
+    let login = Execution {
+        target: Address::ZERO,
+        ..o.login(&fresh, 2)
+    };
+    let b = Batch(vec![login, refund], o.value, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &b).await;
     let data = o.authorize(&b, Some(&q.call_gas)).await;
     o.send(&o.request_at(&data, q.gas_limit).await).await;
