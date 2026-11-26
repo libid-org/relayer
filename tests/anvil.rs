@@ -111,7 +111,7 @@ async fn refuses_before_sending() {
     let unknown = |r: &Refusal| matches!(r, Refusal::UnknownWallet);
     // The batch ran on the target: its link or bind failed, not the check.
     let failed_call = |r: &Refusal| reverted(r, "FailedCall");
-    let wrong_bind = |r: &Refusal| reverted(r, "WrongBindValue");
+    let no_sign_in = |r: &Refusal| matches!(r, Refusal::SignInMissing);
 
     let nested = IWebWallet::executeCall {
         mode: AUTHORIZED_MODE,
@@ -206,7 +206,7 @@ async fn refuses_before_sending() {
         ("fake genesisIdentity", impostor, unknown),
         ("EIP-7702 account", on(account, sign_at(U256::ZERO, now, now + o.longest())), unknown),
         ("planted release", on(planted, sign_at(U256::ZERO, now, now + o.longest())), unknown),
-        ("factory wallet", on(existing, good.clone()), wrong_bind),
+        ("factory wallet, the batch another's", on(existing, good.clone()), no_sign_in),
     ];
 
     let nonce = o.relayer_nonce().await;

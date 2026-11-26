@@ -36,6 +36,7 @@ use crate::{
         outer,
         refunds,
         reverted,
+        signed_in,
         target,
         under_max,
         under_max_value,
@@ -108,9 +109,18 @@ impl Draft {
             config,
             &outer(config, wallet, create, &self.data, message.value),
         )?;
-        // Only the target refuses for the draft; the rest fail as the node.
+        // Only the target, then the sign-in, refuse for the draft; the rest fail as the
+        // node.
+        let target = async {
+            let value = message.value;
+            let target = target(provider, config, wallet, create, &self.data, value);
+            let (call, signed_in) =
+                tokio::join!(target, signed_in(provider, wallet, &executions));
+            let call = call?;
+            signed_in.map(|()| call)
+        };
         let (call, header, tip) = tokio::try_join!(
-            target(provider, config, wallet, create, &self.data, message.value),
+            target,
             gas::latest(provider),
             gas::tip(provider, config.tip_percentile),
         )?;

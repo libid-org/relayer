@@ -488,6 +488,21 @@ impl Onboarding {
         fake
     }
 
+    /// A login of the identity in the wallet's own batch, adding `key`'s session; `n`
+    /// sets its proof apart.
+    fn login(&self, key: &Bytes, n: u8) -> Execution {
+        let wallet = self.wallet;
+        let list = stub_payload(&StubPayload {
+            ceremonyVersion: 1,
+            operationDomain: ADD_SESSION_DOMAIN,
+            authorizationNonce: B256::repeat_byte(n),
+            transactionData: transaction_data(self.chain_id, wallet, wallet, key, &admin()),
+        });
+        let login = (self.stack.platform, self.version, list, admin());
+        let login = IWebWallet::addSessionByLoginCall::new(login);
+        call(wallet, self.value, login.abi_encode())
+    }
+
     /// K is the wallet's admin session and the escrow paid the wallet.
     async fn assert_onboarded(&self, refund: U256) {
         let wallet = IWebWallet::new(self.wallet, &self.owner);

@@ -415,6 +415,7 @@ fn described(refusal: &Refusal) -> (C, Value) {
     let (status, message) = match refusal {
         NoncanonicalData => (C::BAD_REQUEST, "data does not re-encode to itself"),
         RefundMissing => (C::BAD_REQUEST, "no top-level Execution(relayer, R, \"\")"),
+        SignInMissing => (C::BAD_REQUEST, "the batch carries no sign-in"),
         RefundTooLow { .. } => (C::BAD_REQUEST, "sign a refund of at least `required`"),
         GasLimitTooLow { .. } => (C::BAD_REQUEST, "quote again for `required` gas"),
         GasLimitTooHigh { .. } => (C::BAD_REQUEST, "the batch needs over `max` gas"),

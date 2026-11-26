@@ -105,7 +105,8 @@ A refusal throws `RelayerError` with the HTTP `status` and the relayer's
 `args.max`, which `onboard`'s deadline, `validUntil` plus the config's
 `queueWaitSeconds` and `inclusionWindowSeconds`, does not. A quote refused
 as `LinkSessionRefused` means the proof is not this wallet's genesis
-identity. `waitFor` throws on a reverted inclusion, a
+identity. `SignInMissing` means the batch carries no sign-in, which the
+relayer requires; `onboard`'s link of a new wallet is one. `waitFor` throws on a reverted inclusion, a
 failure or a cancellation.
 
 Assumption: the claim page knows the X user id before the ceremony (from the

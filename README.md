@@ -133,6 +133,17 @@ On `[http] port`:
 The API answers CORS preflights from any origin, for `GET` and `POST` with a
 `content-type` header; it takes no credentials.
 
+The relayer pays only for a batch that signs its wallet in, which takes a
+fresh identity proof: a top-level call of the wallet (itself or
+`address(0)`) to `addSessionByLogin`, or to `linkIdentity` while the wallet
+has no code or never had a session, as a new wallet's onboarding does.
+Anything else is `SignInMissing`, quoted or relayed. A login in the wallet's
+own batch names the wallet as its submitter, and a live session signs the
+batch: the key it adds signs only from the next second. Below quorum a call
+of the wallet is an admin operation, so a below-quorum batch is never paid
+for. `removeSessionsByLogin` does not count: it adds a session only when its
+payload carries a key.
+
 `create` is `{platformId, idNode, salt}` when the batch creates the wallet.
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
 signatures. A quote's `callGas`, which the wallet reserves before each call,
@@ -174,7 +185,7 @@ A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 
 | Status | Names |
 | ------ | ----- |
-| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `TooLarge`, `ValueTooHigh`, `UnknownWallet`, `UnsupportedRelease`, `Expired`, `DeadlineTooFar`, a reverting batch's decoded error (`Reverted` when unknown) |
+| `400`  | `BadRequest`, `NoncanonicalData`, `RefundMissing`, `SignInMissing`, `RefundTooLow`, `GasLimitTooLow`, `GasLimitTooHigh`, `TooLarge`, `ValueTooHigh`, `UnknownWallet`, `UnsupportedRelease`, `Expired`, `DeadlineTooFar`, a reverting batch's decoded error (`Reverted` when unknown) |
 | `404`  | `UnknownRequest` |
 | `408`  | past `request_timeout` |
 | `409`  | `IdentityBusy`: another request of the identity is in flight, `args.id` |

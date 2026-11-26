@@ -99,6 +99,9 @@ pub enum Refusal {
     NoncanonicalData,
     /// No top-level `Execution(relayer, R, "")` in the batch.
     RefundMissing,
+    /// The batch carries no sign-in: a top-level `addSessionByLogin` of the wallet, or
+    /// its `linkIdentity` while it never had a session.
+    SignInMissing,
     /// `R - value` does not cover the gas and L1 fee bound.
     RefundTooLow {
         /// The batch's refund.
@@ -186,6 +189,7 @@ impl Refusal {
         match self {
             Self::NoncanonicalData => "NoncanonicalData",
             Self::RefundMissing => "RefundMissing",
+            Self::SignInMissing => "SignInMissing",
             Self::RefundTooLow { .. } => "RefundTooLow",
             Self::GasLimitTooLow { .. } => "GasLimitTooLow",
             Self::GasLimitTooHigh { .. } => "GasLimitTooHigh",
@@ -224,8 +228,15 @@ impl Request {
         let refund = refund(&executions, config.relayer).ok_or(Refusal::RefundMissing)?;
         let call = target(provider, config, wallet, create, &self.data, value);
         let identity = genesis(provider, wallet, create);
-        let target = async { Ok((call.await?, identity.await?)) };
-        // Only the target refuses for the request; the rest fail as the node.
+        let signed_in = signed_in(provider, wallet, &executions);
+        // The target refuses before the sign-in.
+        let target = async {
+            let (call, identity, signed_in) = tokio::join!(call, identity, signed_in);
+            let call = call?;
+            signed_in?;
+            Ok((call, identity?))
+        };
+        // Only the target and the sign-in refuse for the request; the rest fail as the node.
         let (header, (call, identity), tip, l1_fee_bound) = tokio::try_join!(
             gas::latest(provider),
             target,
@@ -300,6 +311,36 @@ pub(crate) fn decode(
 /// R: what the batch's top-level `Execution(relayer, R, "")` calls pay.
 fn refund(executions: &[Execution], relayer: Address) -> Option<U256> {
     refunds(executions, relayer).reduce(U256::saturating_add)
+}
+
+/// `SignInMissing` unless the batch signs its wallet in: a top-level call of the wallet,
+/// itself or `address(0)`, to `addSessionByLogin`, or to `linkIdentity` while the
+/// wallet has no code or never had a session. A login runs only on a fresh proof.
+pub(crate) async fn signed_in<P: Provider>(
+    provider: &P,
+    wallet: Address,
+    executions: &[Execution],
+) -> Result<(), Refusal> {
+    let own = executions
+        .iter()
+        .filter(|e| e.target == wallet || e.target == Address::ZERO)
+        .filter_map(|e| e.callData.get(..4));
+    let selectors: Vec<&[u8]> = own.collect();
+    let calls = |selector: [u8; 4]| selectors.contains(&&selector[..]);
+    if calls(IWebWallet::addSessionByLoginCall::SELECTOR) {
+        return Ok(());
+    }
+    if !calls(IWebWallet::linkIdentityCall::SELECTOR) {
+        return Err(Refusal::SignInMissing);
+    }
+    if provider.get_code_at(wallet).await.map_err(node)?.is_empty() {
+        return Ok(());
+    }
+    let wallet = IWebWallet::new(wallet, provider);
+    match wallet.hadSession().call().await.map_err(node)? {
+        false => Ok(()),
+        true => Err(Refusal::SignInMissing),
+    }
 }
 
 /// The values of the batch's top-level `Execution(relayer, R, "")` calls.
