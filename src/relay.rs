@@ -874,9 +874,14 @@ impl<P: Provider> Relayer<P> {
         let db = self.db();
         let sql = "SELECT worst, tx, cancel IS NOT NULL FROM identities WHERE id = ?1";
         let row = |r: &Row| Ok((u256(r, 0)?, r.get::<_, String>(1)?, r.get(2)?));
-        let (worst, tx, cancelled): (_, String, bool) = db.query_row(sql, [&id[..]], row)?;
+        let (worst, tx, cancelled): (_, String, bool) =
+            db.query_row(sql, [&id[..]], row)?;
         let tx: TransactionRequest = serde_json::from_str(&tx)?;
-        let value = if cancelled { U256::ZERO } else { tx.value.unwrap_or_default() };
+        let value = if cancelled {
+            U256::ZERO
+        } else {
+            tx.value.unwrap_or_default()
+        };
         let loss = worst.saturating_sub(value);
         db.execute(
             "UPDATE identities SET loss = ?4, holds = 1, at = unixepoch(), \
@@ -1125,7 +1130,11 @@ impl<P: Provider> Relayer<P> {
 
 /// What the rows lost over the last `window`: each charged loss by when it was
 /// charged, and with `pending` each send not yet charged at its worst.
-pub(crate) fn lost(db: &Connection, window: Duration, pending: bool) -> Result<U256, Error> {
+pub(crate) fn lost(
+    db: &Connection,
+    window: Duration,
+    pending: bool,
+) -> Result<U256, Error> {
     let sql = "SELECT coalesce(loss, worst) FROM identities WHERE worst IS NOT NULL \
                AND iif(loss IS NULL, ?2, at > unixepoch() - ?1)";
     let losses = rows(db, sql, params![window.as_secs(), pending], |r| u256(r, 0))?;

@@ -157,7 +157,10 @@ impl Onboarding {
             .await;
         // The sessions sign from the second after the block that added them.
         let added = self.now().await;
-        self.owner.anvil_set_next_block_timestamp(added + 1).await.unwrap();
+        self.owner
+            .anvil_set_next_block_timestamp(added + 1)
+            .await
+            .unwrap();
         self.owner.anvil_mine(Some(1), None).await.unwrap();
         assert_eq!(self.now().await, added + 1);
         (k, token, leaves)
