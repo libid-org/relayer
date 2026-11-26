@@ -138,11 +138,12 @@ const PEAK_MARGIN: u128 = 50_000;
 /// floor `floors[i]`. A run at its margin, `max(ceil(1.05 × peak), peak + 50 000)`,
 /// the peak being `maxUsedGas`, what the run needs before its refund (EIP-3529); from
 /// a node that gives none, `ceil(1.25 × gasUsed)` instead. With the gas `before` each
-/// call, the most of the run and each `before[i]` with `extra` at that margin plus
-/// `(floors[i] + CALL_OVERHEAD) × (64/63)^d`; without, the run plus that of the
-/// highest floor. Each 64/63 is a frame's kept 1/64: the wallet's check, and the
-/// delegatecall of the wallet proxy, so `d` is 2; the create path adds the factory
-/// proxy's delegatecall and its call of the wallet, so 4.
+/// call, the most of the run and, for each call, `(before[i] + extra) × (64/63)^(d−1)`
+/// at that margin plus `(floors[i] + CALL_OVERHEAD) × (64/63)^d`; without, the run plus
+/// that of the highest floor. Each 64/63 is a frame's kept 1/64: the wallet's check,
+/// and the delegatecall of the wallet proxy, so `d` is 2; the create path adds the
+/// factory proxy's delegatecall and its call of the wallet, so 4. The outer `d − 1`
+/// frames keep theirs of the gas before the call too.
 pub(crate) fn limit(
     sim: &SimCallResult,
     extra: u64,
@@ -151,22 +152,23 @@ pub(crate) fn limit(
     create: bool,
 ) -> u64 {
     let d = if create { 4 } else { 2 };
-    let reserve = |floor: u64| {
-        let reserve = u128::from(floor) + u128::from(CALL_OVERHEAD);
-        (reserve * 64u128.pow(d)).div_ceil(63u128.pow(d))
+    let kept =
+        |gas: u128, frames: u32| (gas * 64u128.pow(frames)).div_ceil(63u128.pow(frames));
+    let reserve = |floor: u64| kept(u128::from(floor) + u128::from(CALL_OVERHEAD), d);
+    let margin = |used: u128, peak: u128| match sim.max_used_gas {
+        Some(_) => (peak * 105).div_ceil(100).max(peak + PEAK_MARGIN),
+        None => (used * 5).div_ceil(4),
     };
-    let margin = |used: u64, peak: u64| match sim.max_used_gas {
-        Some(_) => {
-            let peak = u128::from(peak) + u128::from(extra);
-            (peak * 105).div_ceil(100).max(peak + PEAK_MARGIN)
-        }
-        None => (u128::from(used + extra) * 5).div_ceil(4),
-    };
-    let run = margin(sim.gas_used, sim.max_used_gas.unwrap_or_default());
+    let extra = u128::from(extra);
+    let (used, peak) = (sim.gas_used, sim.max_used_gas.unwrap_or_default());
+    let run = margin(u128::from(used) + extra, u128::from(peak) + extra);
     let limit = match before {
         Some(before) => {
             let each = before.iter().zip(floors);
-            let each = each.map(|(&b, &floor)| margin(b, b) + reserve(floor));
+            let each = each.map(|(&b, &floor)| {
+                let b = kept(u128::from(b) + extra, d - 1);
+                margin(b, b) + reserve(floor)
+            });
             each.fold(run, u128::max)
         }
         None => run + reserve(floors.iter().copied().max().unwrap_or_default()),
@@ -439,6 +441,20 @@ pub(crate) async fn l1_bound<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gas_before_a_call_is_priced_through_the_outer_frames() {
+        let sim = SimCallResult {
+            gas_used: 100_000,
+            max_used_gas: Some(100_000),
+            ..Default::default()
+        };
+        let before = [1_000_000];
+        // 1e6 × (64/63)^3 = 1 048 379, × 1.05 = 1 100 798; 20 000 × (64/63)^4 = 21 301.
+        assert_eq!(limit(&sim, 0, &[0], Some(&before), true), 1_122_099);
+        // 1e6 × 64/63 = 1 015 874, × 1.05 = 1 066 668; 20 000 × (64/63)^2 = 20 640.
+        assert_eq!(limit(&sim, 0, &[0], Some(&before), false), 1_087_308);
+    }
 
     #[test]
     fn a_pinned_read_requires_the_canonical_block() {

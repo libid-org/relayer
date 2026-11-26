@@ -398,7 +398,8 @@ impl Onboarding {
 
     /// The relay-time limit by hand, of `data` run with `extra` gas more: the most of
     /// [`run_limit`] and, before each call, the gas its cut used with the calldata of the
-    /// calls the cut leaves out at that margin, plus the reserve of its signed floor.
+    /// calls the cut leaves out, kept by the `d − 1` outer frames, at that margin, plus
+    /// the reserve of its signed floor.
     async fn limit_with(&self, data: &Bytes, value: U256, extra: u64) -> u64 {
         let sim = self.simulated(data, value).await;
         assert!(sim.status, "{sim:?}");
@@ -416,6 +417,7 @@ impl Onboarding {
             let used = self.simulated(&cut, value).await.gas_used;
             let left_out = calls[k..].iter().map(|c| eip2028(&c.abi_encode()));
             let before = used + left_out.sum::<u64>() + extra;
+            let before = kept(before, if create { 3 } else { 1 });
             let reserve = reserve(floor.to(), create);
             let margin = match sim.max_used_gas {
                 Some(_) => (before * 105).div_ceil(100).max(before + 50_000),
@@ -594,8 +596,13 @@ fn run_limit(sim: &alloy::rpc::types::simulate::SimCallResult, extra: u64) -> u6
 /// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the
 /// create path and 2 otherwise.
 fn reserve(call_gas: u64, create: bool) -> u64 {
-    let d = if create { 4 } else { 2 };
-    ((call_gas + CALL_OVERHEAD) * 64u64.pow(d)).div_ceil(63u64.pow(d))
+    kept(call_gas + CALL_OVERHEAD, if create { 4 } else { 2 })
+}
+
+/// `gas × (64/63)^frames`, rounded up: what `frames` frames that each keep 1/64 need
+/// to pass `gas` on.
+fn kept(gas: u64, frames: u32) -> u64 {
+    (gas * 64u64.pow(frames)).div_ceil(63u64.pow(frames))
 }
 
 /// 4 gas a zero byte and 16 any other.

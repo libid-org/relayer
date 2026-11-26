@@ -426,7 +426,8 @@ async fn cuts_at_their_calldata_floor_are_quoted_the_whole_run() {
 /// same data one 64/63 factor of the highest floor's reserve below that limit reverts
 /// `InsufficientCallGas`. On the create path, under EIP-7825's 2^24 gas, the run's
 /// margin covers one factor, so the least gas it runs at is shown above the highest
-/// floor's whole depth-4 reserve instead.
+/// floor's whole depth-4 reserve instead, and the limit at least the margin's 50 000
+/// above that least gas.
 #[tokio::test]
 async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     let o = Onboarding::new(true).await;
@@ -442,11 +443,13 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
         let call_gas = *floors.iter().max().unwrap();
         let create = o.path().await.is_some();
         let tx = o.outer(&data, b.1).await;
+        let mut at_least = 0;
         if create {
             let tx = TransactionRequest { gas: None, ..tx };
             let least = o.relayer.estimate_gas(tx).await.unwrap();
             let reserve = reserve(call_gas, true);
             assert!(least > reserve, "{least} within {reserve}");
+            at_least = least + 50_000;
         } else {
             let short = limit - reserve(call_gas, false) / 64;
             let e = o.relayer.call(tx.with_gas_limit(short)).await.unwrap_err();
@@ -463,6 +466,8 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
             .await
             .transaction_hash;
         let sent = o.tx(hash).await.inner.gas_limit();
+        // On the create path, the margin's 50 000 above what the outer frames keep.
+        assert!(sent >= at_least, "sent at {sent}, under {at_least}");
         assert!(
             sent.abs_diff(limit) <= 2,
             "sent at {sent}, expected {limit}"

@@ -153,7 +153,8 @@ in one block, for batches of up to 8 calls, at most the whole run's gas; a
 longer batch, one whose cuts do not run, or one with a cut billed at its
 EIP-7623 calldata floor, gets the whole run's gas for each. The gas limit is
 the most of the run at its margin and, before each call, the gas its cut
-used with the calldata of the calls it leaves out, at that margin, plus
+used with the calldata of the calls it leaves out, times `(64/63)^(d−1)` for
+the outer frames' kept 1/64, at that margin, plus
 `(floor + CALL_OVERHEAD) × (64/63)^d`, `d` 4 on the create path and 2
 otherwise; without cuts, the run plus that of the highest floor. A relay
 measures the signed batch the same way. A call that needs more than its run
