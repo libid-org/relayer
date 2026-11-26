@@ -14,7 +14,6 @@ Two steps, because the ceremony's proof commits the wallet and the key.
 ```ts
 import { idNode } from '@libid/contracts'
 import {
-  indexerHoldings,
   onboard,
   onboardingTransactionData,
   relayerConfig,
@@ -40,7 +39,6 @@ const onboarded = await onboard({
   identityRegistry,
   escrow,
   handleNode,
-  holdings: indexerHoldings(indexerUrl),
 })
 const { received } = await waitFor(relayerUrl, onboarded.id, { client, onboarded })
 ```
@@ -61,7 +59,9 @@ proof would take each payload format's layout or a second `verify` call.
 `onboard`:
 
 1. Reads the relayer's config, the link fee (`WalletRegistry.quoteFor`), the
-   factory's latest release, the chain's time and the handle's holdings.
+   factory's latest release, the chain's time, and what the escrow holds for
+   the handle of the chain's coin and each approved token
+   (`HandleEscrow.escrowed`).
 2. Claims the escrow's ETH and every approved token held; the one the quoter
    values highest pays the swap. With none of them, it throws `ClaimTooSmall`.
    Tokens outside the table stay in the escrow.
@@ -76,10 +76,12 @@ proof would take each payload format's layout or a second `verify` call.
    allowance is left. The surplus ETH stays in the wallet. When the token
    cannot cover the shortfall, it throws `ClaimTooSmall {held, required}`,
    both in wei.
-5. Relays it. On `GasLimitTooLow` it quotes and signs once more.
+5. Relays it, posting the same body again, up to three times in all, after a
+   network error or a `408` or `5xx` answer: a lost answer leaves no request
+   without its id. On `GasLimitTooLow` it quotes and signs once more.
 
 It returns the request `id`, the `wallet`, the genesis session `key`, the
-`quote`, the claimed `tokens` (`native` is the chain's coin), and the refund's
+`quote`, the batch's `deadline` (Unix seconds), the claimed `tokens` (`native` is the chain's coin), and the refund's
 parts: `linkFee`, `gasRefund` (`minRefund`) and `swapped`
 (`{token, amountIn, ethOutMin}`). With `client`
 and the onboarding, `waitFor` also returns `received`: what the new wallet
@@ -90,14 +92,20 @@ with `client` and the onboarding reads the chain instead, settled once the
 wallet has code and `key` is its admin session (at the latest block, with no
 `txHashes`). While it is not, `waitFor` throws `RequestDropped` at once: the
 request failed and a later one of the identity replaced it, or it was
-dropped. Relay again.
+dropped. Relay again. `waitFor` polls through network errors and `408` or
+`5xx` answers until its timeout. A cancelled batch may still land, sent by
+anyone, until its deadline: with `client` and the onboarding, `waitFor`
+waits for a block past it, then settles from the chain as above or throws
+`Cancelled`; without them it throws `Cancelled` at once, with
+`args.deadline`.
 
 A refusal throws `RelayerError` with the HTTP `status` and the relayer's
 `name`, `message` and `args`; `IdentityBusy` carries the request in flight as
 `args.id`. `DeadlineTooFar` means the batch was signed to expire after
 `args.max`, which `onboard`'s deadline, `validUntil` plus the config's
-`queueWaitSeconds` and `inclusionWindowSeconds`, does not. A quote refused as `LinkSessionRefused` means the proof is not
-this wallet's genesis identity. `waitFor` throws on a reverted inclusion, a
+`queueWaitSeconds` and `inclusionWindowSeconds`, does not. A quote refused
+as `LinkSessionRefused` means the proof is not this wallet's genesis
+identity. `waitFor` throws on a reverted inclusion, a
 failure or a cancellation.
 
 Assumption: the claim page knows the X user id before the ceremony (from the
@@ -106,11 +114,11 @@ proof must commit.
 
 ### Holdings
 
-`indexerHoldings(url)` reads the usernames-indexer's
-`GET /v1/escrow/node/{node}?chain=`, every page. The indexer lags the chain,
-so its answer only chooses the tokens and fails early; the relayer's
-simulation of the signed batch decides. Any function
-`(handleNode, chainId) => Promise<{token, amount}[]>` can stand in for it.
+`onboard` reads the escrow from the chain with
+`escrowHoldings(client, escrow, tokens)`. `indexerHoldings(url)` reads the
+usernames-indexer's `GET /v1/escrow/node/{node}?chain=`, every page, for a
+page that lists what a handle holds; it lags the chain and misses the
+deposits it has not indexed.
 
 ### Approved tokens
 
@@ -171,6 +179,5 @@ the dependency becomes that npm version.
 
 The e2e tests need the stack (`docker compose up --wait --build`). They skip
 without it, and fail under CI. They read the stack's identity registry and
-escrow from `/etc/relayer/stack.json`, which the `deploy` one-shot writes, the
-holdings from the chain, and swap through `test/mocks/SwapMocks.sol`, a token
+escrow from `/etc/relayer/stack.json`, which the `deploy` one-shot writes, and swap through `test/mocks/SwapMocks.sol`, a token
 and a fixed-price stand-in for SwapRouter02 and QuoterV2 that forge compiles.

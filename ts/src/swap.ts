@@ -3,7 +3,7 @@
 /// token amount, the whole allowance, for at least that much WETH and unwraps
 /// all of it to the wallet.
 
-import type { Call } from '@libid/contracts'
+import { type Call, handleEscrowAbi } from '@libid/contracts'
 import {
   type Address,
   encodeFunctionData,
@@ -59,8 +59,28 @@ export type Holding = { token: Address; amount: bigint }
 /// What a handle node holds in the escrow on a chain.
 export type Holdings = (handleNode: Hex, chainId: number) => Promise<Holding[]>
 
+/// `HandleEscrow.escrowed` of each of `tokens`, read from the chain.
+export function escrowHoldings(
+  client: PublicClient,
+  escrow: Address,
+  tokens: readonly Address[],
+): Holdings {
+  return (handleNode) =>
+    Promise.all(
+      tokens.map(async (token) => ({
+        token,
+        amount: await client.readContract({
+          address: escrow,
+          abi: handleEscrowAbi,
+          functionName: 'escrowed',
+          args: [handleNode, token],
+        }),
+      })),
+    )
+}
+
 /// The usernames-indexer's `GET /v1/escrow/node/{node}?chain=`, every page.
-/// It lags the chain: the relayer's simulation decides.
+/// It lags the chain, missing deposits it has not indexed.
 export function indexerHoldings(indexerUrl: string): Holdings {
   return async (handleNode, chainId) => {
     const held: Holding[] = []

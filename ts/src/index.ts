@@ -33,8 +33,8 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 
 import {
   ClaimTooSmall,
+  escrowHoldings,
   type Holding,
-  type Holdings,
   quoteSwap,
   SWAP_ROUTES,
   type SwapPlan,
@@ -137,8 +137,6 @@ export type Onboarding = {
   identityRegistry: Address
   escrow: Address
   handleNode: Hex
-  /// What the handle holds: `indexerHoldings(url)`, or `escrowHoldings` from the chain.
-  holdings: Holdings
   /// Approved tokens by chain id; `SWAP_ROUTES` by default.
   routes?: Record<number, readonly SwapRoute[]>
   /// The most a swap may pay over its quote, in basis points; 100 by default.
@@ -187,6 +185,8 @@ export type Onboarded = {
   /// The genesis session key, admin once the onboarding lands.
   key: Hex
   quote: Quote
+  /// The batch's deadline, in Unix seconds: until then it may still land.
+  deadline: number
   /// `HandleEscrow.NATIVE`, the chain's coin among `tokens`.
   native: Address
   /// The tokens the batch claims into the wallet.
@@ -210,7 +210,7 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
   const { platformId, verifierVersion, payload } = o.proof
   const salt = o.salt ?? 0n
   const native = { address: o.escrow, abi: handleEscrowAbi, functionName: 'NATIVE' } as const
-  const [wallet, [, version], fee, block, coin, holdings] = await Promise.all([
+  const [wallet, [, version], fee, block, coin] = await Promise.all([
     walletAddress(o.client, config.factory, platformId, o.idNode, salt),
     o.client.readContract({
       address: config.factory,
@@ -225,22 +225,25 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
     }),
     o.client.getBlock(),
     o.client.readContract(native),
-    o.holdings(o.handleNode, chainId),
   ])
+  const routes = (o.routes ?? SWAP_ROUTES)[chainId] ?? []
+  // From the chain: an indexer misses the deposits it has not indexed.
+  const candidates = [coin, ...routes.map((r) => r.token)]
+  const holdings = await escrowHoldings(o.client, o.escrow, candidates)(o.handleNode, chainId)
   const heldOf = (token: Address) =>
     holdings.find((h) => isAddressEqual(h.token, token) && h.amount > 0n)?.amount ?? 0n
   const eth = heldOf(coin)
   // Every approved token held is claimed; the one worth the most ETH to the
   // quoter pays the swap.
-  const valued = ((o.routes ?? SWAP_ROUTES)[chainId] ?? [])
+  const valued = routes
     .map((route) => ({ route, held: heldOf(route.token) }))
     .filter((r) => r.held > 0n)
     .map(async (r) => ({ ...r, worth: await quoteSwap(o.client, r.route, { in: r.held }) }))
   const approved = await Promise.all(valued)
   const best = approved.filter((r) => r.worth > 0n).sort((x, y) => (y.worth > x.worth ? 1 : -1))[0]
-  const tokens = [...(eth > 0n ? [coin] : []), ...approved.map((r) => r.route.token)]
-  if (tokens.length === 0) throw new ClaimTooSmall(0n, fee)
-  const b = { wallet, fee, relayer: config.relayer, tokens }
+  const claimed = [...(eth > 0n ? [coin] : []), ...approved.map((r) => r.route.token)]
+  if (claimed.length === 0) throw new ClaimTooSmall(0n, fee)
+  const b = { wallet, fee, relayer: config.relayer, tokens: claimed }
 
   const at = Number(block.timestamp)
   // A wallet not yet created signs at nonce 0 under the domain salt of epoch 0.
@@ -299,12 +302,13 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
     const data = await authorize(refund, quote.callGas, deadline, o.signer, swap)
     try {
       const body = { wallet, create, data, gasLimit: quote.gasLimit }
-      const { id } = (await http('POST', '/v1/relay', body)) as { id: Hex }
+      const { id } = (await posted(() => http('POST', '/v1/relay', body))) as { id: Hex }
       const swapped = swap
         ? [{ token: swap.route.token, amountIn: swap.amountIn, ethOutMin: swap.minOut }]
         : []
       const parts = { linkFee: fee, gasRefund: quote.minRefund, swapped }
-      return { id, wallet, key: o.signer.key, quote, native: coin, tokens, ...parts }
+      const onboarded = { id, wallet, key: o.signer.key, quote, deadline, native: coin }
+      return { ...onboarded, tokens: claimed, ...parts }
     } catch (e) {
       if (retried || !(e instanceof RelayerError) || e.name !== 'GasLimitTooLow') throw e
       ;({ quote, swap } = await priced(swap))
@@ -316,46 +320,100 @@ type WaitOptions = {
   intervalMs?: number
   timeoutMs?: number
   client?: PublicClient
-  onboarded?: Pick<Onboarded, 'wallet' | 'key' | 'native' | 'tokens'>
+  onboarded?: Pick<Onboarded, 'wallet' | 'key' | 'native' | 'tokens' | 'deadline'>
 }
 
-/// `GET /v1/relay/{id}` every `intervalMs` until the request settles. An
-/// inclusion that reverted, a failure and a cancellation throw. With `client`
-/// and an onboarding, also what the new wallet holds of its claimed tokens at
-/// the inclusion block: what it received, net of the swap and the refund.
+/// `GET /v1/relay/{id}` every `intervalMs` until the request settles, through
+/// network errors, `408` and `5xx` answers. An inclusion that reverted, a
+/// failure and a cancellation throw. With `client` and an onboarding, also what
+/// the new wallet holds of its claimed tokens at the inclusion block: what it
+/// received, net of the swap and the refund.
 /// A request the relayer dropped, past its receipt's lag, is `UnknownRequest`:
 /// with `client` and an onboarding the chain answers instead, settled once the
 /// wallet has code and the genesis key is its admin session, at the latest
 /// block, with no hashes; otherwise it throws `RequestDropped` at once.
+/// A cancelled batch may still land, sent by anyone, until its deadline: with
+/// `client` and an onboarding the chain answers once a block is past it;
+/// otherwise `Cancelled` throws at once, its `args.deadline` the onboarding's.
 export async function waitFor(
   relayerUrl: string,
   id: Hex,
   { intervalMs = 500, timeoutMs = 120_000, client, onboarded }: WaitOptions = {},
 ): Promise<{ txHashes: Hex[]; blockNumber: number; received: Holding[] }> {
   const http = relayerHttp(relayerUrl)
+  const landed = async (): Promise<RelayStatus | undefined> => {
+    if (!client || !onboarded) return undefined
+    const at = await landedAt(client, onboarded)
+    return at === undefined ? undefined : { status: 'included', txHashes: [], blockNumber: at }
+  }
+  const pause = () => new Promise((r) => setTimeout(r, intervalMs))
   for (const end = Date.now() + timeoutMs; Date.now() < end; ) {
     const s = await (http('GET', `/v1/relay/${id}`) as Promise<RelayStatus>).catch(
-      async (e): Promise<RelayStatus> => {
+      async (e): Promise<RelayStatus | undefined> => {
+        if (transient(e)) return undefined
         const unknown = e instanceof RelayerError && e.name === 'UnknownRequest'
         if (!unknown || !client || !onboarded) throw e
-        const at = await landedAt(client, onboarded)
-        if (at === undefined) throw dropped(id)
-        return { status: 'included', txHashes: [], blockNumber: at }
+        const settled = await landed()
+        if (!settled) throw dropped(id)
+        return settled
       },
     )
-    if (s.status === 'included' && !s.reverted) {
-      const blockNumber = s.blockNumber as number
-      const received =
-        client && onboarded ? await balances(client, onboarded, BigInt(blockNumber)) : []
-      return { txHashes: s.txHashes, blockNumber, received }
+    if (!s) {
+      await pause()
+      continue
     }
+    if (s.status === 'cancelled') {
+      const deadline = onboarded?.deadline
+      const cancelled = () =>
+        new RelayerError(200, 'Cancelled', 'the relayer cancelled it', { deadline })
+      if (!client || deadline === undefined) throw cancelled()
+      while (Number((await client.getBlock()).timestamp) <= deadline) {
+        if (Date.now() >= end) throw timedOut(id, timeoutMs)
+        await pause()
+      }
+      const settled = await landed()
+      if (!settled) throw cancelled()
+      return included(settled)
+    }
+    if (s.status === 'included' && !s.reverted) return included(s)
     if (s.status === 'included') throw new RelayerError(200, 'Reverted', 'the batch reverted')
     if (s.status === 'failed') throw refusal(200, s.error)
-    if (s.status === 'cancelled')
-      throw new RelayerError(200, 'Cancelled', 'the relayer cancelled it')
-    await new Promise((r) => setTimeout(r, intervalMs))
+    await pause()
   }
-  throw new Error(`request ${id} did not settle in ${timeoutMs} ms`)
+  throw timedOut(id, timeoutMs)
+
+  async function included(s: RelayStatus) {
+    const blockNumber = s.blockNumber as number
+    const received =
+      client && onboarded ? await balances(client, onboarded, BigInt(blockNumber)) : []
+    return { txHashes: s.txHashes, blockNumber, received }
+  }
+}
+
+function timedOut(id: Hex, timeoutMs: number): Error {
+  return new Error(`request ${id} did not settle in ${timeoutMs} ms`)
+}
+
+/// A network error, or a `408` or `5xx` answer: the same request may succeed again.
+function transient(e: unknown): boolean {
+  if (!(e instanceof RelayerError)) return e instanceof TypeError
+  return e.status === 408 || e.status >= 500
+}
+
+/// How often, and how far apart, `onboard` posts the same relay again.
+const POSTS = 3
+const REPOST_MS = 1_000
+
+/// `post` again while it fails [`transient`]ly, at most `POSTS` times in all.
+async function posted<T>(post: () => Promise<T>): Promise<T> {
+  for (let n = 1; ; n++) {
+    try {
+      return await post()
+    } catch (e) {
+      if (n >= POSTS || !transient(e)) throw e
+      await new Promise((r) => setTimeout(r, REPOST_MS))
+    }
+  }
 }
 
 /// The latest block once `wallet` has code and `key` is its admin session.

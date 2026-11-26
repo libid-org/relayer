@@ -61,9 +61,18 @@ const client = {
 } as unknown as PublicClient
 
 const k = privateKeyToAccount(generatePrivateKey())
+/// `client`, its escrow holding `held` for the handle.
+const holding = (held: Holding[]) =>
+  ({
+    ...client,
+    readContract: async (c: { functionName: string; args: [Hex, Address] }) =>
+      c.functionName === 'escrowed'
+        ? (held.find((h) => h.token === c.args[1])?.amount ?? 0n)
+        : client.readContract(c as never),
+  }) as unknown as PublicClient
 const onboarding = (held: Holding[]): Onboarding => ({
   relayerUrl: 'http://relayer.test',
-  client,
+  client: holding(held),
   proof: { platformId: zeroHash, verifierVersion: 1, payload: '0x01' },
   idNode: ID,
   signer: { key: k.address, sign: (hash) => k.sign({ hash }) },
@@ -77,12 +86,12 @@ const onboarding = (held: Holding[]): Onboarding => ({
   identityRegistry: a(5),
   escrow: a(6),
   handleNode: zeroHash,
-  holdings: async () => held,
   routes: { 31337: [{ token: TOKEN, fee: 500, router: ROUTER, quoter: ROUTER, weth: a(11) }] },
 })
 const ethOnly = onboarding([{ token: NATIVE, amount: ETHER }])
 
-/// Answers each request with the next `[status, body]` its path has, and records the bodies.
+/// Answers each request with the next `[status, body]` its path has, status 0 as a
+/// network error, and records the bodies.
 function relayer(answers: Record<string, [number, unknown][]>) {
   const sent: Record<string, Record<string, unknown>[]> = {}
   vi.stubGlobal('fetch', async (url: URL, init: RequestInit) => {
@@ -92,6 +101,7 @@ function relayer(answers: Record<string, [number, unknown][]>) {
     }
     const [status, body] =
       path === '/v1/config' ? [200, config] : (answers[path].shift() ?? [500, 'no answer left'])
+    if (status === 0) throw new TypeError('fetch failed')
     return new Response(JSON.stringify(body), {
       status,
       headers: { 'content-type': 'application/json' },
@@ -137,6 +147,7 @@ describe('onboard', () => {
     })
     const done = await onboard(ethOnly)
     expect(done).toMatchObject({ id: '0xab', wallet: WALLET, linkFee: FEE, gasRefund: 1000n })
+    expect(done.deadline).toBe(NOW + 75)
     expect(done.swapped).toEqual([])
 
     const draft = decoded(sent['/v1/quote'][0].data as Hex)
@@ -258,6 +269,23 @@ describe('onboard', () => {
     await expect(onboard(ethOnly)).rejects.toMatchObject({ name: 'GasLimitTooLow' })
   })
 
+  test('posts the same relay again after a 502 or a network error', async () => {
+    const sent = relayer({
+      '/v1/quote': [[200, quote(1)]],
+      '/v1/relay': [
+        [502, 'bad gateway'],
+        [0, null],
+        [202, { id: '0xab', status: 'queued' }],
+      ],
+    })
+    await expect(onboard(ethOnly)).resolves.toMatchObject({ id: '0xab' })
+    const [first, ...again] = sent['/v1/relay']
+    expect(again).toEqual([first, first])
+
+    relayer({ '/v1/quote': [[200, quote(1)]], '/v1/relay': Array(3).fill([503, {}]) })
+    await expect(onboard(ethOnly)).rejects.toMatchObject({ status: 503 })
+  }, 10_000)
+
   test('a refusal is a RelayerError with its status, name and args', async () => {
     relayer({
       '/v1/quote': [[200, quote(1)]],
@@ -286,9 +314,58 @@ describe('waitFor', () => {
       readContract: async () => ({ admin }),
       getBalance: async () => ETHER,
     }) as unknown as PublicClient
-  const onboarded = { wallet: WALLET, key: k.address, native: NATIVE, tokens: [NATIVE] }
-  const wait = (client: PublicClient) =>
+  const onboarded = {
+    wallet: WALLET,
+    key: k.address,
+    native: NATIVE,
+    tokens: [NATIVE],
+    deadline: NOW + 2,
+  }
+  const wait = (client?: PublicClient) =>
     waitFor('http://relayer.test', ID, { intervalMs: 1, timeoutMs: 50, client, onboarded })
+  const path = `/v1/relay/${ID}`
+  const included = [200, { status: 'included', txHashes: ['0x01'], blockNumber: 7 }]
+
+  test('polls through a 502, a 408 and a network error', async () => {
+    relayer({
+      [path]: [[502, 'bad gateway'], [408, {}], [0, null], included] as [number, unknown][],
+    })
+    await expect(wait()).resolves.toEqual({ txHashes: ['0x01'], blockNumber: 7, received: [] })
+  })
+
+  test('a reverted inclusion and a failure throw', async () => {
+    const reverted = [200, { status: 'included', txHashes: [], blockNumber: 7, reverted: true }]
+    relayer({ [path]: [reverted as [number, unknown]] })
+    await expect(wait()).rejects.toMatchObject({ name: 'Reverted' })
+    const error = { name: 'RefundTooLow', message: 'm', args: { refund: '1' } }
+    relayer({ [path]: [[200, { status: 'failed', txHashes: [], error }]] })
+    await expect(wait()).rejects.toMatchObject({ name: 'RefundTooLow', args: { refund: '1' } })
+  })
+
+  test('a cancellation throws with its deadline, after it once a client reads the chain', async () => {
+    const cancelled: [number, unknown] = [200, { status: 'cancelled', txHashes: [] }]
+    relayer({ [path]: [cancelled] })
+    await expect(wait()).rejects.toMatchObject({ name: 'Cancelled', args: { deadline: NOW + 2 } })
+    // Blocks at NOW + 1, + 2, + 3: only the last is past the deadline.
+    const passing = (admin: boolean) => {
+      let time = NOW
+      const reads = { time: 0 }
+      const c = {
+        ...chain('0x01', admin),
+        getBlock: async () => {
+          reads.time = ++time
+          return { timestamp: BigInt(time) }
+        },
+      } as unknown as PublicClient
+      return { c, reads }
+    }
+    const late = passing(true)
+    relayer({ [path]: [cancelled] })
+    await expect(wait(late.c)).resolves.toMatchObject({ txHashes: [], blockNumber: 42 })
+    expect(late.reads.time).toBe(NOW + 3)
+    relayer({ [path]: [cancelled] })
+    await expect(wait(passing(false).c)).rejects.toMatchObject({ name: 'Cancelled' })
+  })
 
   test('once dropped, settles from the chain once the genesis key is admin', async () => {
     relayer({ [`/v1/relay/${ID}`]: [unknown as [number, unknown]] })

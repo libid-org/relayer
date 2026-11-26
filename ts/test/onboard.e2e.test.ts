@@ -27,7 +27,6 @@ import {
   http,
   parseAbiParameters,
   parseEther,
-  type PublicClient,
   zeroHash,
 } from 'viem'
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
@@ -35,7 +34,6 @@ import { foundry } from 'viem/chains'
 import { afterAll, expect, test } from 'vitest'
 
 import {
-  type Holdings,
   onboard,
   onboardingTransactionData,
   relayerConfig,
@@ -77,22 +75,6 @@ function mock(name: 'MockToken' | 'MockSwapRouter') {
   const artifact = JSON.parse(readFileSync(join(mocks, 'SwapMocks.sol', `${name}.json`), 'utf8'))
   return { abi: artifact.abi as Abi, bytecode: artifact.bytecode.object as Hex }
 }
-
-/// `HandleEscrow.escrowed` of each of `tokens`, read from the chain.
-const escrowHoldings =
-  (client: PublicClient, escrow: Address, tokens: Address[]): Holdings =>
-  (handleNode) =>
-    Promise.all(
-      tokens.map(async (token) => ({
-        token,
-        amount: await client.readContract({
-          address: escrow,
-          abi: handleEscrowAbi,
-          functionName: 'escrowed',
-          args: [handleNode, token],
-        }),
-      })),
-    )
 
 async function stack() {
   const ok = await fetch(`${API}/health`).catch(() => undefined)
@@ -175,7 +157,7 @@ async function identity(s: NonNullable<Awaited<ReturnType<typeof stack>>>) {
 async function onboarded(
   s: NonNullable<Awaited<ReturnType<typeof stack>>>,
   o: Awaited<ReturnType<typeof identity>>,
-  extra: { holdings: Holdings; routes?: Parameters<typeof onboard>[0]['routes'] },
+  extra: { routes?: Parameters<typeof onboard>[0]['routes'] } = {},
 ) {
   const done = await onboard({ ...o.onboarding, ...extra })
   const landed = await waitFor(API, done.id, {
@@ -210,8 +192,7 @@ test('an onboarding claims the escrowed ETH and repays the relayer from it', asy
     await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args, value: amount }),
   )
 
-  const holdings = escrowHoldings(s.client, s.escrow.address, [s.native])
-  const { done, landed } = await onboarded(s, o, { holdings })
+  const { done, landed } = await onboarded(s, o)
   expect(done.swapped).toEqual([])
   const refund = done.linkFee + done.gasRefund
   expect(landed.received).toEqual([{ token: s.native, amount: amount - refund }])
@@ -251,9 +232,7 @@ test('an onboarding swaps an approved token for the refund', async (ctx) => {
   await s.mined(await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args }))
 
   const route = { token, fee: 500, router, quoter: router, weth: router }
-  const holdings = escrowHoldings(s.client, s.escrow.address, [s.native, token])
   const { done, landed } = await onboarded(s, o, {
-    holdings,
     routes: { [s.config.chainId]: [route] },
   })
   // The swap sells exactly the allowance for at least the refund; the surplus
