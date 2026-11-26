@@ -47,7 +47,10 @@ budget's `window`.
   sending pauses until the window passes; under `min_balance`, until the key
   is funded. A send also counts each send not yet charged at its worst.
 - A database of another schema version is refused, naming the fix: start on
-  a fresh file. This is a pre-release; there is no migration.
+  a fresh file. This is a pre-release; there is no migration. Before moving
+  to a fresh file, stop sending and wait until the old binary's `stats`
+  shows no request queued or sent: a fresh ledger forgets them, and a send
+  of theirs mined after its start pauses sending as a foreign nonce.
 
 ## Configure
 
@@ -233,6 +236,9 @@ when the claimed ETH falls short, and refund, in one relayed transaction.
 
 The image (`Dockerfile`) reads `/etc/relayer/relayer.toml` and holds no key.
 Point `[state] db` at a mounted volume, such as `/var/lib/relayer/relayer.db`.
+Give the container a stop grace period over `request_timeout`, such as
+compose's `stop_grace_period`: Docker's default of 10 s kills the relayer
+before requests in flight finish.
 
 ## Known gaps
 
