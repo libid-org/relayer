@@ -3,7 +3,7 @@
 [workspace.dependencies]
 # Pinned to a commit; its embedded artifacts are vendored by
 # `scripts/vendor-contracts.sh` (see the README).
-libid-contracts = { git = "https://github.com/libid-org/libID-contracts", rev = "637b9255ca7fa60417a404fe491ee2ab8bf194c3" }
+libid-contracts = { git = "https://github.com/libid-org/libID-contracts", rev = "9e69e75400652b6e309a5cb71c91dc6237a16752" }
 
 [package]
 name = "relayer"

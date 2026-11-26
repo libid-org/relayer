@@ -3408,12 +3408,13 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "libid-contracts"
 version = "0.23.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=637b9255ca7fa60417a404fe491ee2ab8bf194c3#637b9255ca7fa60417a404fe491ee2ab8bf194c3"
+source = "git+https://github.com/libid-org/libID-contracts?rev=9e69e75400652b6e309a5cb71c91dc6237a16752#9e69e75400652b6e309a5cb71c91dc6237a16752"
 dependencies = [
  "alloy",
  "include_dir",
  "serde",
  "serde_json",
+ "serde_with",
  "thiserror",
  "tokio",
 ]

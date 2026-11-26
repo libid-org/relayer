@@ -33,7 +33,7 @@ use libid_contracts::{
         ExecuteAuthorization,
         ExecuteMessage,
     },
-    gas::CALL_OVERHEAD,
+    gas::WalletGas,
 };
 
 use crate::{
@@ -139,7 +139,7 @@ const PEAK_MARGIN: u128 = 50_000;
 /// the peak being `maxUsedGas`, what the run needs before its refund (EIP-3529); from
 /// a node that gives none, `ceil(1.25 × gasUsed)` instead. With the gas `before` each
 /// call, the most of the run and, for each call, `(before[i] + extra) × (64/63)^(d−1)`
-/// at that margin plus `(floors[i] + CALL_OVERHEAD) × (64/63)^d`; without, the run plus
+/// at that margin plus `(floors[i] + call_overhead) × (64/63)^d`; without, the run plus
 /// that of the highest floor. Each 64/63 is a frame's kept 1/64: the wallet's check,
 /// and the delegatecall of the wallet proxy, so `d` is 2; the create path adds the
 /// factory proxy's delegatecall and its call of the wallet, so 4. The outer `d − 1`
@@ -154,7 +154,8 @@ pub(crate) fn limit(
     let d = if create { 4 } else { 2 };
     let kept =
         |gas: u128, frames: u32| (gas * 64u128.pow(frames)).div_ceil(63u128.pow(frames));
-    let reserve = |floor: u64| kept(u128::from(floor) + u128::from(CALL_OVERHEAD), d);
+    let overhead = u128::from(WalletGas::vendored().call_overhead());
+    let reserve = |floor: u64| kept(u128::from(floor) + overhead, d);
     let margin = |used: u128, peak: u128| match sim.max_used_gas {
         Some(_) => (peak * 105).div_ceil(100).max(peak + PEAK_MARGIN),
         None => (used * 5).div_ceil(4),

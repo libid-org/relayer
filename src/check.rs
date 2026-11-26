@@ -316,9 +316,6 @@ pub(crate) fn decode(
     data: &Bytes,
 ) -> Option<(ExecuteMessage, ExecuteAuthorization, Vec<Execution>)> {
     let (message, authorization) = ExecuteMessage::from_authorized_data(data).ok()?;
-    if message.authorized_data(authorization.clone()) != *data {
-        return None;
-    }
     let executions = decode_executions(&message.execution_calldata).ok()?;
     Some((message, authorization, executions))
 }

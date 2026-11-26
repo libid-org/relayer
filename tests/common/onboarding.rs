@@ -56,7 +56,7 @@ use libid_contracts::{
         Operation,
         OPERATIONS_DOMAIN,
     },
-    gas::CALL_OVERHEAD,
+    gas::WalletGas,
     testing::*,
     wallet_target::RELEASE_SLOT,
     Artifacts,
@@ -596,7 +596,8 @@ fn run_limit(sim: &alloy::rpc::types::simulate::SimCallResult, extra: u64) -> u6
 /// The relay-time reserve `(callGas + CALL_OVERHEAD) × (64/63)^d`: `d` is 4 on the
 /// create path and 2 otherwise.
 fn reserve(call_gas: u64, create: bool) -> u64 {
-    kept(call_gas + CALL_OVERHEAD, if create { 4 } else { 2 })
+    let overhead = WalletGas::vendored().call_overhead();
+    kept(call_gas + overhead, if create { 4 } else { 2 })
 }
 
 /// `gas × (64/63)^frames`, rounded up: what `frames` frames that each keep 1/64 need
