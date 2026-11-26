@@ -88,6 +88,8 @@ pub struct Checked {
     pub(crate) l1_fee_bound: U256,
     /// The wallet's genesis identity.
     pub(crate) identity: Identity,
+    /// What a send costs at most at the head's cap, its value included.
+    pub(crate) worst: U256,
 }
 
 /// Why a request is not sent.
@@ -268,19 +270,16 @@ impl Request {
                 .with_chain_id(config.chain_id)
         };
         // Run at the cap a send uses; queued at the cap from R.
-        simulate(
-            provider,
-            &at_cap(cap.min(head.fee_bound(config))),
-            None,
-            late,
-        )
-        .await?;
+        let sent = cap.min(head.fee_bound(config));
+        simulate(provider, &at_cap(sent), None, late).await?;
+        let worst = gas::cost(limit, sent, l1_fee_bound) + value;
         let tx = at_cap(cap);
         Ok(Checked {
             tx,
             net,
             l1_fee_bound,
             identity,
+            worst,
         })
     }
 }

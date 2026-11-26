@@ -384,9 +384,9 @@ async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
 #[tokio::test]
 async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
     let (mut o, path) = (Onboarding::new(true).await, db("budgets"));
-    // A request's worst loss is its refund R. Over R and a reverted send's gas, under R
-    // and a mined send's loss with its value.
-    let budget = o.refund() + o.value / U256::from(2);
+    // A request's worst loss is its value and its gas at the head's cap, far under R.
+    // Over one worst loss and a reverted send's gas, under two with a mined send's loss.
+    let budget = o.value + o.value / U256::from(2);
     let config = Config {
         global_budget: Budget {
             wei: budget,

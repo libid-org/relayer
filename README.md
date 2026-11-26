@@ -104,8 +104,9 @@ serves through:
 - the OP-stack operator fee is on, which pauses sending while a tick finds it
   on, or `L1Block` has no operator fee getters.
 
-A request whose worst loss, its gas at its fee cap, its L1 fee bound and its
-`value` in full, is over what is left of the global budget is refused as
+A request whose worst loss, its gas at the head's fee cap (M × base fee, at
+least the floor, at most the cap from R), its L1 fee bound and its `value` in
+full, is over what is left of the global budget is refused as
 `OverBudget` when relayed, and fails as `OverBudget` at its send.
 
 ## HTTP API

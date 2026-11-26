@@ -354,8 +354,8 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Store `checked` as `id`, queued in its identity's row, unless [`admit`] now
-    /// answers for it, or its worst loss, value included, is over what is left of the
-    /// global budget.
+    /// answers for it, or its worst loss at the head's cap, value included, is over
+    /// what is left of the global budget.
     #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
     fn queue(
         &self,
@@ -368,13 +368,11 @@ impl<P: Provider> Relayer<P> {
         let (net, l1) = (checked.net, checked.l1_fee_bound);
         let (net, l1) = (net.to_be_bytes::<32>(), l1.to_be_bytes::<32>());
         let ((platform, id_node), db) = (checked.identity, self.db());
-        if let Some(stored) = admit(&db, id, checked.identity, self.config.loss_hold)? {
+        let (_, hold, window) = self.holds();
+        if let Some(stored) = admit(&db, id, checked.identity, (hold, window))? {
             return Ok(stored);
         }
-        let call = &checked.tx;
-        let gas = U256::from(call.gas.unwrap_or_default())
-            * U256::from(call.max_fee_per_gas.unwrap_or_default());
-        let worst = gas + checked.l1_fee_bound + call.value.unwrap_or_default();
+        let worst = checked.worst;
         let budget = self.config.global_budget;
         let left = budget
             .wei
