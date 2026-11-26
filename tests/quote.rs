@@ -703,3 +703,33 @@ async fn an_existing_wallet_is_relayed_only_signing_in_again() {
     let session = wallet.sessionOf(fresh).call().await.unwrap();
     assert!(session.byProof, "no session by login");
 }
+
+/// A call that burns most of the run is quoted at most the whole run's gas, not its
+/// own and a quarter; a batch of over 8 calls is quoted the whole run's for each.
+#[tokio::test]
+async fn floors_are_at_most_the_run_and_the_run_past_8_calls() {
+    let o = Onboarding::new(true).await;
+    o.land(&o.sign(&o.onboarding()).await, o.value).await;
+    let burner = Address::repeat_byte(0xb0);
+    o.set_code(burner, "62030d405b600190038060045700").await; // 200 000 loops
+    let r = U256::from(CLAIMED / 10);
+    let run = async |b: &Batch<'_>| {
+        let draft = o.authorize(b, None).await;
+        o.simulated(&draft, b.1).await.gas_used
+    };
+    let burn = call(burner, U256::ZERO, vec![]);
+    let b = Batch(
+        o.signing_in(2, vec![burn, o.repay(r)]),
+        o.value,
+        vec![&o.k],
+        None,
+    );
+    let q = o.quote_with(&o.config(), &b).await;
+    assert_eq!(q.call_gas[1], run(&b).await, "{:?}", q.call_gas);
+    let empty = call(Address::repeat_byte(0x33), U256::ZERO, vec![]);
+    let mut calls = vec![empty; 7];
+    calls.push(o.repay(r));
+    let b = Batch(o.signing_in(2, calls), o.value, vec![&o.k], None);
+    let q = o.quote_with(&o.config(), &b).await;
+    assert_eq!(q.call_gas, vec![run(&b).await; 9]);
+}
