@@ -866,17 +866,18 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Charge `id` with no refund at its stored worst less its value, which a landed
-    /// send to a vouched wallet cannot lose; with no receipt recorded, it fails as
-    /// `Node`.
+    /// send to a vouched wallet cannot lose; at its whole worst once a cancel, which
+    /// sends no value, may have landed. With no receipt recorded, it fails as `Node`.
     fn charge_worst(&self, id: B256, e: &Error) -> Result<(), Error> {
         let unread = Refusal::Node(format!("its receipt does not parse: {e}"));
         let (failure, detail) = encode_failure(&unread);
         let db = self.db();
-        let sql = "SELECT worst, tx FROM identities WHERE id = ?1";
-        let row = |r: &Row| Ok((u256(r, 0)?, r.get::<_, String>(1)?));
-        let (worst, tx) = db.query_row(sql, [&id[..]], row)?;
+        let sql = "SELECT worst, tx, cancel IS NOT NULL FROM identities WHERE id = ?1";
+        let row = |r: &Row| Ok((u256(r, 0)?, r.get::<_, String>(1)?, r.get(2)?));
+        let (worst, tx, cancelled): (_, String, bool) = db.query_row(sql, [&id[..]], row)?;
         let tx: TransactionRequest = serde_json::from_str(&tx)?;
-        let loss = worst.saturating_sub(tx.value.unwrap_or_default());
+        let value = if cancelled { U256::ZERO } else { tx.value.unwrap_or_default() };
+        let loss = worst.saturating_sub(value);
         db.execute(
             "UPDATE identities SET loss = ?4, holds = 1, at = unixepoch(), \
              status = iif(block IS NULL, 'failed', status), \

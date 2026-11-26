@@ -1347,7 +1347,10 @@ async fn an_unparsed_receipt_of_an_unmined_send_is_watched_and_cancelled() {
         "{status:?}"
     );
     let lost = left - r.budget_left().unwrap();
-    assert!(lost > U256::ZERO, "uncharged");
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let sql = "SELECT worst FROM identities WHERE id = ?1";
+    let worst: Vec<u8> = ledger.query_row(sql, [&id[..]], |r| r.get(0)).unwrap();
+    assert_eq!(lost, U256::from_be_slice(&worst), "charged under its worst");
     let retry = r.relay(&request).await;
     assert!(
         matches!(retry, Err(Refusal::IdentityHeld { .. })),
