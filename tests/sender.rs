@@ -58,6 +58,18 @@ impl Onboarding {
         next.await.unwrap();
     }
 
+    /// Mine one block at `time`, with the base fee set first when given.
+    async fn mine_at(&self, time: u64, base_fee: Option<u128>) {
+        if let Some(fee) = base_fee {
+            self.base_fee(fee).await;
+        }
+        self.owner
+            .anvil_set_next_block_timestamp(time)
+            .await
+            .unwrap();
+        self.owner.evm_mine(None).await.unwrap();
+    }
+
     /// The refund covers each send attempt: `gasLimit × maxFeePerGas + l1 ≤ R − value`.
     /// A cancel, a self-send, is outside it.
     async fn assert_within_refund(&self, hashes: &[B256], l1: U256) {
@@ -1376,4 +1388,132 @@ async fn a_charged_loss_is_not_recomputed() {
     mode.store(LAGGING, Ordering::Relaxed);
     r.tick().await.unwrap();
     assert_eq!(charged(), before, "charged again");
+}
+
+/// A send in flight at start, its base fee risen above its cap and its deadline the
+/// longest a quote allows, is cancelled a window after the start, and the next is sent.
+#[tokio::test]
+async fn a_resumed_send_priced_out_is_cancelled_after_its_window() {
+    let (mut o, path) = (Onboarding::new(true).await, db("resumed-priced-out"));
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let r = o.start(&path).await.unwrap();
+    let id = o.onboard(&r, o.longest()).await.unwrap();
+    r.tick().await.unwrap();
+    let cap = o
+        .tx(r.status(id).await.unwrap().tx_hashes[0])
+        .await
+        .inner
+        .max_fee_per_gas();
+    drop(r);
+    let r = o.restart(&path).await.unwrap();
+    o.other_identity(1).await;
+    let next = o.onboard(&r, o.longest()).await.unwrap();
+    let (now, window) = (o.now().await, o.config().inclusion_window.as_secs());
+    for at in [2, 2 + window, 4 + window, 6 + window, 8 + window] {
+        o.mine_at(now + at, Some(cap * 100)).await;
+        r.tick().await.unwrap();
+    }
+    let status = r.status(id).await.unwrap().status;
+    assert!(matches!(status, Status::Cancelled), "{status:?}");
+    let status = r.status(next).await.unwrap().status;
+    assert!(
+        !matches!(status, Status::Queued),
+        "the next waits: {status:?}"
+    );
+}
+
+/// A send in flight at start that the node lost is sent again while its batch runs a
+/// window from the start, though not until its deadline.
+#[tokio::test]
+async fn a_resumed_send_is_sent_again_while_it_runs() {
+    let (o, path) = (Onboarding::new(true).await, db("resumed-runs"));
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let r = o.start(&path).await.unwrap();
+    let now = o.now().await;
+    let proof = Address::repeat_byte(0x99);
+    let until = now + o.config().inclusion_window.as_secs() + 4;
+    o.set_code(proof, &format!("63{:08x}4211600b57005b5f5ffd", until))
+        .await;
+    let mut calls = o.onboarding();
+    calls.push(call(proof, U256::ZERO, vec![1]));
+    let data = o.sign_until(encode_executions(&calls), o.value, now, now + o.longest());
+    let id = r.relay(&o.request(data)).await.unwrap();
+    r.tick().await.unwrap();
+    let hash = r.status(id).await.unwrap().tx_hashes[0];
+    o.owner.anvil_drop_transaction(hash).await.unwrap();
+    drop(r);
+    let r = o.restart(&path).await.unwrap();
+    r.tick().await.unwrap();
+    let report = o.settle(&r, id, included).await;
+    assert_eq!(report.tx_hashes, [hash], "cancelled");
+}
+
+/// A paid send a reorg removes after its window is sent again, across a restart too.
+#[tokio::test]
+async fn a_send_a_reorg_removes_past_its_window_is_sent_again() {
+    for restart in [false, true] {
+        let (o, path) = (Onboarding::new(true).await, db("reorg-past-window"));
+        o.owner.anvil_set_auto_mine(false).await.unwrap();
+        let r = o.start(&path).await.unwrap();
+        let id = o.onboard(&r, o.longest()).await.unwrap();
+        let sent_at = o.now().await;
+        r.tick().await.unwrap();
+        let snap = o.owner.anvil_snapshot().await.unwrap();
+        o.owner.evm_mine(None).await.unwrap();
+        r.tick().await.unwrap();
+        let r = if restart {
+            drop(r);
+            o.restart(&path).await.unwrap()
+        } else {
+            r
+        };
+        assert!(o.owner.anvil_revert(snap).await.unwrap());
+        o.owner.anvil_drop_all_transactions().await.unwrap();
+        o.mine_at(sent_at + o.config().inclusion_window.as_secs() + 1, None)
+            .await;
+        r.tick().await.unwrap();
+        let report = o.settle(&r, id, included).await;
+        assert_eq!(report.tx_hashes.len(), 1, "cancelled, restart {restart}");
+    }
+}
+
+/// A send in flight at start whose deadline comes before a window's end is sent again,
+/// and cancelled at the deadline.
+#[tokio::test]
+async fn a_resumed_send_is_cancelled_at_its_deadline() {
+    let (o, path) = (Onboarding::new(true).await, db("resumed-deadline"));
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let r = o.start(&path).await.unwrap();
+    let now = o.now().await;
+    let id = o
+        .onboard(&r, o.config().inclusion_window.as_secs() + 3)
+        .await
+        .unwrap();
+    r.tick().await.unwrap();
+    let hash = r.status(id).await.unwrap().tx_hashes[0];
+    let cap = o.tx(hash).await.inner.max_fee_per_gas();
+    o.owner.anvil_drop_transaction(hash).await.unwrap();
+    drop(r);
+    let r = o.restart(&path).await.unwrap();
+    o.mine_at(now + 4, None).await;
+    r.tick().await.unwrap();
+    let back = o.owner.get_transaction_by_hash(hash).await.unwrap();
+    assert!(back.is_some(), "not sent again before its deadline");
+    assert_eq!(
+        r.status(id).await.unwrap().tx_hashes.len(),
+        1,
+        "cancelled before its deadline"
+    );
+    o.mine_at(
+        now + o.config().inclusion_window.as_secs() + 3,
+        Some(cap * 100),
+    )
+    .await;
+    r.tick().await.unwrap();
+    assert_eq!(
+        r.status(id).await.unwrap().tx_hashes.len(),
+        2,
+        "not cancelled at its deadline"
+    );
+    o.settle(&r, id, |s| matches!(s, Status::Cancelled)).await;
 }

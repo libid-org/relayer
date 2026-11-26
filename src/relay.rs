@@ -216,6 +216,9 @@ struct Ticking {
     receipt: Strikes,
     /// Our nonces mined with no receipt of ours, and the block each was first seen at.
     missing: BTreeMap<u64, u64>,
+    /// The block time a send in flight at start, or one a reorg removed, was first
+    /// watched at, while it stays in flight: its window begins there.
+    since: BTreeMap<B256, u64>,
 }
 
 /// Each request's ticks in a row with an error.
@@ -424,8 +427,14 @@ impl<P: Provider> Relayer<P> {
         let mined = self.provider.get_transaction_count(relayer);
         let mined = mined.block_id(head.at()).await?;
         let mut missing = BTreeMap::new();
-        for (id, deadline, cover) in self.in_flight(mined)? {
-            let watched = self.watch(id, deadline, cover, &head, mined).await;
+        let in_flight = self.in_flight(mined)?;
+        ticking
+            .since
+            .retain(|id, _| in_flight.iter().any(|(i, ..)| i == id));
+        for (id, deadline, cover) in in_flight {
+            let watched = self
+                .watch(&mut ticking.since, (id, deadline, cover), &head, mined)
+                .await;
             if let Some(Some(n)) = self.read(&mut ticking.receipt, id, watched, mined)? {
                 missing.insert(n, *ticking.missing.get(&n).unwrap_or(&head.number));
             }
@@ -693,14 +702,13 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Resolve `id` from a receipt of any of its transactions. With none, broadcast its
-    /// send again until its window ends, or for a send in flight at start its deadline,
-    /// or it no longer runs, then cancel it. Its nonce when mined with no receipt of
-    /// ours: another sender's, or a lagging node's.
+    /// send again until its window ends, never past its deadline, or it no longer runs,
+    /// then cancel it. Its nonce when mined with no receipt of ours: another sender's,
+    /// or a lagging node's.
     async fn watch(
         &self,
-        id: B256,
-        deadline: u64,
-        cover: Cover,
+        since: &mut BTreeMap<B256, u64>,
+        (id, deadline, cover): (B256, u64, Cover),
         head: &Head,
         mined: u64,
     ) -> Result<Option<u64>, Error> {
@@ -714,18 +722,17 @@ impl<P: Provider> Relayer<P> {
         let Some(sent) = self.sent(id)? else {
             return Ok(None);
         };
-        if unread.is_none() {
-            self.set_status(id, "sent", None, None)?; // a receipt a reorg removed
+        if unread.is_none() && self.set_status(id, "sent", None, None)? {
+            since.insert(id, head.time); // a receipt a reorg removed
         }
         if mined > sent.nonce {
             return unread.map_or(Ok(Some(sent.nonce)), Err);
         }
-        let resumed = self.resumed.contains(&sent.hashes[0]);
-        let late = if resumed {
-            deadline
-        } else {
-            self.late(sent.signed_at)
-        };
+        if self.resumed.contains(&sent.hashes[0]) {
+            since.entry(id).or_insert(head.time);
+        }
+        let from = since.get(&id).copied().unwrap_or(sent.signed_at);
+        let late = self.late(from).min(deadline);
         let last = sent.last()?;
         let run = Some((deadline, late));
         if last.cancel
@@ -1044,14 +1051,14 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Move `id` to `status`, with a receipt and its loss, or a failure; the row's time
-    /// when the status changes.
+    /// when the status changes, and whether it did.
     fn set_status(
         &self,
         id: B256,
         status: &str,
         receipt: Option<(&AnyTransactionReceipt, Option<(U256, bool)>)>,
         failed: Option<&Refusal>,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let (receipt, loss) = receipt.unzip();
         let block = receipt.map(|r| r.block_number.unwrap_or_default());
         let hash = receipt.and_then(|r| r.block_hash.map(|h| h.0));
@@ -1059,7 +1066,13 @@ impl<P: Provider> Relayer<P> {
         let reverted = receipt.map(|r| !r.status());
         let (loss, holds) = loss.flatten().unzip();
         let loss = loss.map(|w| w.to_be_bytes::<32>());
-        self.db().execute(
+        let db = self.db();
+        let was: String = db.query_row(
+            "SELECT status FROM identities WHERE id = ?1",
+            [&id[..]],
+            first,
+        )?;
+        db.execute(
             "UPDATE identities SET at = iif(status = ?2, at, unixepoch()), status = ?2, \
              block = ?3, reverted = ?4, failure = ?5, detail = ?6, loss = ?7, \
              block_hash = ?8, holds = ?9 WHERE id = ?1",
@@ -1075,7 +1088,7 @@ impl<P: Provider> Relayer<P> {
                 holds
             ],
         )?;
-        Ok(())
+        Ok(was != status)
     }
 
     /// `id`'s signed transactions, once sent.
