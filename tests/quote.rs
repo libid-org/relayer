@@ -652,12 +652,12 @@ async fn the_quote_bounds_the_l1_fee_on_a_base_sepolia_fork() {
 }
 
 /// However high the tip, a quote's fee cap is at most a send's: M × the base fee grown
-/// over the quote's validity.
+/// over the quote's validity, and at least that grown over the validity and the window.
 #[tokio::test]
 async fn a_high_tip_is_quoted_at_most_a_sends_cap() {
     let o = Onboarding::new(true).await;
-    let config = Config {
-        max_fee_percent: 1000,
+    let at = |max_fee_percent| Config {
+        max_fee_percent,
         ..o.config()
     };
     for _ in 0..10 {
@@ -669,19 +669,23 @@ async fn a_high_tip_is_quoted_at_most_a_sends_cap() {
         sent.get_receipt().await.unwrap();
     }
     let b = Batch(o.onboarding(), o.value, vec![&o.k], None);
-    let q = o.quote_with(&config, &b).await;
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
-    let cap = relayer::config::Eip1559::L1.grow(base.into(), 10) * 1000 / 100;
+    let grow = |blocks| relayer::config::Eip1559::L1.grow(base.into(), blocks);
+    let q = o.quote_with(&at(1000), &b).await;
     assert_eq!(
-        q.max_fee_per_gas, cap,
+        q.max_fee_per_gas,
+        grow(10) * 1000 / 100,
         "not capped at M × the grown base fee"
     );
+    // At M = 100% the cap is under the base fee grown over the validity and the window.
+    let q = o.quote_with(&at(100), &b).await;
+    assert_eq!(q.max_fee_per_gas, grow(15), "not at the floor");
 }
 
 /// An existing wallet's batch without a login is refused, quoted or relayed. Signed in
-/// again in its own batch by a live session, the login adds the new key's session and
-/// the batch lands.
+/// again in its own batch by a live session, the login addressed to `address(0)`, the
+/// wallet itself, adds the new key's session and the batch lands.
 #[tokio::test]
 async fn an_existing_wallet_is_relayed_only_signing_in_again() {
     let o = Onboarding::new(true).await;
