@@ -299,4 +299,6 @@ cargo test
 CI (`.github/workflows/ci.yml`) runs the vendor script, then formatting,
 clippy and the tests, on the Foundry and Rust versions it pins; its `e2e` job
 runs the client's checks, then the Rust and the client's e2e tests against the
-compose stack.
+compose stack; its `swap-fork` job runs the client's swap routes on a fork of
+Base's live head (`pnpm -C ts test:fork`), the only job given `BASE_RPC_URL`,
+and is not meant to be required.

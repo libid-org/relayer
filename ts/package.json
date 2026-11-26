@@ -12,7 +12,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run --dir src",
-    "test:e2e": "vitest run --dir test",
+    "test:e2e": "vitest run --dir test --exclude '**/*.fork.test.ts'",
+    "test:fork": "vitest run --dir test fork",
     "lint": "biome lint .",
     "fmt": "biome format --write .",
     "fmt:check": "biome format ."
