@@ -512,8 +512,16 @@ async fn an_existing_wallet_relays_and_a_skipped_refund_costs_only_gas() {
     // keeps its id, and its send fails unsent.
     let data = o.authorize(&b, Some(q.call_gas)).await;
     let queued = o.request_at(&data, q.gas_limit).await;
-    let r = o.start(&db("moved")).await.unwrap();
+    let moved = db("moved");
+    let r = o.start(&moved).await.unwrap();
     let id = r.relay(&queued).await.unwrap();
+    // Its row is the wallet's genesis identity, read from the wallet.
+    let ledger = rusqlite::Connection::open(&moved).unwrap();
+    let sql = "SELECT platform, id_node FROM identities WHERE id = ?1";
+    let row = |r: &rusqlite::Row| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?));
+    let charged = ledger.query_row(sql, [&id[..]], row).unwrap();
+    let genesis = (o.create.platform_id.to_vec(), o.create.id_node.to_vec());
+    assert_eq!(charged, genesis, "not its genesis identity");
     let (s, artifacts) = (o.stack, Artifacts::embedded());
     let deploy = async |name: &str, args: Vec<u8>| {
         let code = artifacts.bytecode(name).unwrap();
