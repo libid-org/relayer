@@ -340,11 +340,50 @@ async fn refusals_carry_their_decoded_names() {
     assert_eq!((code, name(&unknown)), (404, "UnknownRequest"));
 }
 
-/// With every permit held by a half-sent body, config and status still answer; at
-/// shutdown, that request and one with unfinished headers hold the drain no longer
-/// than `request_timeout`.
+/// With every permit held by a half-sent body for `request_timeout`, config and status
+/// still answer at once.
 #[tokio::test]
-async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
+async fn a_half_sent_request_holds_neither_config_nor_status() {
+    use tokio::io::AsyncWriteExt;
+    let o = Onboarding::new(false).await;
+    let relayer = Relayer::start(o.relayer.clone(), o.config(), &db("permit"))
+        .await
+        .unwrap();
+    let service = Service::new(relayer, Duration::from_secs(5));
+    let bind = || tokio::net::TcpListener::bind("127.0.0.1:0");
+    let (api, metrics) = (bind().await.unwrap(), bind().await.unwrap());
+    let at = api.local_addr().unwrap();
+    let limits = Limits {
+        timeout: Duration::from_secs(20),
+        concurrency: 1,
+    };
+    let hour = Duration::from_secs(3600);
+    let never = std::future::pending();
+    let served = tokio::spawn(serve(service, hour, limits, (api, metrics), never));
+    let mut half = tokio::net::TcpStream::connect(at).await.unwrap();
+    let head = "POST /v1/relay HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n{";
+    half.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let url = format!("http://{at}");
+    let soon = Duration::from_secs(5);
+    let config = reqwest::get(format!("{url}/v1/config"));
+    let config = tokio::time::timeout(soon, config)
+        .await
+        .expect("config held");
+    assert_eq!(config.unwrap().status(), 200);
+    let status = reqwest::get(format!("{url}/v1/relay/{}", B256::ZERO));
+    let status = tokio::time::timeout(soon, status)
+        .await
+        .expect("status held");
+    assert_eq!(status.unwrap().status(), 404);
+    served.abort();
+    drop(half);
+}
+
+/// At shutdown, a half-sent request and one with unfinished headers hold the drain no
+/// longer than `request_timeout`.
+#[tokio::test]
+async fn a_half_sent_request_holds_no_shutdown() {
     use tokio::io::AsyncWriteExt;
     let o = Onboarding::new(false).await;
     let relayer = Relayer::start(o.relayer.clone(), o.config(), &db("half"))
@@ -372,11 +411,6 @@ async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let url = format!("http://{at}");
-    let config = reqwest::get(format!("{url}/v1/config")).await.unwrap();
-    assert_eq!(config.status(), 200);
-    let status = reqwest::get(format!("{url}/v1/relay/{}", B256::ZERO)).await;
-    assert_eq!(status.unwrap().status(), 404);
     stop.send(()).unwrap();
     let drained = tokio::time::timeout(Duration::from_secs(5), served).await;
     drained
