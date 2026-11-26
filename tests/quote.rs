@@ -619,3 +619,28 @@ async fn the_quote_bounds_the_l1_fee_on_a_base_sepolia_fork() {
     assert!(q.l1_fee_bound > U256::ZERO);
     assert!(q.min_refund > U256::from(q.gas_limit) * U256::from(q.max_fee_per_gas));
 }
+
+/// However high the tip, a quote's fee cap is at most a send's: M × the base fee grown
+/// over the quote's validity.
+#[tokio::test]
+async fn a_high_tip_is_quoted_at_most_a_sends_cap() {
+    let o = Onboarding::new(true).await;
+    let config = Config {
+        max_fee_percent: 1000,
+        ..o.config()
+    };
+    for _ in 0..10 {
+        let tipped = TransactionRequest::default()
+            .with_to(Address::repeat_byte(1))
+            .with_max_priority_fee_per_gas(1_000_000_000_000)
+            .with_max_fee_per_gas(2_000_000_000_000);
+        let sent = o.owner.send_transaction(tipped).await.unwrap();
+        sent.get_receipt().await.unwrap();
+    }
+    let b = Batch(o.onboarding(), o.value, vec![&o.k], None);
+    let q = o.quote_with(&config, &b).await;
+    let latest = o.owner.get_block_by_number(Default::default()).await;
+    let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
+    let cap = relayer::config::Eip1559::L1.grow(base.into(), 10) * 1000 / 100;
+    assert_eq!(q.max_fee_per_gas, cap, "not capped at M × the grown base fee");
+}
