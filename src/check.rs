@@ -373,14 +373,19 @@ pub(crate) async fn target<P: Provider>(
     data: &Bytes,
     value: U256,
 ) -> Result<TransactionRequest, Refusal> {
-    if let Some(c) = create {
+    let created = async {
+        let Some(c) = create else {
+            return Ok(());
+        };
         let factory = WalletFactory::new(config.factory, provider);
         let address = factory.walletAddress(c.platform_id, c.id_node, c.salt);
-        if address.call().await.map_err(node)? != wallet {
-            return Err(Refusal::UnknownWallet);
+        match address.call().await.map_err(node)? == wallet {
+            true => Ok(()),
+            false => Err(Refusal::UnknownWallet),
         }
-    }
-    vouched(provider, config, wallet, create.is_some()).await?;
+    };
+    let vouched = vouched(provider, config, wallet, create.is_some());
+    tokio::try_join!(created, vouched)?;
     Ok(outer(config, wallet, create, data, value))
 }
 
@@ -471,13 +476,13 @@ async fn simulate<P: Provider>(
         time: Some(late),
         ..Default::default()
     };
-    for overrides in [None, Some(at_late)] {
-        let call = provider
-            .call(tx.clone())
-            .block_opt(block)
-            .with_block_overrides_opt(overrides);
-        call.await.map_err(refusal)?;
-    }
+    let call = |overrides| async move {
+        let call = provider.call(tx.clone()).block_opt(block);
+        call.with_block_overrides_opt(overrides)
+            .await
+            .map_err(refusal)
+    };
+    tokio::try_join!(call(None), call(Some(at_late)))?;
     Ok(())
 }
 
