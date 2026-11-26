@@ -124,7 +124,7 @@ const CANCEL_PERCENTILE: f64 = 90.0;
 const FAILING_TICK: Duration = Duration::from_secs(5);
 
 /// The schema version, `PRAGMA user_version`, a database must have.
-const VERSION: i32 = 5;
+const VERSION: i32 = 6;
 
 /// The tables, created in a new database.
 const SCHEMA: &str = include_str!("schema.sql");
@@ -516,16 +516,24 @@ impl<P: Provider> Relayer<P> {
     }
 
     /// Drop the rows that are done: a paid one `receipt_lag_blocks` after its block, a
-    /// failed one or one with a loss `loss_hold` after it was last moved.
+    /// failed one or one with a loss [`held`] after it was last moved.
     fn prune(&self, head: &Head) -> Result<(), Error> {
-        let (lag, hold) = (self.config.receipt_lag_blocks, self.config.loss_hold);
+        let (lag, hold, window) = self.holds();
         self.db().execute(
             "DELETE FROM identities WHERE \
              (status = 'included' AND loss = zeroblob(32) AND block + ?1 <= ?2) \
-             OR ((status = 'failed' OR loss != zeroblob(32)) AND at <= unixepoch() - ?3)",
-            params![lag, head.number, hold.as_secs()],
+             OR ((status = 'failed' OR loss != zeroblob(32)) \
+                 AND at <= unixepoch() - iif(holds, ?3, ?4))",
+            params![lag, head.number, hold, window],
         )?;
         Ok(())
+    }
+
+    /// `receipt_lag_blocks`, and in seconds `loss_hold` and the budget's window.
+    fn holds(&self) -> (u64, u64, u64) {
+        let c = &self.config;
+        let window = c.global_budget.window.as_secs();
+        (c.receipt_lag_blocks, c.loss_hold.as_secs(), window)
     }
 
     /// `id`'s status and its transactions.
@@ -596,7 +604,8 @@ impl<P: Provider> Relayer<P> {
     /// and L1 fee, plus its value unless it reverted, less R when the key's balance over
     /// its block rose by at least `R - value - cost`. `None` while the balances are
     /// unread, until `receipt_lag_blocks` past its block, then charged its gas and L1
-    /// fee.
+    /// fee. With whether it holds the identity for `loss_hold`: a reverted batch, a
+    /// skipped refund or unread balances do; a cancel or a paid refund do not.
     async fn loss(
         &self,
         cancel: bool,
@@ -604,26 +613,28 @@ impl<P: Provider> Relayer<P> {
         receipt: &AnyTransactionReceipt,
         net: U256,
         head: &Head,
-    ) -> Result<Option<U256>, Error> {
+    ) -> Result<Option<(U256, bool)>, Error> {
         let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
         let cost = gas + l1_fee(receipt).map_err(unreadable)?;
         if cancel || !receipt.status() {
-            return Ok(Some(cost));
+            return Ok(Some((cost, !cancel)));
         }
         let value = TxEnvelope::decode_2718(&mut &send[..])
             .map_err(unreadable)?
             .value();
         let block = receipt.block_number.unwrap_or_default();
         Ok(Some(match self.balances(receipt).await {
-            Ok((parent, at)) if at + cost >= parent + net => cost.saturating_sub(net),
-            Ok(_) => cost + value,
+            Ok((parent, at)) if at + cost >= parent + net => {
+                (cost.saturating_sub(net), false)
+            }
+            Ok(_) => (cost + value, true),
             Err(_) if head.number < block + self.config.receipt_lag_blocks => {
                 return Ok(None)
             }
             Err(e) => {
                 let hash = receipt.transaction_hash;
                 tracing::warn!("{hash} charged as unrefunded: {e}");
-                cost
+                (cost, true)
             }
         }))
     }
@@ -851,7 +862,7 @@ impl<P: Provider> Relayer<P> {
         let tx: TransactionRequest = serde_json::from_str(&tx)?;
         let loss = worst.saturating_sub(tx.value.unwrap_or_default());
         db.execute(
-            "UPDATE identities SET loss = ?4, at = unixepoch(), \
+            "UPDATE identities SET loss = ?4, holds = 1, at = unixepoch(), \
              status = iif(block IS NULL, 'failed', status), \
              failure = iif(block IS NULL, ?2, failure), \
              detail = iif(block IS NULL, ?3, detail) WHERE id = ?1",
@@ -1038,7 +1049,7 @@ impl<P: Provider> Relayer<P> {
         &self,
         id: B256,
         status: &str,
-        receipt: Option<(&AnyTransactionReceipt, Option<U256>)>,
+        receipt: Option<(&AnyTransactionReceipt, Option<(U256, bool)>)>,
         failed: Option<&Refusal>,
     ) -> Result<(), Error> {
         let (receipt, loss) = receipt.unzip();
@@ -1046,11 +1057,12 @@ impl<P: Provider> Relayer<P> {
         let hash = receipt.and_then(|r| r.block_hash.map(|h| h.0));
         let (failure, detail) = failed.map(encode_failure).unzip();
         let reverted = receipt.map(|r| !r.status());
-        let loss = loss.flatten().map(|w| w.to_be_bytes::<32>());
+        let (loss, holds) = loss.flatten().unzip();
+        let loss = loss.map(|w| w.to_be_bytes::<32>());
         self.db().execute(
             "UPDATE identities SET at = iif(status = ?2, at, unixepoch()), status = ?2, \
              block = ?3, reverted = ?4, failure = ?5, detail = ?6, loss = ?7, \
-             block_hash = ?8 WHERE id = ?1",
+             block_hash = ?8, holds = ?9 WHERE id = ?1",
             params![
                 &id[..],
                 status,
@@ -1059,7 +1071,8 @@ impl<P: Provider> Relayer<P> {
                 failure,
                 detail,
                 loss,
-                hash
+                hash,
+                holds
             ],
         )?;
         Ok(())
@@ -1101,14 +1114,14 @@ pub(crate) fn lost(db: &Connection, window: Duration) -> Result<U256, Error> {
 /// charged.
 pub(crate) fn counts(
     db: &Connection,
-    hold: Duration,
+    (hold, window): (Duration, Duration),
 ) -> Result<(BTreeMap<String, u64>, u64, u64), Error> {
     let sql = "SELECT CASE WHEN reverted THEN 'reverted' ELSE status END, count(*) \
                FROM identities GROUP BY 1";
     let statuses = rows(db, sql, [], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let sql = "SELECT count(*) FROM identities \
-               WHERE loss != zeroblob(32) AND at > unixepoch() - ?1";
-    let held = db.query_row(sql, [hold.as_secs()], first)?;
+               WHERE loss != zeroblob(32) AND at > unixepoch() - iif(holds, ?1, ?2)";
+    let held = db.query_row(sql, [hold.as_secs(), window.as_secs()], first)?;
     let sql =
         "SELECT count(*) FROM identities WHERE status = 'included' AND loss IS NULL";
     let pending = db.query_row(sql, [], first)?;
@@ -1163,19 +1176,20 @@ fn stored(db: &Connection, id: B256) -> Result<Option<(B256, String)>, Refusal> 
 }
 
 /// [`stored`], or room for `id` in `identity`'s row: none, a failed one, or one whose
-/// loss is older than `hold`. `IdentityBusy` while another request of the identity is
+/// loss is [`held`] no longer. `IdentityBusy` while another request of the identity is
 /// queued, sent, or paid and not yet dropped; `IdentityHeld` while a loss holds it.
 #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
 fn admit(
     db: &Connection,
     id: B256,
     (platform, id_node): Identity,
-    hold: Duration,
+    (hold, window): (u64, u64),
 ) -> Result<Option<(B256, String)>, Refusal> {
     if let Some(stored) = stored(db, id)? {
         return Ok(Some(stored));
     }
-    let sql = "SELECT id, status, loss, at, unixepoch() FROM identities \
+    let sql =
+        "SELECT id, status, loss, at, unixepoch(), coalesce(holds, 1) FROM identities \
                WHERE platform = ?1 AND id_node = ?2";
     let row = |r: &Row| {
         let loss = r.get::<_, Option<Vec<u8>>>(2)?;
@@ -1185,10 +1199,11 @@ fn admit(
             loss.map(|w| U256::from_be_slice(&w)),
             r.get::<_, u64>(3)?,
             r.get::<_, u64>(4)?,
+            r.get::<_, bool>(5)?,
         ))
     };
     let found = db.query_row(sql, [&platform[..], &id_node[..]], row);
-    let until = |at: u64| at + hold.as_secs();
+    let until = |at: u64, holds: bool| at + held(holds, hold, window);
     match found.optional().map_err(node)? {
         None => Ok(None),
         Some((_, status, None, ..)) if status == "failed" => Ok(None),
@@ -1196,10 +1211,23 @@ fn admit(
         Some((id, _, Some(loss), ..)) if loss.is_zero() => {
             Err(Refusal::IdentityBusy { id })
         }
-        Some((.., at, now)) if now < until(at) => {
-            Err(Refusal::IdentityHeld { until: until(at) })
+        Some((.., at, now, holds)) if now < until(at, holds) => {
+            Err(Refusal::IdentityHeld {
+                until: until(at, holds),
+            })
         }
         Some(_) => Ok(None),
+    }
+}
+
+/// How long a loss holds its identity and stays in the budget: `hold` for a reverted
+/// batch, a skipped refund or unread balances; the budget's `window` for a cancel or a
+/// paid refund short of the send's cost.
+fn held(holds: bool, hold: u64, window: u64) -> u64 {
+    if holds {
+        hold
+    } else {
+        window
     }
 }
 

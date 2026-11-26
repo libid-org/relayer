@@ -72,7 +72,8 @@ impl fmt::Display for Stats {
 /// and loss hold.
 pub fn stats(db: &Path, config: &Config) -> Result<Stats, Error> {
     let db = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let (requests, held, pending) = counts(&db, config.loss_hold)?;
+    let (requests, held, pending) =
+        counts(&db, (config.loss_hold, config.global_budget.window))?;
     Ok(Stats {
         requests,
         held,

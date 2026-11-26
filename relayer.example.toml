@@ -77,8 +77,9 @@ concurrency_limit = 64
 # warns of: 8M gas at 210% of a 0.1 gwei base fee is 1.68e15 wei, plus a fronted
 # value. The window is above 0.
 global_budget = { wei = "20000000000000000", window = "1h" }
-# Optional, "24h" by default: how long a loss refuses its identity (`IdentityHeld`);
-# at least global_budget's window.
+# Optional, "24h" by default: how long a reverted batch or a skipped refund refuses
+# its identity (`IdentityHeld`); a landed cancel holds it for global_budget's window.
+# At least that window.
 loss_hold = "24h"
 # The highest gas limit a request may be priced for: a real-proof onboarding's
 # createAndExecute is priced near 5.6M.

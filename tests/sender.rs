@@ -485,7 +485,7 @@ async fn a_stranger_learns_nothing_of_a_queued_batch() {
 /// deadline, by a 0-value self-send at its nonce, +10% on both fees and its cap at least
 /// twice the base fee. Lost by the node with the base fee below its cap, that cancel is
 /// sent again; above it, a new one is signed. `cancelled`, its id is not queued again,
-/// and a new batch lands.
+/// and its identity is held for the budget's window only.
 #[tokio::test]
 async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let (o, path) = (Onboarding::new(true).await, db("cancel"));
@@ -542,6 +542,12 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     assert_eq!(lost(), cost, "not the cancel's cost");
     back(120);
     assert_eq!(lost(), cost, "expired inside the window");
+    // The cancel holds its identity for the budget's window, not `loss_hold`.
+    let retry = o.onboard(&r, o.longest() - 1).await;
+    assert!(
+        matches!(retry, Err(Refusal::IdentityHeld { .. })),
+        "{retry:?}"
+    );
     back(o.config().global_budget.window.as_secs());
     assert_eq!(lost(), U256::ZERO, "counted past the window");
     drop(r);
@@ -550,13 +556,11 @@ async fn a_send_priced_out_is_cancelled_when_its_window_ends() {
     let again = r.status(id).await.unwrap();
     let kept = cancelled(&again.status) && again.tx_hashes == report.tx_hashes;
     assert!(kept, "queued again: {:?}", again.status);
-    // The cancel's gas is a loss: the identity is held for `loss_hold`.
+    // Past the window, well inside `loss_hold`, the identity relays again.
+    assert!(o.config().loss_hold > o.config().global_budget.window * 2);
+    assert_eq!(relayer::stats::stats(&path, &o.config()).unwrap().held, 0);
     let retry = o.onboard(&r, o.longest() - 1).await;
-    assert!(
-        matches!(retry, Err(Refusal::IdentityHeld { .. })),
-        "{retry:?}"
-    );
-    assert_eq!(relayer::stats::stats(&path, &o.config()).unwrap().held, 1);
+    assert!(retry.is_ok(), "{retry:?}");
 }
 
 /// A send the node lost that no longer runs is cancelled at once, inside its window,
