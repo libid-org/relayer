@@ -34,7 +34,12 @@ if [[ ! -d "$PACKAGE/dist" ]]; then
     (cd "$BUILD/ts" && pnpm install --frozen-lockfile)
     (cd "$BUILD/ts/packages/contracts" && pnpm codegen && pnpm build)
     mv "$BUILD/ts/packages/contracts/dist" "$PACKAGE/dist.$$"
-    mv -T "$PACKAGE/dist.$$" "$PACKAGE/dist"
+    # Not into a dist/ another run finished meanwhile; `mv -T` is GNU only.
+    if [[ -e "$PACKAGE/dist" ]]; then
+        rm -rf "$PACKAGE/dist.$$"
+    else
+        mv "$PACKAGE/dist.$$" "$PACKAGE/dist"
+    fi
 fi
 
 mkdir -p ts/vendor
