@@ -366,7 +366,10 @@ async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
     half.write_all(head.as_bytes()).await.unwrap();
     // Its headers unfinished: no handler runs, so no request timeout ends it.
     let mut headless = tokio::net::TcpStream::connect(at).await.unwrap();
-    headless.write_all(b"POST /v1/relay HTTP/1.1\r\nhost: x\r\n").await.unwrap();
+    headless
+        .write_all(b"POST /v1/relay HTTP/1.1\r\nhost: x\r\n")
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let url = format!("http://{at}");
     let config = reqwest::get(format!("{url}/v1/config")).await.unwrap();

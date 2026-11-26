@@ -1651,7 +1651,8 @@ async fn a_mined_count_below_the_lowest_nonce_in_flight_is_refused() {
     r.tick().await.unwrap();
     drop(r);
     let ledger = rusqlite::Connection::open(&path).unwrap();
-    let ahead = "UPDATE identities SET nonce = nonce + 1; UPDATE nonce SET next = next + 1";
+    let ahead =
+        "UPDATE identities SET nonce = nonce + 1; UPDATE nonce SET next = next + 1";
     ledger.execute_batch(ahead).unwrap();
     let refused = o.restart(&path).await.err().unwrap();
     assert!(refused.contains("nonce drift"), "{refused}");
@@ -1669,7 +1670,11 @@ async fn a_send_in_flight_does_not_pause_sending() {
         ..o.config()
     };
     let r = Relayer::start(o.relayer.clone(), budget(U256::ONE), &path);
-    let refused = r.await.unwrap().relay(&o.request_for(&o.onboarding()).await).await;
+    let refused = r
+        .await
+        .unwrap()
+        .relay(&o.request_for(&o.onboarding()).await)
+        .await;
     let Err(Refusal::OverBudget { worst, .. }) = refused else {
         panic!("{refused:?}")
     };
