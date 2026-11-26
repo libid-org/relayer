@@ -146,7 +146,8 @@ const LAGGING: u8 = 7;
 const L1_WEI: u8 = 8;
 /// Fails `eth_getTransactionReceipt` with a node error.
 const DOWN: u8 = 9;
-/// Refuses the next raw transaction unsent, as geth's pool refuses one over 128 KiB.
+/// Refuses the next raw transaction unsent, as a pool refuses one over 128 KiB, naming
+/// it in camelCase.
 const OVERSIZED: u8 = 10;
 /// Never answers `eth_getTransactionCount`, as a node that accepts and stalls.
 const HANG: u8 = 11;
@@ -294,7 +295,7 @@ impl Provider for Racing {
                 sent.get_receipt().await.unwrap();
             }
             if mode == OVERSIZED {
-                let refused = r#"{"code": -32000, "message": "oversized data"}"#;
+                let refused = r#"{"code": -32000, "message": "OversizedData"}"#;
                 let refused = serde_json::from_str(refused).unwrap();
                 return Err(alloy::transports::RpcError::ErrorResp(refused));
             }
@@ -966,7 +967,7 @@ async fn a_first_send_the_node_refuses_fails_and_the_next_is_sent() {
     mode.store(OVERSIZED, Ordering::Relaxed);
     r.tick().await.unwrap();
     let report = r.status(id).await.unwrap();
-    let failed = |e: &str| e.contains("oversized");
+    let failed = |e: &str| e.contains("OversizedData");
     let failed = matches!(&report.status, Status::Failed(Refusal::Node(e)) if failed(e));
     assert!(failed && report.tx_hashes.is_empty(), "{:?}", report.status);
     assert!(!r.paused(), "paused by one request");
