@@ -186,8 +186,7 @@ fn each(cuts: &[check::Cut], executions: &[Execution]) -> Option<Vec<u64>> {
 }
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
-/// did not check, the rest of a valid `_verify`, the signed `call_gas` floors and
-/// their array's offset and length words, the
+/// did not check, the rest of a valid `_verify`, the signed `call_gas` floors, the
 /// zero bytes the client fills as nonzero ([`gas::fillable`]), a value transfer for
 /// a refund drafted at 0, and, below quorum, the rules check of that many calls.
 fn unmeasured(
@@ -209,7 +208,7 @@ fn unmeasured(
     });
     // The draft signs a zero floor per call; the signed data carries `call_gas`.
     let bytes = |g: &u64| u64::from(u64::BITS - g.leading_zeros()).div_ceil(8);
-    let call_gas_bytes = call_gas.iter().map(bytes).sum::<u64>() + 2 * 32;
+    let call_gas_bytes = call_gas.iter().map(bytes).sum::<u64>();
     let transfers = refunds.clone().filter(|r| r.is_zero()).count() as u64 * CALL_VALUE;
     let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
     costs.verify_tail()
