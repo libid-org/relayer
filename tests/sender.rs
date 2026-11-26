@@ -1656,3 +1656,31 @@ async fn a_mined_count_below_the_lowest_nonce_in_flight_is_refused() {
     let refused = o.restart(&path).await.err().unwrap();
     assert!(refused.contains("nonce drift"), "{refused}");
 }
+
+/// A send in flight whose worst is the whole budget leaves sending unpaused.
+#[tokio::test]
+async fn a_send_in_flight_does_not_pause_sending() {
+    let (o, path) = (Onboarding::new(true).await, db("in-flight-budget"));
+    let budget = |wei| Config {
+        global_budget: relayer::config::Budget {
+            wei,
+            ..o.config().global_budget
+        },
+        ..o.config()
+    };
+    let r = Relayer::start(o.relayer.clone(), budget(U256::ONE), &path);
+    let refused = r.await.unwrap().relay(&o.request_for(&o.onboarding()).await).await;
+    let Err(Refusal::OverBudget { worst, .. }) = refused else {
+        panic!("{refused:?}")
+    };
+    let start = async || {
+        let r = Relayer::start(o.relayer.clone(), budget(worst), &path).await;
+        r.map_err(|e| e.to_string())
+    };
+    let r = unlocked(start).await.unwrap();
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let id = o.queue(&r).await;
+    r.tick().await.unwrap();
+    assert!(matches!(r.status(id).await.unwrap().status, Status::Sent));
+    assert!(!r.paused(), "paused by a send in flight");
+}
