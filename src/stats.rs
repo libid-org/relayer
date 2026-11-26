@@ -77,7 +77,7 @@ pub fn stats(db: &Path, config: &Config) -> Result<Stats, Error> {
     Ok(Stats {
         requests,
         held,
-        lost: lost(&db, config.global_budget.window)?,
+        lost: lost(&db, config.global_budget.window, true)?,
         pending,
     })
 }

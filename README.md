@@ -43,9 +43,9 @@ budget's `window`.
   `loss_hold` after a reverted batch or a skipped refund, so an honest batch
   that reverts after a good check waits as long; the budget's `window` after
   a landed cancel, an L1 fee over its bound, or balances left unread.
-- The global budget sums the rows' losses over its `window`, each send at its
-  worst until its receipt. Past it sending pauses until the window passes;
-  under `min_balance`, until the key is funded.
+- The global budget sums the rows' charged losses over its `window`. Past it
+  sending pauses until the window passes; under `min_balance`, until the key
+  is funded. A send also counts each send not yet charged at its worst.
 - A database of another schema version is refused, naming the fix: start on
   a fresh file. This is a pre-release; there is no migration.
 
@@ -111,8 +111,9 @@ serves through:
 
 A request whose worst loss, its gas at the head's fee cap (M × base fee, at
 least the floor, at most the cap from R), its L1 fee bound and its `value` in
-full, is over what is left of the global budget is refused as
-`OverBudget` when relayed, and fails as `OverBudget` at its send.
+full, is over what the charged losses leave of the global budget is refused
+as `OverBudget` when relayed, and fails as `OverBudget` at its send when it
+is over what they and the sends not yet charged, each at its worst, leave.
 
 ## HTTP API
 

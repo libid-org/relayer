@@ -1575,3 +1575,33 @@ async fn unread_balances_hold_their_identity_for_the_window() {
     assert_ne!(window, o.config().loss_hold.as_secs());
     assert_eq!(until, at + window, "held for loss_hold");
 }
+
+/// A send in flight leaves the budget whole for a relay, while its worst counts at the
+/// next send: one whose worst is over what is left fails `OverBudget` unsent.
+#[tokio::test]
+async fn a_send_not_yet_charged_counts_only_at_the_next_send() {
+    let (mut o, path) = (Onboarding::new(true).await, db("pending-budget"));
+    // Over one request's worst loss, under two.
+    let config = Config {
+        global_budget: relayer::config::Budget {
+            wei: o.value + o.value / U256::from(2),
+            ..o.config().global_budget
+        },
+        ..o.config()
+    };
+    let racing = Racing(o.relayer.clone(), Default::default());
+    let mode = racing.1.clone();
+    let r = Relayer::start(racing, config, &path).await.unwrap();
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let first = o.queue(&r).await;
+    r.tick().await.unwrap();
+    o.other_identity(1).await;
+    let second = r.relay(&o.request_for(&o.onboarding()).await).await;
+    let second = second.expect("refused for a send in flight");
+    mode.store(BLIND, Ordering::Relaxed);
+    o.settle(&r, first, included).await;
+    r.tick().await.unwrap();
+    let status = r.status(second).await.unwrap();
+    let over = matches!(status.status, Status::Failed(Refusal::OverBudget { .. }));
+    assert!(over && status.tx_hashes.is_empty(), "{:?}", status.status);
+}

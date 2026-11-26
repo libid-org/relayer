@@ -358,7 +358,7 @@ impl<P: Provider> Relayer<P> {
 
     /// Store `checked` as `id`, queued in its identity's row, unless [`admit`] now
     /// answers for it, or its worst loss at the head's cap, value included, is over
-    /// what is left of the global budget.
+    /// what the charged losses leave of the global budget.
     #[allow(clippy::result_large_err)] // the `Refusal` that `relay` returns
     fn queue(
         &self,
@@ -377,9 +377,8 @@ impl<P: Provider> Relayer<P> {
         }
         let worst = checked.worst;
         let budget = self.config.global_budget;
-        let left = budget
-            .wei
-            .saturating_sub(lost(&db, budget.window).map_err(node)?);
+        let lost = lost(&db, budget.window, false).map_err(node)?;
+        let left = budget.wei.saturating_sub(lost);
         if worst > left {
             return Err(Refusal::OverBudget { worst, left });
         }
@@ -416,7 +415,7 @@ impl<P: Provider> Relayer<P> {
     /// has run [`FAILING_TICK`]. Above it a foreign nonce pauses sending;
     /// below it ours is unmined. A balance below `min_balance` pauses sending until a
     /// tick finds it funded, an OP-stack operator fee until a tick finds it off, and a
-    /// spent global loss budget until its window passes.
+    /// global loss budget its charged losses spent until its window passes.
     async fn step(&self) -> Result<(), Error> {
         let mut ticking = self.ticking.lock().await;
         let started = tokio::time::Instant::now();
@@ -463,7 +462,7 @@ impl<P: Provider> Relayer<P> {
         if self.paused.load(Relaxed)
             || mined < next
             || !self.in_flight(mined)?.is_empty()
-            || self.budget_left()?.is_zero()
+            || self.charged_left()?.is_zero()
         {
             return Ok(());
         }
@@ -577,10 +576,10 @@ impl<P: Provider> Relayer<P> {
 
     /// Whether sending paused: a foreign nonce, a balance below `min_balance`, a first
     /// send refused for a pending transaction of the key, our nonce mined with no
-    /// receipt of ours for `receipt_lag_blocks`, an OP-stack operator fee, or a spent
-    /// global loss budget.
+    /// receipt of ours for `receipt_lag_blocks`, an OP-stack operator fee, or a global
+    /// loss budget its charged losses spent.
     pub fn paused(&self) -> bool {
-        let spent = self.budget_left().map_or(true, |left| left.is_zero());
+        let spent = self.charged_left().map_or(true, |left| left.is_zero());
         let (low, unexplained) = (self.low.load(Relaxed), self.unexplained.load(Relaxed));
         let fee = self.operator_fee.load(Relaxed);
         self.paused.load(Relaxed) || low || unexplained || fee || spent
@@ -603,10 +602,20 @@ impl<P: Provider> Relayer<P> {
         Ok(self.db().query_row(sql, [], first)?)
     }
 
-    /// What is left of the global loss budget.
+    /// What is left of the global loss budget, each send not yet charged at its worst.
     pub fn budget_left(&self) -> Result<U256, Error> {
+        self.left(true)
+    }
+
+    /// What the charged losses leave of the global loss budget.
+    fn charged_left(&self) -> Result<U256, Error> {
+        self.left(false)
+    }
+
+    fn left(&self, pending: bool) -> Result<U256, Error> {
         let budget = self.config.global_budget;
-        Ok(budget.wei.saturating_sub(lost(&self.db(), budget.window)?))
+        let lost = lost(&self.db(), budget.window, pending)?;
+        Ok(budget.wei.saturating_sub(lost))
     }
 
     /// What `receipt` of `id`'s send `send`, or of a cancel, cost the relayer: its gas
@@ -1114,11 +1123,11 @@ impl<P: Provider> Relayer<P> {
 }
 
 /// What the rows lost over the last `window`: each charged loss by when it was
-/// charged, and each send not yet charged at its worst.
-pub(crate) fn lost(db: &Connection, window: Duration) -> Result<U256, Error> {
-    let sql = "SELECT coalesce(loss, worst) FROM identities \
-               WHERE worst IS NOT NULL AND (loss IS NULL OR at > unixepoch() - ?1)";
-    let losses = rows(db, sql, [window.as_secs()], |r| u256(r, 0))?;
+/// charged, and with `pending` each send not yet charged at its worst.
+pub(crate) fn lost(db: &Connection, window: Duration, pending: bool) -> Result<U256, Error> {
+    let sql = "SELECT coalesce(loss, worst) FROM identities WHERE worst IS NOT NULL \
+               AND iif(loss IS NULL, ?2, at > unixepoch() - ?1)";
+    let losses = rows(db, sql, params![window.as_secs(), pending], |r| u256(r, 0))?;
     Ok(losses.into_iter().fold(U256::ZERO, U256::saturating_add))
 }
 

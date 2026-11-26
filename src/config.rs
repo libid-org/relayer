@@ -177,8 +177,8 @@ pub struct Config {
     /// node, before sending pauses; and a receipt's loss stays pending for the key's
     /// balances before it is charged as unrefunded.
     pub receipt_lag_blocks: u64,
-    /// The loss budget of all identities, each loss at its worst until its receipt:
-    /// past it, sending pauses and requests are `Paused`.
+    /// The loss budget of all identities. Its charged losses past it pause sending and
+    /// requests are `Paused`; a send also counts each send not yet charged at its worst.
     pub global_budget: Budget,
     /// How long a loss refuses its identity as `IdentityHeld`.
     pub loss_hold: Duration,
