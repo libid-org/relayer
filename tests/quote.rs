@@ -713,9 +713,18 @@ async fn floors_are_at_most_the_run_and_the_run_past_8_calls() {
     let burner = Address::repeat_byte(0xb0);
     o.set_code(burner, "62030d405b600190038060045700").await; // 200 000 loops
     let r = U256::from(CLAIMED / 10);
-    let run = async |b: &Batch<'_>| {
-        let draft = o.authorize(b, None).await;
-        o.simulated(&draft, b.1).await.gas_used
+    // The quote and its run on the same draft: a dummy signature's zero bytes vary.
+    let quoted = async |b: &Batch<'_>| {
+        let data = o.authorize(b, None).await;
+        let run = o.simulated(&data, b.1).await.gas_used;
+        let (wallet, create) = (o.wallet, o.path().await);
+        let draft = Draft {
+            wallet,
+            create,
+            data,
+            below_quorum: false,
+        };
+        (draft.quote(&o.relayer, &o.config()).await.unwrap(), run)
     };
     let burn = call(burner, U256::ZERO, vec![]);
     let b = Batch(
@@ -724,12 +733,12 @@ async fn floors_are_at_most_the_run_and_the_run_past_8_calls() {
         vec![&o.k],
         None,
     );
-    let q = o.quote_with(&o.config(), &b).await;
-    assert_eq!(q.call_gas[1], run(&b).await, "{:?}", q.call_gas);
+    let (q, run) = quoted(&b).await;
+    assert_eq!(q.call_gas[1], run, "{:?}", q.call_gas);
     let empty = call(Address::repeat_byte(0x33), U256::ZERO, vec![]);
     let mut calls = vec![empty; 7];
     calls.push(o.repay(r));
     let b = Batch(o.signing_in(2, calls), o.value, vec![&o.k], None);
-    let q = o.quote_with(&o.config(), &b).await;
-    assert_eq!(q.call_gas, vec![run(&b).await; 9]);
+    let (q, run) = quoted(&b).await;
+    assert_eq!(q.call_gas, vec![run; 9]);
 }
