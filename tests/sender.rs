@@ -1545,3 +1545,33 @@ async fn a_send_dropped_mid_broadcast_is_committed() {
     let report = o.settle(&r, id, included).await;
     assert_eq!(report.tx_hashes, [hash]);
 }
+
+/// A send landed unrefunded whose balances stay unread past `receipt_lag_blocks` is
+/// charged its cost and holds its identity only for the budget's window.
+#[tokio::test]
+async fn unread_balances_hold_their_identity_for_the_window() {
+    let (o, path) = (Onboarding::new(true).await, db("unread-hold"));
+    let (r, mode) = o.armable(&path).await;
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let id = o.queue(&r).await;
+    r.tick().await.unwrap();
+    o.set_code(o.wallet, "00").await; // STOP: mined, no refund
+    mode.store(BLIND, Ordering::Relaxed);
+    o.settle(&r, id, included).await;
+    let lag = o.config().receipt_lag_blocks;
+    o.owner.anvil_mine(Some(lag), None).await.unwrap();
+    r.tick().await.unwrap();
+    mode.store(0, Ordering::Relaxed);
+    o.set_code(o.wallet, "").await;
+    let again = o.batch(o.repay(o.refund() + U256::ONE));
+    let held = r.relay(&o.request_for(&again).await).await;
+    let Err(Refusal::IdentityHeld { until }) = held else {
+        panic!("{held:?}")
+    };
+    let ledger = rusqlite::Connection::open(&path).unwrap();
+    let sql = "SELECT at FROM identities WHERE id = ?1";
+    let at: u64 = ledger.query_row(sql, [&id[..]], |r| r.get(0)).unwrap();
+    let window = o.config().global_budget.window.as_secs();
+    assert_ne!(window, o.config().loss_hold.as_secs());
+    assert_eq!(until, at + window, "held for loss_hold");
+}

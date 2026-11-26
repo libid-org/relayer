@@ -29,10 +29,11 @@ an existing wallet, whatever its salt. The row holds the identity's request,
 its signed send and cancels, written before each broadcast, the send's worst
 cost with its value until its receipt, then what it lost. A paid row is
 dropped `receipt_lag_blocks` after its receipt, so a reorg that removes it
-has it sent again. A row with a loss from a reverted batch, a skipped refund
-or unread balances is dropped `loss_hold` after it last moved; one from a
-landed cancel, or a paid refund short of the send's cost, and a failed one,
-after the global budget's `window`.
+has it sent again. A row with a loss from a reverted batch or a skipped
+refund is dropped `loss_hold` after it last moved; one from a landed cancel,
+a paid refund short of the send's cost, or balances unread
+`receipt_lag_blocks` after its receipt, and a failed one, after the global
+budget's `window`.
 
 - An identity has one request in flight: another is `IdentityBusy` until the
   row is dropped or failed. Before its check, a relay answers only for its own
@@ -41,7 +42,7 @@ after the global budget's `window`.
 - A loss refuses the identity as `IdentityHeld` until its row is dropped:
   `loss_hold` after a reverted batch or a skipped refund, so an honest batch
   that reverts after a good check waits as long; the budget's `window` after
-  a landed cancel or an L1 fee over its bound.
+  a landed cancel, an L1 fee over its bound, or balances left unread.
 - The global budget sums the rows' losses over its `window`, each send at its
   worst until its receipt. Past it sending pauses until the window passes;
   under `min_balance`, until the key is funded.

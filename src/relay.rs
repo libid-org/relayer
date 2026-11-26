@@ -613,8 +613,8 @@ impl<P: Provider> Relayer<P> {
     /// and L1 fee, plus its value unless it reverted, less R when the key's balance over
     /// its block rose by at least `R - value - cost`. `None` while the balances are
     /// unread, until `receipt_lag_blocks` past its block, then charged its gas and L1
-    /// fee. With whether it holds the identity for `loss_hold`: a reverted batch, a
-    /// skipped refund or unread balances do; a cancel or a paid refund do not.
+    /// fee. With whether it holds the identity for `loss_hold`: a reverted batch or a
+    /// skipped refund do; a cancel, a paid refund or unread balances do not.
     async fn loss(
         &self,
         cancel: bool,
@@ -643,7 +643,7 @@ impl<P: Provider> Relayer<P> {
             Err(e) => {
                 let hash = receipt.transaction_hash;
                 tracing::warn!("{hash} charged as unrefunded: {e}");
-                (cost, true)
+                (cost, false)
             }
         }))
     }
@@ -1234,8 +1234,8 @@ fn admit(
 }
 
 /// How long a loss holds its identity and stays in the budget: `hold` for a reverted
-/// batch, a skipped refund or unread balances; the budget's `window` for a cancel or a
-/// paid refund short of the send's cost.
+/// batch or a skipped refund; the budget's `window` for a cancel, a paid refund short
+/// of the send's cost, or unread balances.
 fn held(holds: bool, hold: u64, window: u64) -> u64 {
     if holds {
         hold
