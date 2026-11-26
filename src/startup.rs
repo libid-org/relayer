@@ -83,8 +83,7 @@ pub async fn run(
     for warning in check(&provider, &config, signer.address()).await? {
         tracing::warn!("{warning}");
     }
-    // Stale once a tick may have run its whole timeout and ten more polls passed.
-    let stale_after = config.tick_timeout + poll_interval * 10;
+    let stale_after = stale_after(config.tick_timeout, poll_interval);
     let relayer = Relayer::start(provider, config, &db).await?;
     let api = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
     let metrics = TcpListener::bind((Ipv4Addr::UNSPECIFIED, metrics_port)).await?;
@@ -237,4 +236,21 @@ async fn operator_fee<P: Provider>(
         }
         gas::OperatorFee::Off => None,
     })
+}
+
+/// How old the last good tick may be while `/health` answers `OK`: a tick's whole
+/// timeout and ten more polls.
+fn stale_after(tick_timeout: Duration, poll_interval: Duration) -> Duration {
+    tick_timeout + poll_interval * 10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_goes_stale_after_a_tick_timeout_and_ten_polls() {
+        let stale = stale_after(Duration::from_secs(30), Duration::from_secs(1));
+        assert_eq!(stale, Duration::from_secs(40));
+    }
 }
