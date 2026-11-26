@@ -340,7 +340,8 @@ async fn refusals_carry_their_decoded_names() {
 }
 
 /// With every permit held by a half-sent body, config and status still answer; at
-/// shutdown, that request holds the drain no longer than `request_timeout`.
+/// shutdown, that request and one with unfinished headers hold the drain no longer
+/// than `request_timeout`.
 #[tokio::test]
 async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
     use tokio::io::AsyncWriteExt;
@@ -363,6 +364,9 @@ async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
     let mut half = tokio::net::TcpStream::connect(at).await.unwrap();
     let head = "POST /v1/relay HTTP/1.1\r\nhost: x\r\ncontent-length: 100\r\n\r\n{";
     half.write_all(head.as_bytes()).await.unwrap();
+    // Its headers unfinished: no handler runs, so no request timeout ends it.
+    let mut headless = tokio::net::TcpStream::connect(at).await.unwrap();
+    headless.write_all(b"POST /v1/relay HTTP/1.1\r\nhost: x\r\n").await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let url = format!("http://{at}");
     let config = reqwest::get(format!("{url}/v1/config")).await.unwrap();
@@ -375,7 +379,7 @@ async fn a_half_sent_request_holds_neither_status_nor_shutdown() {
         .expect("held past request_timeout")
         .unwrap()
         .unwrap();
-    drop(half);
+    drop((half, headless));
 }
 
 /// An identity whose send lost the relayer gas is `IdentityHeld` until `loss_hold`
