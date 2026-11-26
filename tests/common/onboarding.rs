@@ -323,10 +323,10 @@ impl Onboarding {
     }
 
     /// The latest deadline a relay accepts, in seconds after the latest block: what a
-    /// quote's `validUntil` and the inclusion window give.
+    /// quote's `validUntil`, the queue's wait and the inclusion window give.
     fn longest(&self) -> u64 {
         let config = self.config();
-        (config.quote_validity + config.inclusion_window).as_secs()
+        (config.quote_validity + config.queue_wait + config.inclusion_window).as_secs()
     }
 
     async fn sign(&self, calls: &[Execution]) -> Bytes {

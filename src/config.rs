@@ -19,6 +19,9 @@ pub const L1_MARGIN: u64 = 130;
 /// How long a quote stays valid on a production chain.
 pub const QUOTE_VALIDITY: Duration = Duration::from_secs(10);
 
+/// How long a request may wait queued on a production chain.
+pub const QUEUE_WAIT: Duration = Duration::from_secs(60);
+
 /// The most gas a transaction may have (EIP-7825): the highest `max_gas_limit`.
 pub const MAX_TX_GAS: u64 = 1 << 24;
 
@@ -154,6 +157,9 @@ pub struct Config {
     pub inclusion_window: Duration,
     /// How long a quote stays valid; its fee covers the base fee's growth meanwhile.
     pub quote_validity: Duration,
+    /// How long a request may wait queued: a deadline may run this much past a quote's
+    /// validity and the inclusion window.
+    pub queue_wait: Duration,
     /// The chain's block time, the step of the base fee's growth.
     pub block_time: Duration,
     /// The chain's base fee rule.
@@ -191,8 +197,9 @@ impl Config {
     /// as anvil mines each send at once; 1 s blocks and L1's base fee rule, M its
     /// growth over the window, cancels up to 10× the base fee, no balance floor, 5
     /// ticks of node errors on a request, receipts up to 10 blocks behind, no loss
-    /// budget or value cap, a day's hold on a loss, gas limits up to [`MAX_TX_GAS`], and release 1, the one the
-    /// contracts' test stack publishes.
+    /// budget or value cap, a day's hold on a loss, [`QUEUE_WAIT`] in the queue, gas
+    /// limits up to [`MAX_TX_GAS`], and release 1, the one the contracts' test stack
+    /// publishes.
     pub fn anvil(chain_id: u64, factory: Address, relayer: Address) -> Self {
         let mut config = Self {
             chain_id,
@@ -205,6 +212,7 @@ impl Config {
             l1_margin: L1_MARGIN,
             inclusion_window: Duration::from_secs(5),
             quote_validity: QUOTE_VALIDITY,
+            queue_wait: QUEUE_WAIT,
             block_time: Duration::from_secs(1),
             fee_params: FeeParams::Fixed(Eip1559::L1),
             tip_percentile: TIP_PERCENTILE,

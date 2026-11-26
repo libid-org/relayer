@@ -55,6 +55,8 @@ export type RelayerConfig = {
   registry: Address
   inclusionWindowSeconds: number
   quoteValiditySeconds: number
+  /// How long a request may wait queued: its deadline may run this much later.
+  queueWaitSeconds: number
 }
 
 /// `POST /v1/quote`: sign `callGas` and a refund of at least the batch's value
@@ -293,7 +295,7 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
   let { quote, swap } = await priced()
   for (let retried = false; ; retried = true) {
     const refund = fee + quote.minRefund
-    const deadline = quote.validUntil + config.inclusionWindowSeconds
+    const deadline = quote.validUntil + config.queueWaitSeconds + config.inclusionWindowSeconds
     const data = await authorize(refund, quote.callGas, deadline, o.signer, swap)
     try {
       const body = { wallet, create, data, gasLimit: quote.gasLimit }

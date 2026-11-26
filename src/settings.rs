@@ -23,6 +23,7 @@ use crate::{
         FeeParams,
         L1Fee,
         LOSS_HOLD,
+        QUEUE_WAIT,
         TICK_TIMEOUT,
     },
     http::Limits,
@@ -94,6 +95,8 @@ struct Fees {
     inclusion_window: Duration,
     #[serde(with = "humantime_serde")]
     quote_validity: Duration,
+    #[serde(default = "queue_wait", with = "humantime_serde")]
+    queue_wait: Duration,
     tip_percentile: f64,
     l1_fee: L1Fee,
     l1_margin_percent: u64,
@@ -112,6 +115,10 @@ struct State {
 
 fn tick_timeout() -> Duration {
     TICK_TIMEOUT
+}
+
+fn queue_wait() -> Duration {
+    QUEUE_WAIT
 }
 
 fn loss_hold() -> Duration {
@@ -219,6 +226,7 @@ impl Settings {
             l1_margin: fees.l1_margin_percent,
             inclusion_window: fees.inclusion_window,
             quote_validity: fees.quote_validity,
+            queue_wait: fees.queue_wait,
             block_time: chain.block_time,
             fee_params: fees.fee_params,
             tip_percentile: fees.tip_percentile,

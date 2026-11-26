@@ -30,6 +30,7 @@ const config = {
   registry: REGISTRY,
   inclusionWindowSeconds: 5,
   quoteValiditySeconds: 10,
+  queueWaitSeconds: 60,
 }
 const quote = (callGas: number, minRefund = '1000') => ({
   relayer: RELAYER,
@@ -159,7 +160,7 @@ describe('onboard', () => {
     expect(relay.gasLimit).toBe(900_000)
     expect(relay.create).toEqual({ platformId: zeroHash, idNode: ID, salt: '0' })
     const signed = decoded(relay.data as Hex)
-    expect([signed.value, signed.callGas, signed.deadline]).toEqual([FEE, 50_000n, NOW + 15])
+    expect([signed.value, signed.callGas, signed.deadline]).toEqual([FEE, 50_000n, NOW + 75])
     expect(signed.executions[3]).toEqual({ target: RELAYER, value: FEE + 1000n, callData: '0x' })
     const signer = await recoverAddress({
       hash: signed.digest,

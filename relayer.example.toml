@@ -37,6 +37,9 @@ address = "0x0000000000000000000000000000000000000000"
 # cap covers the base fee's growth over both.
 inclusion_window = "10s"
 quote_validity = "10s"
+# Optional, "60s" by default: how long a request may wait queued. A batch's
+# deadline may run this much past a quote's validity and inclusion_window.
+queue_wait = "60s"
 # The fee-history percentile of a send's tip, between 50 and 90.
 tip_percentile = 75.0
 # "op-stack" bounds the L1 fee with the gas price oracle; "none" on anvil.

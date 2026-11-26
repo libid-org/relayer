@@ -141,9 +141,12 @@ async fn an_onboarding_lands_through_the_stack() {
 
     let now = chain.get_block_by_number(Default::default()).await.unwrap();
     let now = now.unwrap().header.timestamp;
-    // The latest deadline a relay accepts: a quote's `validUntil` and the window.
+    // The latest deadline a relay accepts: a quote's `validUntil`, the queue's wait and
+    // the window.
     let seconds = |key: &str| config[key].as_u64().unwrap();
-    let longest = seconds("quoteValiditySeconds") + seconds("inclusionWindowSeconds");
+    let longest = seconds("quoteValiditySeconds")
+        + seconds("queueWaitSeconds")
+        + seconds("inclusionWindowSeconds");
     let message = ExecuteMessage {
         execution_calldata: encode_executions(&calls),
         value,

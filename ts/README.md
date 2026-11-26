@@ -95,8 +95,8 @@ dropped. Relay again.
 A refusal throws `RelayerError` with the HTTP `status` and the relayer's
 `name`, `message` and `args`; `IdentityBusy` carries the request in flight as
 `args.id`. `DeadlineTooFar` means the batch was signed to expire after
-`args.max`, which `onboard`'s deadline, `validUntil` plus the inclusion
-window, does not. A quote refused as `LinkSessionRefused` means the proof is not
+`args.max`, which `onboard`'s deadline, `validUntil` plus the config's
+`queueWaitSeconds` and `inclusionWindowSeconds`, does not. A quote refused as `LinkSessionRefused` means the proof is not
 this wallet's genesis identity. `waitFor` throws on a reverted inclusion, a
 failure or a cancellation.
 

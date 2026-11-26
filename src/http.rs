@@ -271,6 +271,7 @@ async fn config<P: Provider + 'static>(State(s): S<P>) -> Answer {
         "l1MarginPercent": c.l1_margin,
         "inclusionWindowSeconds": c.inclusion_window.as_secs(),
         "quoteValiditySeconds": c.quote_validity.as_secs(),
+        "queueWaitSeconds": c.queue_wait.as_secs(),
     }))
     .into_response())
 }

@@ -136,8 +136,8 @@ pub enum Refusal {
     },
     /// The batch's deadline falls before the inclusion window ends.
     Expired,
-    /// The batch's deadline is past the latest a quote signed now gives, which bounds
-    /// how long a send resumed at start is sent again.
+    /// The batch's deadline is past the latest a quote signed now and `queue_wait`
+    /// give.
     DeadlineTooFar {
         /// The latest deadline relayed, in unix seconds.
         max: u64,
@@ -241,7 +241,8 @@ impl Request {
         let (window, deadline) = (config.inclusion_window, message.deadline.to());
         let late = covered(deadline, header.timestamp.saturating_add(window.as_secs()))?;
         let slack = DEADLINE_SLACK * config.block_time;
-        let max = late + (config.quote_validity + slack).as_secs_f64().ceil() as u64;
+        let wait = config.quote_validity + config.queue_wait + slack;
+        let max = late + wait.as_secs_f64().ceil() as u64;
         if deadline > max {
             return Err(Refusal::DeadlineTooFar { max });
         }

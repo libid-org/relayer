@@ -156,10 +156,13 @@ a landed send to a vouched wallet cannot lose, and its request fails
 as `Node`; until then the send is watched, sent again and cancelled as usual.
 
 A batch's deadline must cover the inclusion window and be at most `max`:
-the latest block's time plus `inclusion_window`, `quote_validity` and two
-`block_time`s, which `validUntil` plus the window stays within. A later one
-is `DeadlineTooFar` (`args.max`): a send in flight at a restart is sent again
-until its deadline, holding the key's next nonce until then.
+the latest block's time plus `inclusion_window`, `quote_validity`,
+`queue_wait` and two `block_time`s, which `validUntil` plus
+`queueWaitSeconds` and the window stays within. A later one is
+`DeadlineTooFar` (`args.max`). A queued request is sent while its deadline
+covers the window. A send is sent again until its window ends, never past
+its deadline: a send in flight at a restart, or one a reorg removed, has
+one window from when it is first watched again.
 
 A refusal is `{"error": {"name", "message", "args"?, "contract"?}}`:
 
