@@ -419,7 +419,8 @@ async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
     let left = budget - first - second;
     assert_eq!(over["error"]["args"]["left"], left.to_string());
     let worst = over["error"]["args"]["worst"].as_str().unwrap();
-    assert!(worst.parse::<U256>().unwrap() > left, "{over}");
+    let worst = worst.parse::<U256>().unwrap();
+    assert!(worst > left && worst > o.value, "{over}");
     assert_eq!(s.gauge("paused").await, 0.0);
     assert_eq!(s.gauge("budget_left_wei").await, f64::from(left));
     let stats = stats(&path, &config).unwrap();
