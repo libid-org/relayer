@@ -8,7 +8,7 @@
 //! - `GET  /metrics`, on a listener of its own
 //!
 //! A refusal is `{"error": {name, contract?, args?, message}}`; wei amounts are
-//! decimal strings.
+//! decimal strings. The API answers browsers of any origin (CORS).
 
 use std::{
     future::{
@@ -73,7 +73,13 @@ use tokio::{
     time::Instant,
 };
 use tower::limit::GlobalConcurrencyLimitLayer;
-use tower_http::timeout::TimeoutLayer;
+use tower_http::{
+    cors::{
+        Any,
+        CorsLayer,
+    },
+    timeout::TimeoutLayer,
+};
 
 use crate::{
     check::{
@@ -205,6 +211,13 @@ pub async fn serve<P: Provider + 'static>(
         // Outside the limits: a saturated API still answers its healthcheck.
         .route(HEALTH_PATH, get(health))
         .fallback(|| async { C::NOT_FOUND })
+        // Any origin: the API takes no credentials.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([header::CONTENT_TYPE]),
+        )
         .layer(map_response(standing_headers))
         .with_state(service.clone());
     let scrape = Router::new()

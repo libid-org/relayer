@@ -127,6 +127,9 @@ On `[http] port`:
 | `GET /v1/relay/{id}`   |                          | `200 {status, txHashes, blockNumber?, reverted?, error?}` |
 | `GET /health`          |                          | `200 OK`, or `503` once no tick succeeded for `tick_timeout` and ten poll intervals |
 
+The API answers CORS preflights from any origin, for `GET` and `POST` with a
+`content-type` header; it takes no credentials.
+
 `create` is `{platformId, idNode, salt}` when the batch creates the wallet.
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
 signatures. A quote's `callGas`, which the wallet reserves before each call,

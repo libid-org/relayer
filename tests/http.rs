@@ -435,3 +435,20 @@ async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
     let after = relayer::stats::stats(&path, &config).unwrap();
     assert_eq!((after.held, after.lost), (0, U256::ZERO), "{after:?}");
 }
+
+/// A browser's preflight of a relay is answered for any origin.
+#[tokio::test]
+async fn a_browser_preflight_is_allowed() {
+    let (o, path) = (Onboarding::new(true).await, db("cors"));
+    let s = Server::start(&o, o.config(), &path, Duration::from_secs(3600)).await;
+    let preflight = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("{}/v1/relay", s.url))
+        .header("origin", "https://claim.example")
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type");
+    let response = preflight.send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let headers = response.headers();
+    assert_eq!(headers["access-control-allow-origin"], "*");
+    assert!(headers["access-control-allow-methods"].to_str().unwrap().contains("POST"));
+}
