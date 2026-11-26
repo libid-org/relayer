@@ -153,6 +153,8 @@ const HANG: u8 = 11;
 /// Refuses every raw transaction unsent, as a node whose pool is full.
 const FULL: u8 = 12;
 const LOST: u8 = 13;
+/// Sends the next raw transaction, then never answers.
+const SILENT: u8 = 14;
 
 type Boxed<'a, T> =
     alloy::transports::BoxFuture<'a, alloy::transports::TransportResult<T>>;
@@ -300,6 +302,9 @@ impl Provider for Racing {
                 self.1.store(LOST, Ordering::Relaxed);
             }
             let sent = self.0.send_raw_transaction(raw).await?;
+            if mode == SILENT {
+                std::future::pending::<()>().await;
+            }
             if mode == LOST {
                 let lost = "error sending request: connection reset";
                 return Err(alloy::transports::TransportErrorKind::custom_str(lost));
@@ -462,6 +467,14 @@ async fn one_identity_is_sent_one_batch_at_a_time() {
     let busy = r.relay(&second).await;
     let busy = matches!(busy, Err(Refusal::IdentityBusy { id }) if id == first);
     assert!(busy, "queued beside the first");
+    r.tick().await.unwrap();
+    assert!(matches!(r.status(first).await.unwrap().status, Status::Sent));
+    let busy = r.relay(&second).await;
+    assert!(
+        matches!(&busy, Err(Refusal::IdentityBusy { id }) if *id == first),
+        "{busy:?}"
+    );
+    assert!(r.status(first).await.is_ok(), "the sent row was replaced");
     let before = o.owner.get_balance(o.relayer_address).await.unwrap();
     let hash = o.settle(&r, first, included).await.tx_hashes[0];
     let refused = r.relay(&second).await;
@@ -1516,4 +1529,19 @@ async fn a_resumed_send_is_cancelled_at_its_deadline() {
         "not cancelled at its deadline"
     );
     o.settle(&r, id, |s| matches!(s, Status::Cancelled)).await;
+}
+
+/// A send the node took and never answered is in the ledger when its tick is dropped.
+#[tokio::test]
+async fn a_send_dropped_mid_broadcast_is_committed() {
+    let o = Onboarding::new(true).await;
+    let r = o.racing(SILENT, "silent").await;
+    let id = o.queue(&r).await;
+    let cut = tokio::time::timeout(std::time::Duration::from_secs(4), r.tick()).await;
+    let report = r.status(id).await.unwrap();
+    let sent = matches!(report.status, Status::Sent) && report.tx_hashes.len() == 1;
+    assert!(sent, "cut {}: {:?}", cut.is_err(), report.status);
+    let hash = report.tx_hashes[0];
+    let report = o.settle(&r, id, included).await;
+    assert_eq!(report.tx_hashes, [hash]);
 }
