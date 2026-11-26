@@ -155,7 +155,11 @@ jobs:
       - name: Onboard through the stack
         run: cargo test --locked --test e2e -- --ignored --nocapture
 
+      # Also runs the swap routes on a fork of Base: a public endpoint unless
+      # the repository sets the BASE_RPC_URL secret.
       - name: Onboard through the client
+        env:
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL || 'https://mainnet.base.org' }}
         run: pnpm -C ts test:e2e
 
       - name: Logs

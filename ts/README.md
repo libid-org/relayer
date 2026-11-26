@@ -154,6 +154,7 @@ and `IQuoterV2` of [Uniswap/v3-periphery](https://github.com/Uniswap/v3-peripher
 The fee tiers are the ones QuoterV2 priced best for 0.001 ETH when the routes
 were added. `test/swap.fork.test.ts` runs every route on a fork of
 `BASE_RPC_URL` (`BASE_RPC_URL=… pnpm -C ts test:e2e`), and skips without it.
+CI runs it on a public Base endpoint unless the `BASE_RPC_URL` secret is set.
 
 ## Known limits
 
