@@ -426,11 +426,22 @@ async fn a_loss_holds_its_identity_and_the_global_budget_bounds_the_next() {
         (2, first + second),
         "not charged its loss"
     );
-    // Past the hold, the rows go: nothing is held or counted.
-    let hold = config.loss_hold.as_secs();
+    // Past the budget's window both still hold their identities; past the hold, the
+    // rows go: nothing is held or counted.
     let ledger = rusqlite::Connection::open(&path).unwrap();
-    let back = format!("UPDATE identities SET at = at - {hold}");
-    ledger.execute(&back, []).unwrap();
+    let back = |secs: u64| {
+        let sql = format!("UPDATE identities SET at = at - {secs}");
+        ledger.execute(&sql, []).unwrap();
+    };
+    let (hold, window) = (
+        config.loss_hold.as_secs(),
+        config.global_budget.window.as_secs(),
+    );
+    back(window + 1);
+    s.service.tick().await;
+    let held = relayer::stats::stats(&path, &config).unwrap().held;
+    assert_eq!(held, 2, "held only for the budget's window");
+    back(hold - window - 1);
     s.service.tick().await;
     let after = relayer::stats::stats(&path, &config).unwrap();
     assert_eq!((after.held, after.lost), (0, U256::ZERO), "{after:?}");
@@ -450,5 +461,8 @@ async fn a_browser_preflight_is_allowed() {
     assert_eq!(response.status(), 200);
     let headers = response.headers();
     assert_eq!(headers["access-control-allow-origin"], "*");
-    assert!(headers["access-control-allow-methods"].to_str().unwrap().contains("POST"));
+    assert!(headers["access-control-allow-methods"]
+        .to_str()
+        .unwrap()
+        .contains("POST"));
 }

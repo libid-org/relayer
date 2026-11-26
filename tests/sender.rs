@@ -477,7 +477,10 @@ async fn one_identity_is_sent_one_batch_at_a_time() {
     let busy = matches!(busy, Err(Refusal::IdentityBusy { id }) if id == first);
     assert!(busy, "queued beside the first");
     r.tick().await.unwrap();
-    assert!(matches!(r.status(first).await.unwrap().status, Status::Sent));
+    assert!(matches!(
+        r.status(first).await.unwrap().status,
+        Status::Sent
+    ));
     let busy = r.relay(&second).await;
     assert!(
         matches!(&busy, Err(Refusal::IdentityBusy { id }) if *id == first),
@@ -1616,4 +1619,22 @@ async fn a_send_not_yet_charged_counts_only_at_the_next_send() {
     let status = r.status(second).await.unwrap();
     let over = matches!(status.status, Status::Failed(Refusal::OverBudget { .. }));
     assert!(over && status.tx_hashes.is_empty(), "{:?}", status.status);
+}
+
+/// A reverted batch is charged its gas and its receipt's `l1Fee`.
+#[tokio::test]
+async fn a_loss_counts_the_receipts_l1_fee() {
+    let (o, path) = (Onboarding::new(true).await, db("l1-loss"));
+    let (r, mode) = o.armable(&path).await;
+    o.owner.anvil_set_auto_mine(false).await.unwrap();
+    let id = o.queue(&r).await;
+    r.tick().await.unwrap();
+    o.set_code(o.wallet, "60006000fd").await; // REVERT: mined, status 0
+    mode.store(L1_WEI, Ordering::Relaxed);
+    let reverted = |s: &Status| matches!(s, Status::Included { reverted: true, .. });
+    let report = o.settle(&r, id, reverted).await;
+    let receipt = o.receipt(report.tx_hashes[0]).await;
+    let gas = U256::from(receipt.gas_used) * U256::from(receipt.effective_gas_price);
+    let lost = relayer::stats::stats(&path, &o.config()).unwrap().lost;
+    assert_eq!(lost, gas + U256::ONE, "not its gas and l1Fee");
 }
