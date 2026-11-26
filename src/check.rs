@@ -14,15 +14,21 @@ use alloy::{
     },
     providers::Provider,
     rpc::types::{
+        simulate::SimCallResult,
         BlockOverrides,
         TransactionRequest,
     },
-    sol_types::SolCall,
+    sol_types::{
+        SolCall,
+        SolError,
+        SolValue,
+    },
     transports::TransportError,
 };
 use libid_contracts::{
     bindings::wallet::{
         decode_executions,
+        encode_executions,
         ExecuteAuthorization,
         ExecuteMessage,
         Execution,
@@ -263,14 +269,23 @@ impl Request {
             let required = value.saturating_add(cost);
             return Err(Refusal::RefundTooLow { refund, required });
         };
-        let call_gas = message.call_gas.try_into().unwrap_or(u64::MAX);
+        let floors = floors(&message);
+        let parts = (&message, &authorization);
+        let (sim, cuts) = tokio::join!(
+            gas::simulate(provider, &call, late),
+            cuts(provider, config, (wallet, create), parts, &executions, late),
+        );
+        let before = cuts.map(|cuts| before(&cuts, &executions));
         let (create, priced_for) = (create.is_some(), self.gas_limit);
         let refunds = refunds(&executions, config.relayer);
         let fillable = gas::fillable(&message, &authorization, refunds);
         let limit = relay_limit(
-            provider, &call, late, call_gas, create, priced_for, fillable,
-        );
-        let limit = limit.await?;
+            sim?,
+            (&floors, before.as_deref()),
+            create,
+            priced_for,
+            fillable,
+        )?;
         // The fee cap the refund pays for at the limit sent: at least the floor.
         let cap = (net - l1_fee_bound) / U256::from(limit);
         let cap = u128::try_from(cap).unwrap_or(u128::MAX);
@@ -354,28 +369,87 @@ pub(crate) fn refunds(
         .map(|e| e.value)
 }
 
-/// The gas limit `call` is sent at, from its run at `late`, for its signed
-/// `call_gas` and path; at most the limit its refund was priced for. A refusal
-/// reports the limit with the `fillable` gas a re-signed batch may add.
-async fn relay_limit<P: Provider>(
-    provider: &P,
-    call: &TransactionRequest,
-    late: u64,
-    call_gas: u64,
+/// The gas limit of the run `sim`, for its signed `floors` with the gas `before` each
+/// call, and its path; at most the limit its refund was priced for. A refusal reports
+/// the limit with the `fillable` gas a re-signed batch may add.
+#[allow(clippy::result_large_err)] // the `Refusal` that its callers return
+fn relay_limit(
+    sim: SimCallResult,
+    (floors, before): (&[u64], Option<&[u64]>),
     create: bool,
     priced_for: u64,
     fillable: u64,
 ) -> Result<u64, Refusal> {
-    let sim = gas::simulate(provider, call, late).await?;
     if !sim.status {
         return Err(reverted(sim.return_data));
     }
-    let required = gas::limit(&sim, 0, call_gas, create);
+    let required = gas::limit(&sim, 0, floors, before, create);
     if required > priced_for {
-        let required = gas::limit(&sim, fillable, call_gas, create);
+        let required = gas::limit(&sim, fillable, floors, before, create);
         return Err(Refusal::GasLimitTooLow { required });
     }
     Ok(required)
+}
+
+/// The most calls a batch may have for its cuts to be run.
+const PREFIXES: usize = 8;
+
+/// A cut of a batch: the gas it used, and its EIP-7623 calldata floor.
+pub(crate) type Cut = (u64, u64);
+
+/// Each cut of `message`'s batch, its first `k` calls with their floors for `k` from 0
+/// to all, run in one block at `time` to its signatures, which sign only the whole
+/// batch. `None` with over [`PREFIXES`] calls, or a cut that does not run to them.
+pub(crate) async fn cuts<P: Provider>(
+    provider: &P,
+    config: &Config,
+    (wallet, create): (Address, Option<Create>),
+    (message, authorization): (&ExecuteMessage, &ExecuteAuthorization),
+    executions: &[Execution],
+    time: u64,
+) -> Option<Vec<Cut>> {
+    if executions.len() > PREFIXES {
+        return None;
+    }
+    let cut = |k: usize| {
+        let message = ExecuteMessage {
+            execution_calldata: encode_executions(&executions[..k]),
+            call_gas: message.call_gas.get(..k)?.to_vec(),
+            ..message.clone()
+        };
+        let data = message.authorized_data(authorization.clone());
+        Some(outer(config, wallet, create, &data, message.value))
+    };
+    let cuts: Option<Vec<_>> = (0..=executions.len()).map(cut).collect();
+    let cuts = cuts?;
+    let input = |c: &TransactionRequest| c.input().map(|i| gas::floor(i));
+    let floors: Vec<_> = cuts.iter().map(|c| input(c).unwrap_or_default()).collect();
+    let runs = gas::simulate_all(provider, cuts, time).await.ok()?;
+    let unsigned = IWebWallet::ExecutionNotSigned::SELECTOR;
+    let ran = |r: &SimCallResult| r.status || r.return_data[..] == unsigned;
+    if runs.len() != executions.len() + 1 || !runs.iter().all(ran) {
+        return None;
+    }
+    Some(runs.iter().map(|r| r.gas_used).zip(floors).collect())
+}
+
+/// The gas used before each call of the batch: its cut before it, with the calldata
+/// gas of the calls the cut leaves out.
+pub(crate) fn before(cuts: &[Cut], executions: &[Execution]) -> Vec<u64> {
+    let calldata: Vec<_> = executions
+        .iter()
+        .map(|e| gas::calldata_gas(&e.abi_encode()))
+        .collect();
+    let left_out = |i: usize| calldata[i..].iter().sum::<u64>();
+    (0..executions.len())
+        .map(|i| cuts[i].0 + left_out(i))
+        .collect()
+}
+
+/// `message`'s signed floors, one per call.
+pub(crate) fn floors(message: &ExecuteMessage) -> Vec<u64> {
+    let floor = |g: &U256| u64::try_from(*g).unwrap_or(u64::MAX);
+    message.call_gas.iter().map(floor).collect()
 }
 
 /// `GasLimitTooHigh` above `config.max_gas_limit`.

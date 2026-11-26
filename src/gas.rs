@@ -134,25 +134,57 @@ fn reverted(e: &alloy::contract::Error) -> bool {
 /// between the run and the block.
 const PEAK_MARGIN: u128 = 50_000;
 
-/// The gas limit of the run `sim` with `extra` gas more:
-/// `max(ceil(1.05 × peak), peak + 50 000) + (callGas + CALL_OVERHEAD) × (64/63)^d`, the
-/// peak being `maxUsedGas`, what the run needs before its refund (EIP-3529); from a
-/// node that gives none, `ceil(1.25 × gasUsed)` instead. Each 64/63 is a frame's kept
-/// 1/64: the wallet's check, and the delegatecall of the wallet proxy, so `d` is 2;
-/// the create path adds the factory proxy's delegatecall and its call of the wallet,
-/// so 4.
-pub(crate) fn limit(sim: &SimCallResult, extra: u64, call_gas: u64, create: bool) -> u64 {
+/// The gas limit of the run `sim` with `extra` gas more, each call `i` given its signed
+/// floor `floors[i]`. A run at its margin, `max(ceil(1.05 × peak), peak + 50 000)`,
+/// the peak being `maxUsedGas`, what the run needs before its refund (EIP-3529); from
+/// a node that gives none, `ceil(1.25 × gasUsed)` instead. With the gas `before` each
+/// call, the most of the run and each `before[i]` with `extra` at that margin plus
+/// `(floors[i] + CALL_OVERHEAD) × (64/63)^d`; without, the run plus that of the
+/// highest floor. Each 64/63 is a frame's kept 1/64: the wallet's check, and the
+/// delegatecall of the wallet proxy, so `d` is 2; the create path adds the factory
+/// proxy's delegatecall and its call of the wallet, so 4.
+pub(crate) fn limit(
+    sim: &SimCallResult,
+    extra: u64,
+    floors: &[u64],
+    before: Option<&[u64]>,
+    create: bool,
+) -> u64 {
     let d = if create { 4 } else { 2 };
-    let reserve = u128::from(call_gas) + u128::from(CALL_OVERHEAD);
-    let reserve = (reserve * 64u128.pow(d)).div_ceil(63u128.pow(d));
-    let run = match sim.max_used_gas {
-        Some(peak) => {
+    let reserve = |floor: u64| {
+        let reserve = u128::from(floor) + u128::from(CALL_OVERHEAD);
+        (reserve * 64u128.pow(d)).div_ceil(63u128.pow(d))
+    };
+    let margin = |used: u64, peak: u64| match sim.max_used_gas {
+        Some(_) => {
             let peak = u128::from(peak) + u128::from(extra);
             (peak * 105).div_ceil(100).max(peak + PEAK_MARGIN)
         }
-        None => (u128::from(sim.gas_used + extra) * 5).div_ceil(4),
+        None => (u128::from(used + extra) * 5).div_ceil(4),
     };
-    u64::try_from(run + reserve).unwrap_or(u64::MAX)
+    let run = margin(sim.gas_used, sim.max_used_gas.unwrap_or_default());
+    let limit = match before {
+        Some(before) => {
+            let each = before.iter().zip(floors);
+            let each = each.map(|(&b, &floor)| margin(b, b) + reserve(floor));
+            each.fold(run, u128::max)
+        }
+        None => run + reserve(floors.iter().copied().max().unwrap_or_default()),
+    };
+    u64::try_from(limit).unwrap_or(u64::MAX)
+}
+
+/// The EIP-7623 floor of a transaction with `input`: 21000 and 10 a token, a zero byte
+/// one token and any other four.
+pub(crate) fn floor(input: &[u8]) -> u64 {
+    let zeros = input.iter().filter(|&&b| b == 0).count() as u64;
+    21_000 + 10 * (zeros + 4 * (input.len() as u64 - zeros))
+}
+
+/// The calldata gas of `bytes` (EIP-2028).
+pub(crate) fn calldata_gas(bytes: &[u8]) -> u64 {
+    let zeros = bytes.iter().filter(|&&b| b == 0).count() as u64;
+    zeros * ZERO_BYTE + (bytes.len() as u64 - zeros) * (ZERO_BYTE + NONZERO_BYTE)
 }
 
 /// The gas of the zero bytes a client fills when it signs, priced as nonzero: the

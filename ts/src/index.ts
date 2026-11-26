@@ -62,7 +62,8 @@ export type RelayerConfig = {
 /// `POST /v1/quote`: sign `callGas` and a refund of at least the batch's value
 /// plus `minRefund`, for a send at `gasLimit`, before `validUntil` (Unix seconds).
 export type Quote = {
-  callGas: number
+  /// The least gas each call gets, one floor per call.
+  callGas: number[]
   gasLimit: number
   maxFeePerGas: bigint
   l1FeeBound: bigint
@@ -249,7 +250,7 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
   // A wallet not yet created signs at nonce 0 under the domain salt of epoch 0.
   const authorize = async (
     refund: bigint,
-    callGas: number,
+    callGas: readonly number[] | undefined,
     deadline: number,
     signer: Signer,
     swap?: SwapPlan,
@@ -261,7 +262,7 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
       at,
       nonce: 0n,
       deadline,
-      callGas: BigInt(callGas),
+      callGas: callGas ? callGas.map(BigInt) : batch.map(() => 0n),
     }
     const digest = executeDigest(message, chainId, wallet, version, walletSalt(zeroHash, 0))
     const signature = await signer.sign(digest)
@@ -269,9 +270,10 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
     return authorizedData(message, { signatures, calls: [], domainProof: [], paymasterProof: [] })
   }
   const create = { platformId, idNode: o.idNode, salt: salt.toString() }
-  // The draft: well-formed, signed by a throwaway key under the real key bytes.
+  // The draft: well-formed, at zero floors, signed by a throwaway key under the real
+  // key bytes.
   const quoted = async (swap?: SwapPlan) => {
-    const data = await authorize(0n, 0, at + 3600, throwaway(), swap)
+    const data = await authorize(0n, undefined, at + 3600, throwaway(), swap)
     return parseQuote(await http('POST', '/v1/quote', { wallet, create, data }))
   }
   // The swap of the best token that returns at least what the claimed ETH lacks.
@@ -473,9 +475,9 @@ function throwaway(): Signer {
 }
 
 function parseQuote(q: unknown): Quote {
-  const r = q as Record<string, string | number>
+  const r = q as Record<string, string | number> & { callGas: number[] }
   return {
-    callGas: Number(r.callGas),
+    callGas: r.callGas.map(Number),
     gasLimit: Number(r.gasLimit),
     maxFeePerGas: BigInt(r.maxFeePerGas),
     l1FeeBound: BigInt(r.l1FeeBound),

@@ -153,7 +153,7 @@ async fn an_onboarding_lands_through_the_stack() {
         at: U48::from(now),
         nonce: U256::ZERO,
         deadline: U48::from(now + longest),
-        call_gas: U256::from(CALL_GAS),
+        call_gas: vec![U256::from(CALL_GAS); calls.len()],
     };
     let digest = message.digest(chain_id, wallet, release, wallet_salt(B256::ZERO, 0));
     let signature = k.sign_hash_sync(&digest).unwrap();

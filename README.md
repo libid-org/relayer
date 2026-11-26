@@ -146,13 +146,19 @@ payload carries a key.
 
 `create` is `{platformId, idNode, salt}` when the batch creates the wallet.
 `data` is `execute(AUTHORIZED_MODE, data)`'s data; a quote's carries dummy
-signatures. A quote's `callGas`, which the wallet reserves before each call,
-covers what the batch's dearest call used and a quarter, measured on cuts of
-the draft run in one block, for batches of up to 8 calls; a longer batch, one
-whose cuts do not run, or one with a cut billed at its EIP-7623 calldata floor,
-gets the whole run's gas. A call that needs more
-than its run showed, made dearer by an earlier call or swallowing a failure
-deep down, may be starved by whoever sends the signed batch. A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
+signatures and a zero `callGas` floor per call. A quote's `callGas` is an
+array, one floor per call, the least gas the wallet gives that call: what it
+used and a quarter, measured on cuts of the draft (its first `k` calls) run
+in one block, for batches of up to 8 calls, at most the whole run's gas; a
+longer batch, one whose cuts do not run, or one with a cut billed at its
+EIP-7623 calldata floor, gets the whole run's gas for each. The gas limit is
+the most of the run at its margin and, before each call, the gas its cut
+used with the calldata of the calls it leaves out, at that margin, plus
+`(floor + CALL_OVERHEAD) × (64/63)^d`, `d` 4 on the create path and 2
+otherwise; without cuts, the run plus that of the highest floor. A relay
+measures the signed batch the same way. A call that needs more than its run
+showed, made dearer by an earlier call or swallowing a failure deep down, may
+be starved by whoever sends the signed batch. A status is `queued`, `sent`, `included`, `cancelled` or `failed`;
 once its row is dropped (see [Ledger](#ledger)) the request is
 `404 UnknownRequest`. Relaying the same request again answers its current
 status; a failed one is checked and queued again. A later request of the same

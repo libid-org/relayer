@@ -300,13 +300,14 @@ impl Onboarding {
         at: u64,
         deadline: u64,
     ) -> Bytes {
+        let calls = decode_executions(&execution_calldata).map_or(0, |e| e.len());
         let message = ExecuteMessage {
             execution_calldata,
             value,
             at: U48::from(at),
             nonce: U256::ZERO,
             deadline: U48::from(deadline),
-            call_gas: U256::from(CALL_GAS),
+            call_gas: vec![U256::from(CALL_GAS); calls],
         };
         // A wallet without code signs under release 1's domain, salt `wallet_salt(0, 0)`.
         let salt = wallet_salt(B256::ZERO, 0);
@@ -395,17 +396,35 @@ impl Onboarding {
         blocks.remove(0).calls.remove(0)
     }
 
-    /// The relay-time limit by hand, of `data` run with `extra` gas more: [`run_limit`]
-    /// and the reserve.
-    async fn limit_with(&self, data: &Bytes, value: U256, call_gas: u64, extra: u64) -> u64 {
+    /// The relay-time limit by hand, of `data` run with `extra` gas more: the most of
+    /// [`run_limit`] and, before each call, the gas its cut used with the calldata of the
+    /// calls the cut leaves out at that margin, plus the reserve of its signed floor.
+    async fn limit_with(&self, data: &Bytes, value: U256, extra: u64) -> u64 {
         let sim = self.simulated(data, value).await;
         assert!(sim.status, "{sim:?}");
-        run_limit(&sim, extra) + reserve(call_gas, self.path().await.is_some())
+        let (message, authorization) = ExecuteMessage::from_authorized_data(data).unwrap();
+        let calls = decode_executions(&message.execution_calldata).unwrap();
+        let create = self.path().await.is_some();
+        let mut limit = run_limit(&sim, extra);
+        for (k, floor) in message.call_gas.iter().enumerate() {
+            let cut = ExecuteMessage {
+                execution_calldata: encode_executions(&calls[..k]),
+                call_gas: message.call_gas[..k].to_vec(),
+                ..message.clone()
+            };
+            let cut = cut.authorized_data(authorization.clone());
+            let used = self.simulated(&cut, value).await.gas_used;
+            let left_out = calls[k..].iter().map(|c| eip2028(&c.abi_encode()));
+            let before = used + left_out.sum::<u64>() + extra;
+            let reserve = reserve(floor.to(), create);
+            limit = limit.max(((before * 5).div_ceil(4)) + reserve);
+        }
+        limit
     }
 
     /// The relay-time limit by hand of `data`.
-    async fn limit(&self, data: &Bytes, value: U256, call_gas: u64) -> u64 {
-        self.limit_with(data, value, call_gas, 0).await
+    async fn limit(&self, data: &Bytes, value: U256) -> u64 {
+        self.limit_with(data, value, 0).await
     }
 
     /// `data` sent directly, and mined successfully.
@@ -573,6 +592,11 @@ fn run_limit(sim: &alloy::rpc::types::simulate::SimCallResult, extra: u64) -> u6
 fn reserve(call_gas: u64, create: bool) -> u64 {
     let d = if create { 4 } else { 2 };
     ((call_gas + CALL_OVERHEAD) * 64u64.pow(d)).div_ceil(63u64.pow(d))
+}
+
+/// 4 gas a zero byte and 16 any other.
+fn eip2028(bytes: &[u8]) -> u64 {
+    bytes.iter().map(|&b| if b == 0 { 4 } else { 16 }).sum()
 }
 
 fn reverted(r: &Refusal, name: &str) -> bool {

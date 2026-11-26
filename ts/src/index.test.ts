@@ -32,9 +32,10 @@ const config = {
   quoteValiditySeconds: 10,
   queueWaitSeconds: 60,
 }
+/// A quote whose first call's floor is `callGas`, the other three's 1, 2 and 3.
 const quote = (callGas: number, minRefund = '1000') => ({
   relayer: RELAYER,
-  callGas,
+  callGas: [callGas, 1, 2, 3],
   gasLimit: 900_000,
   maxFeePerGas: '1',
   l1FeeBound: '0',
@@ -110,7 +111,7 @@ function relayer(answers: Record<string, [number, unknown][]>) {
   return sent
 }
 
-const DATA = parseAbiParameters('bytes, uint256, uint48, uint256, bytes')
+const DATA = parseAbiParameters('bytes, uint256, uint48, uint256[], bytes')
 const EXECUTIONS = parseAbiParameters('(address target, uint256 value, bytes callData)[]')
 const AUTH = parseAbiParameters(
   '((bytes key, bytes signature)[] signatures, uint48 at, (uint256 maxValue, bytes32[] proof)[] calls, bytes32[] domainProof, bytes32[] paymasterProof)',
@@ -151,7 +152,7 @@ describe('onboard', () => {
     expect(done.swapped).toEqual([])
 
     const draft = decoded(sent['/v1/quote'][0].data as Hex)
-    expect(draft.callGas).toBe(0n)
+    expect(draft.callGas).toEqual([0n, 0n, 0n, 0n])
     expect(draft.executions.map((e) => [e.target, e.value])).toEqual([
       [WALLET, FEE],
       [a(5), 0n],
@@ -171,7 +172,11 @@ describe('onboard', () => {
     expect(relay.gasLimit).toBe(900_000)
     expect(relay.create).toEqual({ platformId: zeroHash, idNode: ID, salt: '0' })
     const signed = decoded(relay.data as Hex)
-    expect([signed.value, signed.callGas, signed.deadline]).toEqual([FEE, 50_000n, NOW + 75])
+    expect([signed.value, signed.callGas, signed.deadline]).toEqual([
+      FEE,
+      [50_000n, 1n, 2n, 3n],
+      NOW + 75,
+    ])
     expect(signed.executions[3]).toEqual({ target: RELAYER, value: FEE + 1000n, callData: '0x' })
     const signer = await recoverAddress({
       hash: signed.digest,
@@ -256,8 +261,8 @@ describe('onboard', () => {
       '/v1/relay': [tooLow as [number, unknown], [202, { id: '0xcd', status: 'queued' }]],
     })
     const { quote: used } = await onboard(ethOnly)
-    expect(used.callGas).toBe(60_000)
-    expect(decoded(sent['/v1/relay'][1].data as Hex).callGas).toBe(60_000n)
+    expect(used.callGas).toEqual([60_000, 1, 2, 3])
+    expect(decoded(sent['/v1/relay'][1].data as Hex).callGas).toEqual([60_000n, 1n, 2n, 3n])
 
     relayer({
       '/v1/quote': [

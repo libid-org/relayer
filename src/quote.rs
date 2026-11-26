@@ -2,14 +2,12 @@
 
 use alloy::{
     eips::BlockId,
-    network::TransactionBuilder,
     primitives::{
         Address,
         Bytes,
         U256,
     },
     providers::Provider,
-    rpc::types::TransactionRequest,
     sol_types::{
         SolError,
         SolValue,
@@ -17,7 +15,6 @@ use alloy::{
 };
 use libid_contracts::{
     bindings::wallet::{
-        encode_executions,
         ExecuteAuthorization,
         ExecuteMessage,
         Execution,
@@ -32,6 +29,9 @@ use serde::Deserialize;
 
 use crate::{
     check::{
+        self,
+        before,
+        cuts,
         decode,
         outer,
         refunds,
@@ -53,9 +53,6 @@ use crate::{
 /// A call's extra gas for sending value (`CALL`'s value transfer).
 const CALL_VALUE: u64 = 9_000;
 
-/// The most calls a batch may have for each call's gas to be measured.
-const PREFIXES: usize = 8;
-
 /// A batch to quote: its data carries a well-formed dummy signature for every signer.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,11 +71,12 @@ pub struct Draft {
 
 /// What the client signs: `call_gas`, and a refund of at least `value + min_refund`
 /// for a send at `gas_limit`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Quote {
-    /// The gas the wallet reserves for each call: what its dearest call used and a
-    /// quarter, at most the whole run's gas used.
-    pub call_gas: u64,
+    /// The least gas the wallet gives each call, one floor per call: what it used and a
+    /// quarter, at most the whole run's gas used; each the whole run's when the cuts
+    /// show no call's own gas.
+    pub call_gas: Vec<u64>,
     /// The gas limit the refund is priced for.
     pub gas_limit: u64,
     /// The fee cap the refund is priced at: the floor, the base fee grown by its most
@@ -128,9 +126,9 @@ impl Draft {
         let now = header.timestamp;
         let late = now + config.inclusion_window.as_secs();
         let parts = (&message, &authorization);
-        let (sim, cut) = tokio::join!(
+        let (sim, cuts) = tokio::join!(
             gas::simulate(provider, &call, late),
-            self.call_gas(provider, config, parts, &executions, late),
+            cuts(provider, config, (wallet, create), parts, &executions, late),
         );
         let sim = sim?;
         // Every call ran; only the dummy signatures failed.
@@ -138,15 +136,19 @@ impl Draft {
         if !sim.status && !unsigned {
             return Err(reverted(sim.return_data));
         }
-        let call_gas = cut.unwrap_or(sim.gas_used).min(sim.gas_used);
+        let each = cuts.as_deref().and_then(|cuts| each(cuts, &executions));
+        let each = each.unwrap_or_else(|| vec![sim.gas_used; executions.len()]);
+        let call_gas: Vec<_> = each.into_iter().map(|g| g.min(sim.gas_used)).collect();
+        let before = cuts.map(|cuts| before(&cuts, &executions));
         let below_quorum = self.below_quorum.then_some(executions.len());
         let refunds = refunds(&executions, config.relayer);
         if refunds.clone().next().is_none() {
             return Err(Refusal::RefundMissing);
         }
         let unmeasured =
-            unmeasured(&message, &authorization, refunds, call_gas, below_quorum);
-        let gas_limit = gas::limit(&sim, unmeasured, call_gas, create.is_some());
+            unmeasured(&message, &authorization, refunds, &call_gas, below_quorum);
+        let (floors, create) = ((&call_gas[..], before.as_deref()), create.is_some());
+        let gas_limit = gas::limit(&sim, unmeasured, floors.0, floors.1, create);
         under_max(gas_limit, config)?;
         let growth = config.quote_validity + config.inclusion_window;
         let floor = gas::grown(config, &header, growth)?;
@@ -166,87 +168,33 @@ impl Draft {
             valid_until: now + config.quote_validity.as_secs(),
         })
     }
-
-    /// 1.25 × the gas of the batch's [`dearest`] call. Each cut is run in one block at
-    /// `time`. `None` with over [`PREFIXES`] calls, or a cut that does not run to the
-    /// dummy signatures.
-    async fn call_gas<P: Provider>(
-        &self,
-        provider: &P,
-        config: &Config,
-        (message, authorization): (&ExecuteMessage, &ExecuteAuthorization),
-        executions: &[Execution],
-        time: u64,
-    ) -> Option<u64> {
-        if executions.len() > PREFIXES {
-            return None;
-        }
-        let cut = |k: usize| {
-            let message = ExecuteMessage {
-                execution_calldata: encode_executions(&executions[..k]),
-                ..message.clone()
-            };
-            let data = message.authorized_data(authorization.clone());
-            outer(config, self.wallet, self.create, &data, message.value)
-        };
-        let cuts: Vec<_> = (0..=executions.len()).map(cut).collect();
-        let input =
-            |c: &TransactionRequest| c.input().map(|i| floor(i)).unwrap_or_default();
-        let floors: Vec<_> = cuts.iter().map(input).collect();
-        let runs = gas::simulate_all(provider, cuts, time).await.ok()?;
-        let signed = IWebWallet::ExecutionNotSigned::SELECTOR;
-        let ran = |r: &alloy::rpc::types::simulate::SimCallResult| {
-            !r.status && r.return_data[..] == signed
-        };
-        if runs.len() != executions.len() + 1 || !runs.iter().all(ran) {
-            return None;
-        }
-        let used: Vec<_> = runs.iter().map(|r| r.gas_used).collect();
-        let calls = executions.iter().map(|e| calldata_gas(&e.abi_encode()));
-        Some((dearest(&used, &floors, calls)? * 5).div_ceil(4))
-    }
 }
 
-/// The gas of the dearest call: the cut after it `used` less the cut before it and its
-/// calldata gas `calls`. `None` when a cut used at most its EIP-7623 floor in `floors`,
-/// which hides its execution.
-fn dearest(
-    used: &[u64],
-    floors: &[u64],
-    calls: impl Iterator<Item = u64>,
-) -> Option<u64> {
-    if used.iter().zip(floors).any(|(used, floor)| used <= floor) {
+/// 1.25 × the gas of each call: the cut after it less the cut before it and its
+/// calldata gas. `None` when a cut used at most its EIP-7623 floor, which hides its
+/// execution.
+fn each(cuts: &[check::Cut], executions: &[Execution]) -> Option<Vec<u64>> {
+    if cuts.iter().any(|(used, floor)| used <= floor) {
         return None;
     }
-    let each = used.windows(2).zip(calls);
-    let each =
-        each.map(|(used, call)| used[1].saturating_sub(used[0]).saturating_sub(call));
-    Some(each.max().unwrap_or_default())
-}
-
-/// The EIP-7623 floor of a transaction with `input`: 21000 and 10 a token, a zero byte
-/// one token and any other four.
-fn floor(input: &[u8]) -> u64 {
-    let zeros = input.iter().filter(|&&b| b == 0).count() as u64;
-    21_000 + 10 * (zeros + 4 * (input.len() as u64 - zeros))
-}
-
-/// The calldata gas of `bytes` (EIP-2028).
-fn calldata_gas(bytes: &[u8]) -> u64 {
-    let zeros = bytes.iter().filter(|&&b| b == 0).count() as u64;
-    zeros * gas::ZERO_BYTE
-        + (bytes.len() as u64 - zeros) * (gas::ZERO_BYTE + NONZERO_BYTE)
+    let calls = executions
+        .iter()
+        .map(|e| gas::calldata_gas(&e.abi_encode()));
+    let each = cuts.windows(2).zip(calls);
+    let each = each.map(|(c, call)| c[1].0.saturating_sub(c[0].0).saturating_sub(call));
+    Some(each.map(|g| (g * 5).div_ceil(4)).collect())
 }
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
-/// did not check, the rest of a valid `_verify`, the signed `call_gas` word, the
+/// did not check, the rest of a valid `_verify`, the signed `call_gas` floors and
+/// their array's offset and length words, the
 /// zero bytes the client fills as nonzero ([`gas::fillable`]), a value transfer for
 /// a refund drafted at 0, and, below quorum, the rules check of that many calls.
 fn unmeasured(
     message: &ExecuteMessage,
     authorization: &ExecuteAuthorization,
     refunds: impl Iterator<Item = U256> + Clone,
-    call_gas: u64,
+    call_gas: &[u64],
     below_quorum: Option<usize>,
 ) -> u64 {
     let costs = WalletGas::vendored();
@@ -259,8 +207,9 @@ fn unmeasured(
         (_, 20) => costs.verify(KeyKind::Ecdsa),
         _ => costs.verify(KeyKind::WebAuthn),
     });
-    // The draft signs `callGas = 0`; the signed data carries `call_gas`.
-    let call_gas_bytes = u64::from(u64::BITS - call_gas.leading_zeros()).div_ceil(8);
+    // The draft signs a zero floor per call; the signed data carries `call_gas`.
+    let bytes = |g: &u64| u64::from(u64::BITS - g.leading_zeros()).div_ceil(8);
+    let call_gas_bytes = call_gas.iter().map(bytes).sum::<u64>() + 2 * 32;
     let transfers = refunds.clone().filter(|r| r.is_zero()).count() as u64 * CALL_VALUE;
     let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
     costs.verify_tail()
@@ -278,15 +227,16 @@ mod tests {
     #[test]
     fn a_cut_at_its_calldata_floor_falls_back_to_the_whole_run() {
         // 21000, and 40 a nonzero byte, 10 a zero one.
-        assert_eq!(floor(&[1; 100]), 25_000);
-        assert_eq!(floor(&[0; 1000]), 31_000);
-        let calls = || [10, 10].into_iter();
-        assert_eq!(
-            dearest(&[50_000, 80_000, 90_000], &[40_000; 3], calls()),
-            Some(29_990)
-        );
+        assert_eq!(gas::floor(&[1; 100]), 25_000);
+        assert_eq!(gas::floor(&[0; 1000]), 31_000);
+        let calls = [Execution::default(), Execution::default()];
+        let call = gas::calldata_gas(&calls[0].abi_encode());
+        let cuts = [(50_000, 40_000), (80_000, 40_000), (90_000, 40_000)];
+        let quarter = |g: u64| (g * 5).div_ceil(4);
+        let each_call = vec![quarter(30_000 - call), quarter(10_000 - call)];
+        assert_eq!(each(&cuts, &calls), Some(each_call));
         // The last cut billed at its floor: call 2's 10_000 shows, not its execution.
-        let floors = [40_000, 40_000, 90_000];
-        assert_eq!(dearest(&[50_000, 80_000, 90_000], &floors, calls()), None);
+        let cuts = [(50_000, 40_000), (80_000, 40_000), (90_000, 90_000)];
+        assert_eq!(each(&cuts, &calls), None);
     }
 }

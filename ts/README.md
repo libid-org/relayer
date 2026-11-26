@@ -65,12 +65,12 @@ proof would take each payload format's layout or a second `verify` call.
 2. Claims the escrow's ETH and every approved token held; the one the quoter
    values highest pays the swap. With none of them, it throws `ClaimTooSmall`.
    Tokens outside the table stay in the escrow.
-3. Drafts the batch at no call gas and no refund, signed by a throwaway key,
-   and quotes it. When the claimed ETH is under the refund `R` (the link fee
-   plus `minRefund`), it drafts the swap that covers the difference and
-   quotes again, so a swap is priced only when it runs.
-4. Signs the quoted call gas and `R`, valid until `validUntil` plus the
-   inclusion window. The swap sells the token amount the quoter asks for the
+3. Drafts the batch at zero call gas floors and no refund, signed by a
+   throwaway key, and quotes it. When the claimed ETH is under the refund `R`
+   (the link fee plus `minRefund`), it drafts the swap that covers the
+   difference and quotes again, so a swap is priced only when it runs.
+4. Signs the quoted floors (`callGas`, one per call) and `R`, valid until
+   `validUntil` plus the queue's wait and the inclusion window. The swap sells the token amount the quoter asks for the
    shortfall, plus `slippageBps` (100 by default), for at least the shortfall
    in ETH. It approves exactly that amount, which the swap spends whole, so no
    allowance is left. The surplus ETH stays in the wallet. When the token

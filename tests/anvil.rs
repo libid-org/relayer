@@ -24,7 +24,7 @@ async fn the_onboarding_batch_lands_when_sent_directly() {
 async fn the_relayer_checks_and_lands_the_onboarding() {
     let o = Onboarding::new(true).await;
     let data = o.sign(&o.onboarding()).await;
-    let limit = o.limit(&data, o.value, CALL_GAS).await;
+    let limit = o.limit(&data, o.value).await;
     let before = o.owner.get_balance(o.relayer_address).await.unwrap();
     let receipt = o.send(&o.request(data.clone())).await;
     assert_eq!(receipt.to, Some(o.stack.factory));

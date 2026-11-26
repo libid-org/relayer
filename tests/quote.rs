@@ -41,8 +41,9 @@ impl Onboarding {
         [vec![self.login(&key, n)], calls].concat()
     }
 
-    /// `b`'s data signing `call_gas`; with `None`, a draft a stranger signs.
-    async fn authorize(&self, b: &Batch<'_>, call_gas: Option<u64>) -> Bytes {
+    /// `b`'s data signing the floors `call_gas`; with `None`, a draft a stranger signs
+    /// at zero floors.
+    async fn authorize(&self, b: &Batch<'_>, call_gas: Option<&[u64]>) -> Bytes {
         let w = IWebWallet::new(self.wallet, &self.owner);
         let (nonce, salt) = match self.path().await {
             None => (
@@ -58,7 +59,10 @@ impl Onboarding {
             at: U48::from(now),
             nonce,
             deadline: U48::from(now + self.longest()),
-            call_gas: U256::from(call_gas.unwrap_or(0)),
+            call_gas: match call_gas {
+                Some(floors) => floors.iter().map(|&g| U256::from(g)).collect(),
+                None => vec![U256::ZERO; b.0.len()],
+            },
         };
         let mut digest = message.digest(self.chain_id, self.wallet, version, salt);
         if b.3.is_some() {
@@ -159,7 +163,8 @@ impl Onboarding {
             add(&k[2], below),
         ];
         let b = Batch(adds, U256::ZERO, vec![&self.k], None);
-        self.land(&self.authorize(&b, Some(CALL_GAS)).await, U256::ZERO)
+        let floors = vec![CALL_GAS; b.0.len()];
+        self.land(&self.authorize(&b, Some(&floors)).await, U256::ZERO)
             .await;
         // The sessions sign from the second after the block that added them.
         let added = self.now().await;
@@ -201,14 +206,10 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
     calls.push(call(swallower, U256::ZERO, vec![]));
     let b = Batch(calls, o.value, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &b).await;
-    // `callGas` covers the dearest call, the swallower, not the whole batch.
+    // Each floor covers its call, not the whole batch.
     let whole = o.simulated(&o.authorize(&b, None).await, o.value).await;
-    assert!(
-        q.call_gas < whole.gas_used,
-        "{} of {}",
-        q.call_gas,
-        whole.gas_used
-    );
+    let each = q.call_gas.iter().all(|&g| g < whole.gas_used);
+    assert!(each, "{:?} of {}", q.call_gas, whole.gas_used);
     let latest = o.owner.get_block_by_number(Default::default()).await;
     let base = latest.unwrap().unwrap().header.base_fee_per_gas.unwrap();
     // At least the base fee grown over the quote's validity and the window, 15 blocks,
@@ -228,12 +229,13 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
         q.max_fee_per_gas
     );
 
-    let above = o.authorize(&b, Some(2 * q.call_gas)).await;
-    let expected = o.limit(&above, o.value, 2 * q.call_gas).await;
+    let twice: Vec<_> = q.call_gas.iter().map(|g| 2 * g).collect();
+    let above = o.authorize(&b, Some(&twice)).await;
+    let expected = o.limit(&above, o.value).await;
     // Reported with its fillable zero bytes as nonzero, at 12 gas, run at the limit's
     // margin.
     let fill = 12 * fillable(&above, &[o.refund()]);
-    let filled = o.limit_with(&above, o.value, 2 * q.call_gas, fill).await;
+    let filled = o.limit_with(&above, o.value, fill).await;
     let allowance = filled - expected;
     let mut required = 0;
     for gas_limit in [q.gas_limit, expected - 3] {
@@ -262,17 +264,17 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
         Batch(calls, o.value, vec![&o.k], None)
     };
     let round = U256::from(1u64 << 58);
-    let zeroed = o.authorize(&refunding(round), Some(2 * q.call_gas)).await;
+    let zeroed = o.authorize(&refunding(round), Some(&twice)).await;
     let refused = o.check_at(&zeroed, q.gas_limit).await.err();
     let Some(Refusal::GasLimitTooLow { required }) = refused else {
         panic!("{refused:?}")
     };
     let filled = refunding(round + U256::from(0x0101_0101_0101_0101u64));
-    let filled = o.authorize(&filled, Some(2 * q.call_gas)).await;
+    let filled = o.authorize(&filled, Some(&twice)).await;
     o.check_at(&filled, required).await.unwrap();
 
-    let data = o.authorize(&b, Some(q.call_gas)).await;
-    let limit = o.limit(&data, o.value, q.call_gas).await;
+    let data = o.authorize(&b, Some(&q.call_gas)).await;
+    let limit = o.limit(&data, o.value).await;
     let hash = o
         .send(&o.request_at(&data, q.gas_limit).await)
         .await
@@ -290,7 +292,8 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
         "the swallowed call failed"
     );
     let got = slot(1).await.unwrap();
-    assert!(got >= U256::from(q.call_gas), "it got less than callGas");
+    let last = *q.call_gas.last().unwrap();
+    assert!(got >= U256::from(last), "it got less than its floor");
     // The batch again, on the wallet it created: its link no longer signs it in.
     let draft = Draft {
         wallet: o.wallet,
@@ -315,8 +318,8 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     let paid = |r| o.signing_in(2, vec![o.repay(r)]);
     let b = Batch(paid(r), o.value, vec![&o.k, &k2], None);
     let q = o.quote_with(&o.config(), &b).await;
-    let data = o.authorize(&b, Some(q.call_gas)).await;
-    let run = o.limit(&data, o.value, q.call_gas).await;
+    let data = o.authorize(&b, Some(&q.call_gas)).await;
+    let run = o.limit(&data, o.value).await;
     assert!(q.gas_limit >= run, "{} for {run}", q.gas_limit);
     // Signed with a refund of fewer zero bytes than quoted: the quote overshoots the
     // run by the zero bytes left in R, the signatures, `at` and the deadline, at 12 gas
@@ -324,16 +327,15 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     // reverted run does not get.
     let signed_r = r + U256::from(0x0101_0101_0101u64);
     let signed = Batch(paid(signed_r), o.value, vec![&o.k, &k2], None);
-    let data = o.authorize(&signed, Some(q.call_gas)).await;
+    let data = o.authorize(&signed, Some(&q.call_gas)).await;
     let fill = 12 * fillable(&data, &[signed_r]);
-    let run = o.limit(&data, o.value, q.call_gas).await;
-    let filled = o.limit_with(&data, o.value, q.call_gas, fill).await - run;
+    let run = o.limit(&data, o.value).await;
+    let filled = o.limit_with(&data, o.value, fill).await - run;
     let overshoot = q.gas_limit.saturating_sub(run);
     assert!(overshoot >= filled, "{overshoot} for {filled}");
     // R's zero bytes leave the quote unchanged: the draft runs them cheaper by as much.
     let q2 = o.quote_with(&o.config(), &signed).await;
-    let unreserved = |q: &Quote| q.gas_limit - reserve(q.call_gas, false);
-    assert_eq!(unreserved(&q2), unreserved(&q));
+    assert_eq!((q2.gas_limit, &q2.call_gas), (q.gas_limit, &q.call_gas));
     // So do the deadline's: one of no zero bytes is quoted as the draft's.
     let draft = o.authorize(&b, None).await;
     let (mut message, authorization) =
@@ -346,7 +348,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         below_quorum: false,
     };
     let q3 = draft.quote(&o.relayer, &o.config()).await.unwrap();
-    assert_eq!(unreserved(&q3), unreserved(&q));
+    assert_eq!((q3.gas_limit, &q3.call_gas), (q.gas_limit, &q.call_gas));
     o.send(&o.request_at(&data, q.gas_limit).await).await;
 
     let proof = |max: u128, leaf| CallProof {
@@ -359,7 +361,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
     let one = Batch(o.signing_in(3, vec![o.repay(r)]), o.value, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &one).await;
     assert!(r >= q.min_refund, "the fixture underpays");
-    let data = o.authorize(&one, Some(q.call_gas)).await;
+    let data = o.authorize(&one, Some(&q.call_gas)).await;
     o.send(&o.request_at(&data, q.gas_limit).await).await;
     // Below quorum a call of the wallet is an admin operation, so no login: no batch
     // is paid for.
@@ -379,7 +381,7 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         .quote_with(&o.config(), &at_quorum(vec![o.repay(U256::ZERO)]))
         .await;
     let data = o
-        .authorize(&at_quorum(vec![o.repay(r)]), Some(q.call_gas))
+        .authorize(&at_quorum(vec![o.repay(r)]), Some(&q.call_gas))
         .await;
     o.check_at(&data, q.gas_limit).await.unwrap();
     let unpaid = at_quorum(vec![call(token, U256::ZERO, transfer)]);
@@ -416,15 +418,15 @@ async fn cuts_at_their_calldata_floor_are_quoted_the_whole_run() {
     // The floor of the wide call's bytes and of at most 2000 more.
     let floor = 21_000 + 40 * 40_000;
     assert!((floor..floor + 80_000).contains(&run), "{run}");
-    assert_eq!(q.call_gas, run);
+    assert_eq!(q.call_gas, vec![run; b.0.len()]);
 }
 
-/// A `callGas` far beyond the run's margin, on the create path and then on the wallet
-/// it created, and the relayer lands each at the relay-time limit. On the wallet, the
-/// same data one 64/63 factor of the reserve below that limit reverts
+/// Floors far beyond the run's margin, on the create path and then on the wallet it
+/// created, and the relayer lands each at the relay-time limit. On the wallet, the
+/// same data one 64/63 factor of the highest floor's reserve below that limit reverts
 /// `InsufficientCallGas`. On the create path, under EIP-7825's 2^24 gas, the run's
-/// margin covers one factor, so the least gas it runs at is shown above its gas used
-/// plus the whole depth-4 reserve instead.
+/// margin covers one factor, so the least gas it runs at is shown above the highest
+/// floor's whole depth-4 reserve instead.
 #[tokio::test]
 async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     let o = Onboarding::new(true).await;
@@ -433,17 +435,18 @@ async fn a_large_call_gas_lands_at_the_relay_time_limit() {
     let repay = Batch(o.signing_in(2, vec![o.repay(r)]), o.value, vec![&o.k], None);
     // On the wallet, far enough beyond the run that the reserve outgrows its margin.
     for (b, least) in [(onboarding, 0), (repay, 8_000_000)] {
-        let call_gas = (8 * o.quote_with(&o.config(), &b).await.call_gas).max(least);
-        let data = o.authorize(&b, Some(call_gas)).await;
-        let limit = o.limit(&data, b.1, call_gas).await;
+        let quoted = o.quote_with(&o.config(), &b).await.call_gas;
+        let floors: Vec<_> = quoted.iter().map(|g| (8 * g).max(least)).collect();
+        let data = o.authorize(&b, Some(&floors)).await;
+        let limit = o.limit(&data, b.1).await;
+        let call_gas = *floors.iter().max().unwrap();
         let create = o.path().await.is_some();
         let tx = o.outer(&data, b.1).await;
         if create {
-            let used = o.simulated(&data, b.1).await.gas_used;
             let tx = TransactionRequest { gas: None, ..tx };
             let least = o.relayer.estimate_gas(tx).await.unwrap();
             let reserve = reserve(call_gas, true);
-            assert!(least > used + reserve, "{least} within {used} + {reserve}");
+            assert!(least > reserve, "{least} within {reserve}");
         } else {
             let short = limit - reserve(call_gas, false) / 64;
             let e = o.relayer.call(tx.with_gas_limit(short)).await.unwrap_err();
@@ -498,7 +501,7 @@ async fn an_existing_wallet_relays_and_a_skipped_refund_costs_gas_and_value() {
     };
     let b = batch(2);
     let q = o.quote_with(&o.config(), &b).await;
-    let data = o.authorize(&b, Some(q.call_gas)).await;
+    let data = o.authorize(&b, Some(&q.call_gas)).await;
     let request = o.request_at(&data, q.gas_limit).await;
     assert_eq!(request.create, None);
     let factory = WalletFactory::new(o.stack.factory, &o.owner);
@@ -536,7 +539,7 @@ async fn an_existing_wallet_relays_and_a_skipped_refund_costs_gas_and_value() {
 
     // Queued, then moved to a release 2 outside the supported set: relayed again it
     // keeps its id, and its send fails unsent.
-    let data = o.authorize(&batch(3), Some(q.call_gas)).await;
+    let data = o.authorize(&batch(3), Some(&q.call_gas)).await;
     let queued = o.request_at(&data, q.gas_limit).await;
     let moved = db("moved");
     let r = o.start(&moved).await.unwrap();
@@ -590,7 +593,7 @@ async fn an_existing_wallet_relays_and_a_skipped_refund_costs_gas_and_value() {
     at(slot).await.unwrap();
 
     // The same batch at the wallet's next nonce, with a login of its own.
-    let data = o.authorize(&batch(4), Some(q.call_gas)).await;
+    let data = o.authorize(&batch(4), Some(&q.call_gas)).await;
     let r = o.start(&db("skipped")).await.unwrap();
     let id = r
         .relay(&o.request_at(&data, q.gas_limit).await)
@@ -685,7 +688,7 @@ async fn an_existing_wallet_is_relayed_only_signing_in_again() {
         matches!(refused, Some(Refusal::SignInMissing)),
         "{refused:?}"
     );
-    let data = o.authorize(&plain, Some(CALL_GAS)).await;
+    let data = o.authorize(&plain, Some(&[CALL_GAS])).await;
     let refused = o.check_at(&data, GAS_LIMIT).await.err();
     assert!(
         matches!(refused, Some(Refusal::SignInMissing)),
@@ -694,7 +697,7 @@ async fn an_existing_wallet_is_relayed_only_signing_in_again() {
     let fresh = key_of(&PrivateKeySigner::random());
     let b = Batch(vec![o.login(&fresh, 2), refund], o.value, vec![&o.k], None);
     let q = o.quote_with(&o.config(), &b).await;
-    let data = o.authorize(&b, Some(q.call_gas)).await;
+    let data = o.authorize(&b, Some(&q.call_gas)).await;
     o.send(&o.request_at(&data, q.gas_limit).await).await;
     let wallet = IWebWallet::new(o.wallet, &o.owner);
     let session = wallet.sessionOf(fresh).call().await.unwrap();
