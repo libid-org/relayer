@@ -1142,8 +1142,8 @@ pub(crate) fn lost(
 }
 
 /// The rows by status, an included one whose batch reverted as `reverted`; the
-/// identities a loss holds for `hold`; and the included rows whose loss is not yet
-/// charged.
+/// identities a loss holds now, for `hold` or `window` as [`held`] gives; and the
+/// included rows whose loss is not yet charged.
 pub(crate) fn counts(
     db: &Connection,
     (hold, window): (Duration, Duration),
@@ -1252,9 +1252,10 @@ fn admit(
     }
 }
 
-/// How long a loss holds its identity and stays in the budget: `hold` for a reverted
-/// batch or a skipped refund; the budget's `window` for a cancel, a paid refund short
-/// of the send's cost, or unread balances.
+/// How long a loss holds its identity: `hold` for a reverted batch, a skipped refund
+/// or an unparsed receipt; the budget's `window` for a cancel, a paid refund short of
+/// the send's cost, or unread balances. The budget counts a loss for its `window` only
+/// ([`lost`]).
 fn held(holds: bool, hold: u64, window: u64) -> u64 {
     if holds {
         hold

@@ -1240,6 +1240,8 @@ async fn a_loss_is_pending_until_its_balances_are_read() {
 /// of a mined send holds it for `node_error_ticks` ticks, then its request fails as
 /// `Node`, charged at its send's worst cost without its value from the ledger alone,
 /// in the budget and the stats. A retry of the landed batch is refused and keeps the charge.
+/// Past the budget's window the loss leaves the budget and holds its identity for
+/// `loss_hold`.
 #[tokio::test]
 async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
     let (o, path) = (Onboarding::new(true).await, db("garbled"));
@@ -1280,6 +1282,17 @@ async fn an_unparsed_receipt_fails_charged_at_its_worst_after_its_ticks() {
         "a landed batch relayed again"
     );
     assert_eq!(lost(&r), worst, "a failed retry is charged");
+    // Past the budget's window, out of the budget and still holding its identity.
+    let window = o.config().global_budget.window.as_secs();
+    assert!(o.config().loss_hold.as_secs() > window + 1);
+    let sql = format!("UPDATE identities SET at = at - {}", window + 1);
+    ledger.execute(&sql, []).unwrap();
+    let stats = relayer::stats::stats(&path, &o.config()).unwrap();
+    assert_eq!(
+        (stats.lost, stats.held),
+        (U256::ZERO, 1),
+        "not held for loss_hold"
+    );
 }
 
 /// Strikes count in a row per request, apart for its run and its receipt, and from

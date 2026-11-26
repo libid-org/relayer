@@ -29,18 +29,20 @@ an existing wallet, whatever its salt. The row holds the identity's request,
 its signed send and cancels, written before each broadcast, the send's worst
 cost with its value until its receipt, then what it lost. A paid row is
 dropped `receipt_lag_blocks` after its receipt, so a reorg that removes it
-has it sent again. A row with a loss from a reverted batch or a skipped
-refund is dropped `loss_hold` after it last moved; one from a landed cancel,
-a paid refund short of the send's cost, or balances unread
-`receipt_lag_blocks` after its receipt, and a failed one, after the global
-budget's `window`.
+has it sent again. A row with a loss from a reverted batch, a skipped
+refund or a receipt that does not parse is dropped `loss_hold` after it last
+moved; one from a landed cancel, a paid refund short of the send's cost, or
+balances unread `receipt_lag_blocks` after its receipt, and any other failed
+one, after the global budget's `window`. A loss counts in the budget for its
+`window` either way.
 
 - An identity has one request in flight: another is `IdentityBusy` until the
   row is dropped or failed. Before its check, a relay answers only for its own
   id; busy and held answer after it, so a batch the wallet's key did not sign
   is refused by its check and learns nothing of the identity's request.
 - A loss refuses the identity as `IdentityHeld` until its row is dropped:
-  `loss_hold` after a reverted batch or a skipped refund, so an honest batch
+  `loss_hold` after a reverted batch, a skipped refund or a receipt that does
+  not parse, so an honest batch
   that reverts after a good check waits as long; the budget's `window` after
   a landed cancel, an L1 fee over its bound, or balances left unread.
 - The global budget sums the rows' charged losses over its `window`. Past it
@@ -182,7 +184,8 @@ any other.
 A receipt that does not parse for `node_error_ticks` ticks, once
 its nonce is mined, is charged at its send's worst cost without its value, which
 a landed send to a vouched wallet cannot lose, and its request fails
-as `Node`; until then the send is watched, sent again and cancelled as usual.
+as `Node`, holding its identity for `loss_hold`; until then the send is
+watched, sent again and cancelled as usual.
 
 A batch's deadline must cover the inclusion window and be at most `max`:
 the latest block's time plus `inclusion_window`, `quote_validity`,
