@@ -202,6 +202,31 @@ were added. `test/swap.fork.test.ts` runs every route on a fork of
 `test:e2e` leaves it out. CI runs it in a job of its own, not for merge, on a
 public Base endpoint unless the `BASE_RPC_URL` secret is set.
 
+## An agent's session
+
+`agentPolicy` is a limited policy for an agent that tips handles from the
+user's wallet, for `onboard`'s `session`:
+
+```ts
+const now = Number((await client.getBlock()).timestamp)
+const agent = agentPolicy({ escrow, now, tokens: [{ token: usdc, amount: 10_000_000n }] })
+await onboard({ ...onboarding, session: { key: agentKey, policy: agent.policy } })
+```
+
+The policy is non-admin, takes one signature, and ends 30 days after `now`
+(`validUntil` overrides). Its scope allows `HandleEscrow.deposit` and
+`depositToHandle`, each with at most `native` wei, and `approve` with no value
+on each listed token. Its allowances, each a `period`, are `native` of
+`NATIVE_TOKEN` and each token's `amount`. Defaults (`AGENT_DEFAULTS`): 0.01
+ETH a day; a token's amount has no default, its units being the token's.
+`approve` charges its amount to the token's allowance, whatever the spender.
+
+The agent signs its batches below quorum (`belowQuorumHash` of
+`@libid/contracts`) and sends them itself: the relayer pays only for
+sign-ins. `agent.scope.calls(executions)` gives the batch's
+`Authorization.calls`, one proof per call, and throws for a call outside the
+scope.
+
 ## Known limits
 
 - Once the relayer drops a request's row, `waitFor` reads the chain, which

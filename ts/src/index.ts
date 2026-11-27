@@ -48,6 +48,7 @@ import {
   withSlippage,
 } from './swap.js'
 
+export * from './agent.js'
 export * from './swap.js'
 
 /// `GET /v1/config`, the fields the client reads.

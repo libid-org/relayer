@@ -1,7 +1,8 @@
 /// Onboardings through the compose stack (README, "Local stack"): a fresh
 /// identity, its handle's escrow claimed into a wallet that starts with no ETH,
 /// the relayer repaid from it, in ETH or by swapping a token through a mock of
-/// Uniswap's router; then a second key's sign-in, repaid from the wallet.
+/// Uniswap's router; then a second key's sign-in, repaid from the wallet, and an
+/// agent's below-quorum tip.
 /// Skips without the stack; fails under CI.
 
 import { execFileSync } from 'node:child_process'
@@ -10,7 +11,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   ADD_SESSION_DOMAIN,
+  AUTHORIZED_MODE,
+  authorizedData,
+  belowQuorumHash,
+  calls,
   ceremonyProofVerifierAbi,
+  DIRECT_NONCE_KEY,
+  executeDigest,
   handleEscrowAbi,
   OPERATIONS_DOMAIN,
   platformId,
@@ -38,6 +45,9 @@ import { foundry } from 'viem/chains'
 import { afterAll, expect, test } from 'vitest'
 
 import {
+  agentPolicy,
+  encodeExecutions,
+  NATIVE_TOKEN,
   onboard,
   onboardingTransactionData,
   relayerConfig,
@@ -273,13 +283,18 @@ test('an onboarding adds a limited session; a second key signs in alone', async 
   await s.mined(
     await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args, value: amount }),
   )
-  // A limited key beside the genesis key, active from the next second.
-  const k3 = privateKeyToAccount(generatePrivateKey()).address
-  const limited = { ...admin, admin: false }
-  await onboarded(s, o, { session: { key: k3, policy: limited } })
+  // An agent's key beside the genesis key, active from the next second.
+  const k3 = privateKeyToAccount(generatePrivateKey())
+  const now = Number((await s.client.getBlock()).timestamp)
+  const agent = agentPolicy({ escrow: s.escrow.address, now })
+  await onboarded(s, o, { session: { key: k3.address, policy: agent.policy } })
   const read = { address: o.wallet, abi: webWalletAbi, functionName: 'sessionOf' } as const
-  const extra = await s.client.readContract({ ...read, args: [k3] })
-  expect(extra).toMatchObject({ admin: false, byProof: false, policyHash: policyHashOf(limited) })
+  const extra = await s.client.readContract({ ...read, args: [k3.address] })
+  expect(extra).toMatchObject({
+    admin: false,
+    byProof: false,
+    policyHash: policyHashOf(agent.policy),
+  })
 
   // The login at the head adds K2 in the block, so K2 alone signs its batch.
   const k2 = privateKeyToAccount(generatePrivateKey())
@@ -320,4 +335,56 @@ test('an onboarding adds a limited session; a second key signs in alone', async 
   expect(session.activeAt).toBe(Number(block.timestamp) - 1)
   const after = await s.client.getBalance({ address: o.wallet })
   expect(before - after).toBe(done.loginFee + done.gasRefund)
+
+  // Below quorum the agent alone tips another handle from the wallet, sent directly.
+  const [tip, tipped] = [parseEther('0.001'), generatePrivateKey()]
+  const deposit = calls.handleEscrow.deposit(
+    s.escrow.address,
+    tip,
+    o.platform,
+    tipped,
+    s.native,
+    tip,
+  )
+  const batch = [{ target: deposit.to, value: tip, callData: deposit.data }]
+  const wallet = { address: o.wallet, abi: webWalletAbi } as const
+  const [[, , version, , , salt], nonce, latest] = await Promise.all([
+    s.client.readContract({ ...wallet, functionName: 'eip712Domain' }),
+    s.client.readContract({ ...wallet, functionName: 'getNonce', args: [DIRECT_NONCE_KEY] }),
+    s.client.getBlock(),
+  ])
+  const at = Number(latest.timestamp)
+  const message = {
+    executionCalldata: encodeExecutions(batch),
+    value: 0n,
+    at,
+    nonce,
+    deadline: at + 600,
+    callGas: [0n],
+  }
+  const digest = executeDigest(message, s.config.chainId, o.wallet, BigInt(version), salt)
+  const signature = await k3.sign({ hash: belowQuorumHash(digest, at, k3.address) })
+  const data = authorizedData(message, {
+    signatures: [{ key: k3.address, signature }],
+    calls: agent.scope.calls(batch),
+    domainProof: [],
+    paymasterProof: [],
+  })
+  await s.mined(
+    await s.sender.writeContract({
+      ...wallet,
+      functionName: 'execute',
+      args: [AUTHORIZED_MODE, data],
+    }),
+  )
+  const escrowed = [tipped, s.native] as const
+  expect(
+    await s.client.readContract({ ...s.escrow, functionName: 'escrowed', args: escrowed }),
+  ).toBe(tip)
+  const spent = await s.client.readContract({
+    ...wallet,
+    functionName: 'allowanceOf',
+    args: [k3.address, NATIVE_TOKEN],
+  })
+  expect(spent.spent).toBe(tip)
 }, 120_000)
