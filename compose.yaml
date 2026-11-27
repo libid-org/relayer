@@ -1,0 +1,66 @@
+# A local stack: anvil, the wallet stack deployed on it, and the relayer.
+#
+#   docker compose up --wait --build
+#   cargo test --test e2e -- --ignored --nocapture
+#   docker compose down -v
+#
+# Dev only. `down -v` before starting again: anvil keeps no state, and the
+# relayer's ledger on a fresh chain fails its nonce check.
+
+# Anvil's dev key #1, the relayer's signer. Public test material: never fund it
+# on a real chain.
+x-relayer-key: &relayer-key 59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+
+services:
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:v1.8.5@sha256:32c8ea9ef052a440cb1620175987a3f49eff8b068a0c6a3d09ebf7f5f9a0e043
+    # The image's entrypoint is `sh -c`; name the binary. 0.0.0.0: reachable
+    # from the other services.
+    entrypoint: ["anvil", "--host", "0.0.0.0"]
+    ports:
+      - "127.0.0.1:8545:8545"
+    healthcheck:
+      test: ["CMD", "cast", "chain-id", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  # Deploys the wallet stack and writes relayer.toml into the config volume.
+  deploy:
+    build:
+      context: .
+      target: deploy
+    depends_on:
+      anvil:
+        condition: service_healthy
+    environment:
+      RELAYER_RPC_URL: http://anvil:8545
+      # Anvil's dev key #0, the stack's owner. Public test material.
+      DEPLOYER_KEY: ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+    volumes:
+      - config:/etc/relayer
+
+  relayer:
+    build: .
+    # Over request_timeout, so requests in flight finish before a kill.
+    stop_grace_period: 40s
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    environment:
+      RELAYER_SIGNER: *relayer-key
+    volumes:
+      - config:/etc/relayer:ro
+      - state:/var/lib/relayer
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  config:
+  state:

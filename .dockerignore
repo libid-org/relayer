@@ -1,0 +1,7 @@
+# The image builds from these paths only; target/ would ship gigabytes.
+*
+!Cargo.toml
+!Cargo.lock
+!scripts/vendor-contracts.sh
+!src
+!examples
