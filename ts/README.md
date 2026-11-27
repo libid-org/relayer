@@ -145,13 +145,17 @@ await waitFor(relayerUrl, signedIn.id, { client, signedIn })
 The batch is `signInBatch`: the wallet's `addSessionByLogin` of the new key at
 its head, then the refund, the login fee plus `minRefund`. A login at the head
 of the wallet's own batch is active in that block, so the new key alone signs
-the batch, under the wallet's `eip712Domain()` and nonce. It signs at quorum
-only when one session meets the wallet's threshold; a below-quorum batch is
-never relayed. `signIn` throws `BalanceTooLow {held, required}`, in wei,
+the batch, under the wallet's `eip712Domain()` and nonce. Quorum counts the
+admin platforms among the signers, so the new key reaches it alone only under
+an admin policy on a wallet of threshold 1; a below-quorum batch is never
+relayed. `signIn` throws `BalanceTooLow {held, required}`, in wei,
 before relaying when the wallet's ETH is under the refund. It posts again and
 quotes again as `onboard` does, and returns the request `id`, `key`, `quote`,
 `deadline`, `loginFee` and `gasRefund`. Once the request is dropped, `waitFor`
 with `signedIn` settles when the key has a login's session.
+The relayer holds one request per identity: right after the wallet's
+onboarding or an earlier sign-in, `signIn` is `IdentityBusy` until that
+request's row is dropped, `receipt_lag_blocks` after its receipt.
 
 ### Holdings
 

@@ -23,6 +23,7 @@ import {
   type Abi,
   type Address,
   createPublicClient,
+  createTestClient,
   createWalletClient,
   encodeAbiParameters,
   erc20Abi,
@@ -285,14 +286,28 @@ test('an onboarding adds a limited session; a second key signs in alone', async 
   const login = { chainId: s.config.chainId, wallet: o.wallet, key: k2.address, policy: admin }
   const payload = stubPayload(ADD_SESSION_DOMAIN, signInTransactionData(login))
   const before = await s.client.getBalance({ address: o.wallet })
-  const done = await signIn({
+  const signingIn = {
     relayerUrl: API,
     client: s.client,
     wallet: o.wallet,
     proof: { platformId: o.platform, verifierVersion: 1, payload },
     signer: { key: k2.address, sign: (hash: Hex) => k2.sign({ hash }) },
     policy: admin,
-  })
+  }
+  // The onboarding's row holds the identity until `receipt_lag_blocks` blocks
+  // after it; anvil mines only on demand.
+  const anvil = createTestClient({ mode: 'anvil', transport: http(ANVIL) })
+  const done = await (async () => {
+    for (let tries = 1; ; tries++) {
+      try {
+        return await signIn(signingIn)
+      } catch (e) {
+        if ((e as Error).name !== 'IdentityBusy' || tries === 60) throw e
+        await anvil.mine({ blocks: 1 })
+        await new Promise((r) => setTimeout(r, 300))
+      }
+    }
+  })()
   const landed = await waitFor(API, done.id, {
     timeoutMs: 60_000,
     client: s.client,
