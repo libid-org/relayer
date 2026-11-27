@@ -27,6 +27,7 @@ import {
   erc20Abi,
   type Hex,
   isAddressEqual,
+  keccak256,
   type PublicClient,
   parseAbiParameters,
   zeroAddress,
@@ -141,16 +142,22 @@ export type Onboarding = {
   identityRegistry: Address
   escrow: Address
   handleNode: Hex
+  /// A second key the batch adds under `policy`, for the genesis identity,
+  /// active from the next second.
+  session?: { key: Hex; policy: SessionPolicy }
   /// Approved tokens by chain id; `SWAP_ROUTES` by default.
   routes?: Record<number, readonly SwapRoute[]>
   /// The most a swap may pay over its quote, in basis points; 100 by default.
   slippageBps?: number
 }
 
-/// Link, bind privately, claim `tokens` into the wallet, swap when `swap` is
-/// set, then repay `refund` to the relayer.
+/// Link, add `session` when set, bind privately, claim `tokens` into the
+/// wallet, swap when `swap` is set, then repay `refund` to the relayer.
 export function onboardingBatch(
-  o: Pick<Onboarding, 'proof' | 'policy' | 'identityRegistry' | 'escrow' | 'handleNode'>,
+  o: Pick<
+    Onboarding,
+    'proof' | 'idNode' | 'policy' | 'identityRegistry' | 'escrow' | 'handleNode' | 'session'
+  >,
   b: { wallet: Address; fee: bigint; relayer: Address; tokens: readonly Address[] },
   refund: bigint,
   deadline: number,
@@ -159,8 +166,13 @@ export function onboardingBatch(
   const { platformId, verifierVersion, payload } = o.proof
   const { wallet } = b
   const swaps = swap ? swapCalls(swap, wallet, deadline) : []
+  const identity = identityOf(platformId, o.idNode)
+  const session = o.session
+    ? [calls.webWallet.addSession(wallet, identity, o.session.key, o.session.policy)]
+    : []
   return [
     calls.webWallet.linkIdentity(wallet, b.fee, platformId, verifierVersion, payload, o.policy),
+    ...session,
     calls.identityRegistry.bindPrivately(
       o.identityRegistry,
       0n,
@@ -174,6 +186,13 @@ export function onboardingBatch(
     ...swaps,
     { to: b.relayer, value: refund, data: '0x' as Hex },
   ].map(execution)
+}
+
+/// The wallet's id of a linked identity: `identityOf` of `WalletStorage.sol`.
+function identityOf(platformId: Hex, idNode: Hex): Hex {
+  return keccak256(
+    encodeAbiParameters(parseAbiParameters('bytes32, bytes32'), [platformId, idNode]),
+  )
 }
 
 function execution(c: Call): Execution {
@@ -192,6 +211,8 @@ export type Onboarded = {
   wallet: Address
   /// The genesis session key, admin once the onboarding lands.
   key: Hex
+  /// `Onboarding.session`'s key.
+  session?: Hex
   quote: Quote
   /// The batch's deadline, in Unix seconds: until then it may still land.
   deadline: number
@@ -303,7 +324,8 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
         ? [{ token: swap.route.token, amountIn: swap.amountIn, ethOutMin: swap.minOut }]
         : []
       const parts = { linkFee: fee, gasRefund: quote.minRefund, swapped }
-      const onboarded = { id, wallet, key: o.signer.key, quote, deadline, native: coin }
+      const keys = { key: o.signer.key, session: o.session?.key }
+      const onboarded = { id, wallet, ...keys, quote, deadline, native: coin }
       return { ...onboarded, tokens: claimed, ...parts }
     } catch (e) {
       if (retried || !(e instanceof RelayerError) || e.name !== 'GasLimitTooLow') throw e
@@ -467,7 +489,7 @@ type WaitOptions = {
   intervalMs?: number
   timeoutMs?: number
   client?: PublicClient
-  onboarded?: Pick<Onboarded, 'wallet' | 'key' | 'native' | 'tokens' | 'deadline'>
+  onboarded?: Pick<Onboarded, 'wallet' | 'key' | 'session' | 'native' | 'tokens' | 'deadline'>
   signedIn?: Pick<SignedIn, 'wallet' | 'key' | 'deadline'>
 }
 
@@ -494,8 +516,13 @@ export async function waitFor(
   const landing = onboarded ?? signedIn
   const landed = async (): Promise<RelayStatus | undefined> => {
     if (!client || !landing) return undefined
-    const settles = onboarded ? (s: Session) => s.admin : (s: Session) => s.byProof
-    const at = await landedAt(client, landing, settles)
+    const extra: Settles[] = onboarded?.session
+      ? [[onboarded.session, (s) => s.identity !== zeroHash]]
+      : []
+    const sessions: Settles[] = onboarded
+      ? [[onboarded.key, (s) => s.admin], ...extra]
+      : [[landing.key, (s) => s.byProof]]
+    const at = await landedAt(client, landing.wallet, sessions)
     return at === undefined ? undefined : { status: 'included', txHashes: [], blockNumber: at }
   }
   const pause = () => new Promise((r) => setTimeout(r, intervalMs))
@@ -568,20 +595,23 @@ async function posted<T>(post: () => Promise<T>): Promise<T> {
   }
 }
 
-type Session = { admin: boolean; byProof: boolean }
+type Session = { identity: Hex; admin: boolean; byProof: boolean }
+/// A key, and when its session counts as landed.
+type Settles = [Hex, (session: Session) => boolean]
 
-/// The latest block once `wallet` has code and `key`'s session `settles`.
+/// The latest block once `wallet` has code and each key's session settles.
 async function landedAt(
   client: PublicClient,
-  { wallet, key }: Pick<Onboarded, 'wallet' | 'key'>,
-  settles: (session: Session) => boolean,
+  wallet: Address,
+  sessions: Settles[],
 ): Promise<number | undefined> {
   const blockNumber = await client.getBlockNumber()
   const code = await client.getCode({ address: wallet, blockNumber })
   if (!code || code === '0x') return undefined
   const read = { address: wallet, abi: webWalletAbi, functionName: 'sessionOf' } as const
-  const session = await client.readContract({ ...read, args: [key], blockNumber })
-  return settles(session) ? Number(blockNumber) : undefined
+  const of = (key: Hex) => client.readContract({ ...read, args: [key], blockNumber })
+  const settled = await Promise.all(sessions.map(async ([key, settles]) => settles(await of(key))))
+  return settled.every(Boolean) ? Number(blockNumber) : undefined
 }
 
 /// `wallet`'s balance of ETH (`native`) and of each of `tokens` at `blockNumber`.

@@ -14,6 +14,7 @@ import {
   handleEscrowAbi,
   OPERATIONS_DOMAIN,
   platformId,
+  policyHashOf,
   type SessionPolicy,
   walletRegistryAbi,
   webWalletAbi,
@@ -164,7 +165,7 @@ async function identity(s: NonNullable<Awaited<ReturnType<typeof stack>>>) {
 async function onboarded(
   s: NonNullable<Awaited<ReturnType<typeof stack>>>,
   o: Awaited<ReturnType<typeof identity>>,
-  extra: { routes?: Parameters<typeof onboard>[0]['routes'] } = {},
+  extra: Pick<Parameters<typeof onboard>[0], 'routes' | 'session'> = {},
 ) {
   const done = await onboard({ ...o.onboarding, ...extra })
   const landed = await waitFor(API, done.id, {
@@ -259,7 +260,7 @@ test('an onboarding swaps an approved token for the refund', async (ctx) => {
   })
 }, 120_000)
 
-test('a second key signs in alone, its login at the head of the batch it signs', async (ctx) => {
+test('an onboarding adds a limited session; a second key signs in alone', async (ctx) => {
   const s = await stack()
   if (!s) {
     if (process.env.CI) throw new Error(`no stack under CI at ${API}`)
@@ -271,8 +272,15 @@ test('a second key signs in alone, its login at the head of the batch it signs',
   await s.mined(
     await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args, value: amount }),
   )
-  await onboarded(s, o)
+  // A limited key beside the genesis key, active from the next second.
+  const k3 = privateKeyToAccount(generatePrivateKey()).address
+  const limited = { ...admin, admin: false }
+  await onboarded(s, o, { session: { key: k3, policy: limited } })
+  const read = { address: o.wallet, abi: webWalletAbi, functionName: 'sessionOf' } as const
+  const extra = await s.client.readContract({ ...read, args: [k3] })
+  expect(extra).toMatchObject({ admin: false, byProof: false, policyHash: policyHashOf(limited) })
 
+  // The login at the head adds K2 in the block, so K2 alone signs its batch.
   const k2 = privateKeyToAccount(generatePrivateKey())
   const login = { chainId: s.config.chainId, wallet: o.wallet, key: k2.address, policy: admin }
   const payload = stubPayload(ADD_SESSION_DOMAIN, signInTransactionData(login))
@@ -290,12 +298,7 @@ test('a second key signs in alone, its login at the head of the batch it signs',
     client: s.client,
     signedIn: done,
   })
-  const session = await s.client.readContract({
-    address: o.wallet,
-    abi: webWalletAbi,
-    functionName: 'sessionOf',
-    args: [k2.address],
-  })
+  const session = await s.client.readContract({ ...read, args: [k2.address] })
   expect(session.byProof).toBe(true)
   // Active from the second before its block, so K2's signature counted in it.
   const block = await s.client.getBlock({ blockNumber: BigInt(landed.blockNumber) })

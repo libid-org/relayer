@@ -53,6 +53,13 @@ onboarding is included (the proof commits it, and a failed relay needs it
 again), then drop it. It is never revoked; later access is by X login
 (`addSessionByLogin`), and at quorum 1 a login session acts fully.
 
+`session: {key, policy}` adds a second key in the same batch, right after
+the link: the wallet's `addSession` for the genesis identity, active from the
+next second. A server that holds both keys keeps the second, under a limited
+policy, and drops the genesis key once the onboarding lands. `onboard`
+returns its key as `session`; `waitFor` with the onboarding settles a
+dropped request only once that session exists too.
+
 `handleNode` is an input: the ceremony's result names the handle
 (`handleNode('x', handle)` from `@libid/contracts`). Reading it from the
 proof would take each payload format's layout or a second `verify` call.

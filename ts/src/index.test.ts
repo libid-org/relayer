@@ -12,6 +12,7 @@ import {
   encodeAbiParameters,
   erc20Abi,
   type Hex,
+  keccak256,
   type PublicClient,
   parseAbiParameters,
   recoverAddress,
@@ -201,6 +202,28 @@ describe('onboard', () => {
       signature: signed.signatures[0].signature,
     })
     expect(signer).toBe(k.address)
+  })
+
+  test('adds the extra session after the link, for the genesis identity', async () => {
+    const sent = relayer({
+      '/v1/quote': [[200, quote(50_000)]],
+      '/v1/relay': [[202, { id: '0xab', status: 'queued' }]],
+    })
+    const k3 = privateKeyToAccount(generatePrivateKey())
+    const limited = { ...ethOnly.policy, admin: false, validUntil: NOW + 3600 }
+    const done = await onboard({ ...ethOnly, session: { key: k3.address, policy: limited } })
+    expect(done.session).toBe(k3.address)
+
+    const { executions } = decoded(sent['/v1/relay'][0].data as Hex)
+    expect(executions.map((e) => e.target)).toEqual([WALLET, WALLET, a(5), a(6), RELAYER])
+    const add = decodeFunctionData({ abi: webWalletAbi, data: executions[1].callData })
+    const identity = keccak256(
+      encodeAbiParameters(parseAbiParameters('bytes32, bytes32'), [zeroHash, ID]),
+    )
+    expect([add.functionName, add.args]).toEqual([
+      'addSession',
+      [identity, k3.address.toLowerCase(), limited],
+    ])
   })
 
   test('swaps the approved token for at least what the claimed ETH lacks', async () => {
@@ -404,6 +427,29 @@ describe('waitFor', () => {
       relayer({ [`/v1/relay/${ID}`]: Array(100).fill(unknown) })
       await expect(wait(client)).rejects.toMatchObject({ status: 404, name: 'RequestDropped' })
     }
+  })
+
+  test('once dropped, an onboarding with an extra session settles once that session exists', async () => {
+    const extra = privateKeyToAccount(generatePrivateKey()).address
+    const chain = (identity: Hex) =>
+      ({
+        getBlockNumber: async () => 42n,
+        getCode: async () => '0x01',
+        readContract: async ({ args: [key] }: { args: [Hex] }) =>
+          key === extra ? { identity, admin: false } : { identity: ID, admin: true },
+        getBalance: async () => ETHER,
+      }) as unknown as PublicClient
+    const settled = (identity: Hex) => {
+      relayer({ [path]: [unknown as [number, unknown]] })
+      const options = {
+        timeoutMs: 50,
+        client: chain(identity),
+        onboarded: { ...onboarded, session: extra },
+      }
+      return waitFor('http://relayer.test', ID, options)
+    }
+    await expect(settled(ID)).resolves.toMatchObject({ blockNumber: 42 })
+    await expect(settled(zeroHash)).rejects.toMatchObject({ name: 'RequestDropped' })
   })
 
   test('without a client, UnknownRequest throws', async () => {
