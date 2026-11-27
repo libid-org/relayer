@@ -220,6 +220,14 @@ on each listed token. Its allowances, each a `period`, are `native` of
 `NATIVE_TOKEN` and each token's `amount`. Defaults (`AGENT_DEFAULTS`): 0.01
 ETH a day; a token's amount has no default, its units being the token's.
 `approve` charges its amount to the token's allowance, whatever the spender.
+An approval outlives the session: after `revokeSession` or `validUntil`, the
+spender can still pull what the agent last approved. To revoke an agent, also
+set to 0 the allowances it granted; the wallet's `Approval` logs name the
+spenders.
+
+The escrow pulls a token deposit with `transferFrom`, which the session does
+not charge. A wallet with an agent session keeps no escrow allowance beyond
+what the agent approves, or the agent can deposit all of it in one batch.
 
 The agent signs its batches below quorum (`belowQuorumHash` of
 `@libid/contracts`) and sends them itself: the relayer pays only for

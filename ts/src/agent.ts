@@ -41,6 +41,8 @@ export type AgentPolicyOptions = {
   validUntil?: number
   /// ERC-20s the agent may approve the escrow for, each up to `amount` a
   /// period, in the token's units: 10 USDC is `10_000_000n`.
+  /// A deposit spends the escrow's allowance uncharged: the wallet keeps none
+  /// beyond what the agent approves.
   tokens?: readonly { token: Address; amount: bigint }[]
   /// Wei a period; also each deposit's most value.
   native?: bigint
