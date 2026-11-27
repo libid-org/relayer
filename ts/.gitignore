@@ -1,3 +1,0 @@
-node_modules
-# scripts/vendor-contracts-ts.sh links the pinned @libid/contracts here.
-vendor
