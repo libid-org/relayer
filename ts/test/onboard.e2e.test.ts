@@ -1,0 +1,390 @@
+/// Onboardings through the compose stack (README, "Local stack"): a fresh
+/// identity, its handle's escrow claimed into a wallet that starts with no ETH,
+/// the relayer repaid from it, in ETH or by swapping a token through a mock of
+/// Uniswap's router; then a second key's sign-in, repaid from the wallet, and an
+/// agent's below-quorum tip.
+/// Skips without the stack; fails under CI.
+
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  ADD_SESSION_DOMAIN,
+  AUTHORIZED_MODE,
+  authorizedData,
+  belowQuorumHash,
+  calls,
+  ceremonyProofVerifierAbi,
+  DIRECT_NONCE_KEY,
+  executeDigest,
+  handleEscrowAbi,
+  OPERATIONS_DOMAIN,
+  platformId,
+  policyHashOf,
+  type SessionPolicy,
+  walletRegistryAbi,
+  webWalletAbi,
+} from '@libid/contracts'
+import {
+  type Abi,
+  type Address,
+  createPublicClient,
+  createTestClient,
+  createWalletClient,
+  encodeAbiParameters,
+  erc20Abi,
+  type Hex,
+  http,
+  parseAbiParameters,
+  parseEther,
+  zeroHash,
+} from 'viem'
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
+import { foundry } from 'viem/chains'
+import { afterAll, expect, test } from 'vitest'
+
+import {
+  agentPolicy,
+  encodeExecutions,
+  NATIVE_TOKEN,
+  onboard,
+  onboardingTransactionData,
+  relayerConfig,
+  signIn,
+  signInTransactionData,
+  waitFor,
+  walletAddress,
+} from '../src/index.js'
+
+const API = 'http://127.0.0.1:8080'
+const ANVIL = 'http://127.0.0.1:8545'
+const repo = join(import.meta.dirname, '..', '..')
+
+// The stub's ABI as the pinned crate vendors it; its payload struct, which the ABI leaves out.
+const contracts = join(realpathSync(join(repo, 'ts', 'vendor', 'contracts')), '..', '..', '..')
+const stubAbi = JSON.parse(
+  readFileSync(join(contracts, 'rust', 'contracts', 'abi', 'StubPlatformVerifier.json'), 'utf8'),
+) as Abi
+const STUB_PAYLOAD = parseAbiParameters(
+  '(uint16 ceremonyVersion, bytes32 operationDomain, bytes32 authorizationNonce, bytes transactionData)',
+)
+/// A proof the stub accepts, committing `transactionData` under `operationDomain`.
+const stubPayload = (operationDomain: Hex, transactionData: Hex) =>
+  encodeAbiParameters(STUB_PAYLOAD, [
+    {
+      ceremonyVersion: 1,
+      operationDomain,
+      authorizationNonce: generatePrivateKey(),
+      transactionData,
+    },
+  ])
+
+const admin: SessionPolicy = {
+  validAfter: 0,
+  validUntil: 0,
+  admin: true,
+  signers: 0,
+  rules: { scopeRoot: zeroHash, domainsRoot: zeroHash, paymastersRoot: zeroHash, allowances: [] },
+}
+
+/// `test/mocks/SwapMocks.sol`, compiled by forge into a scratch directory.
+let mocks: string | undefined
+afterAll(() => mocks && rmSync(mocks, { recursive: true, force: true }))
+function mock(name: 'MockToken' | 'MockSwapRouter') {
+  if (!mocks) {
+    const out = mkdtempSync(join(tmpdir(), 'swap-mocks-'))
+    const args = ['build', '--contracts', '.', '--out', out, '--cache-path', join(out, 'cache')]
+    execFileSync('forge', args, { cwd: join(import.meta.dirname, 'mocks'), stdio: 'ignore' })
+    mocks = out
+  }
+  const artifact = JSON.parse(readFileSync(join(mocks, 'SwapMocks.sol', `${name}.json`), 'utf8'))
+  return { abi: artifact.abi as Abi, bytecode: artifact.bytecode.object as Hex }
+}
+
+async function stack() {
+  const ok = await fetch(`${API}/health`).catch(() => undefined)
+  if (!ok) return undefined
+  const addresses = JSON.parse(
+    execFileSync('docker', ['compose', 'exec', '-T', 'relayer', 'cat', '/etc/relayer/stack.json'], {
+      cwd: repo,
+      encoding: 'utf8',
+    }),
+  ) as { identityRegistry: Address; escrow: Address }
+  const client = createPublicClient({ chain: foundry, transport: http(ANVIL) })
+  const [, , anyone] = await createWalletClient({ transport: http(ANVIL) }).getAddresses()
+  const sender = createWalletClient({ account: anyone, transport: http(ANVIL), chain: foundry })
+  const mined = async (hash: Hex) => {
+    const receipt = await client.waitForTransactionReceipt({ hash })
+    expect(receipt.status).toBe('success')
+    return receipt
+  }
+  const config = await relayerConfig(API)
+  const escrow = { address: addresses.escrow, abi: handleEscrowAbi } as const
+  const native = await client.readContract({ ...escrow, functionName: 'NATIVE' })
+  return { ...addresses, client, sender, mined, config, escrow, native }
+}
+
+/// A fresh identity, which the stack's stub, X's verifier 1, reports, its wallet
+/// with no ETH, and K's proof that links it there as admin.
+async function identity(s: NonNullable<Awaited<ReturnType<typeof stack>>>) {
+  const platform = platformId('x')
+  const [idNode, handleNode] = [generatePrivateKey(), generatePrivateKey()]
+  const verifiers = await s.client.readContract({
+    address: s.config.registry,
+    abi: walletRegistryAbi,
+    functionName: 'proofVerifier',
+  })
+  const stub = await s.client.readContract({
+    address: verifiers,
+    abi: ceremonyProofVerifierAbi,
+    functionName: 'verifierOf',
+    args: [platform, 1],
+  })
+  const write = {
+    abi: stubAbi,
+    address: stub,
+    functionName: 'setNodes',
+    args: [idNode, handleNode],
+  }
+  await s.mined(await s.sender.writeContract(write))
+  const wallet = await walletAddress(s.client, s.config.factory, platform, idNode)
+  expect(await s.client.getBalance({ address: wallet })).toBe(0n)
+  const k = privateKeyToAccount(generatePrivateKey())
+  const transactionData = onboardingTransactionData({
+    chainId: s.config.chainId,
+    wallet,
+    key: k.address,
+    policy: admin,
+  })
+  const payload = stubPayload(OPERATIONS_DOMAIN, transactionData)
+  const onboarding = {
+    relayerUrl: API,
+    client: s.client,
+    proof: { platformId: platform, verifierVersion: 1, payload },
+    idNode,
+    signer: { key: k.address, sign: (hash: Hex) => k.sign({ hash }) },
+    policy: admin,
+    identityRegistry: s.identityRegistry,
+    escrow: s.escrow.address,
+    handleNode,
+  }
+  return { platform, handleNode, wallet, k, onboarding }
+}
+
+/// Onboard, wait, and check the escrow is empty and K is admin.
+async function onboarded(
+  s: NonNullable<Awaited<ReturnType<typeof stack>>>,
+  o: Awaited<ReturnType<typeof identity>>,
+  extra: Pick<Parameters<typeof onboard>[0], 'routes' | 'session'> = {},
+) {
+  const done = await onboard({ ...o.onboarding, ...extra })
+  const landed = await waitFor(API, done.id, {
+    timeoutMs: 60_000,
+    client: s.client,
+    onboarded: done,
+  })
+  for (const token of done.tokens) {
+    const args = [o.handleNode, token] as const
+    expect(await s.client.readContract({ ...s.escrow, functionName: 'escrowed', args })).toBe(0n)
+  }
+  const session = await s.client.readContract({
+    address: o.wallet,
+    abi: webWalletAbi,
+    functionName: 'sessionOf',
+    args: [o.k.address],
+  })
+  expect(session.admin).toBe(true)
+  return { done, landed }
+}
+
+test('an onboarding claims the escrowed ETH and repays the relayer from it', async (ctx) => {
+  const s = await stack()
+  if (!s) {
+    if (process.env.CI) throw new Error(`no stack under CI at ${API}`)
+    return ctx.skip(`no relayer at ${API}; docker compose up --wait`)
+  }
+  const o = await identity(s)
+  const amount = parseEther('1')
+  const args = [o.platform, o.handleNode, s.native, amount] as const
+  await s.mined(
+    await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args, value: amount }),
+  )
+
+  const { done, landed } = await onboarded(s, o)
+  expect(done.swapped).toEqual([])
+  const refund = done.linkFee + done.gasRefund
+  expect(landed.received).toEqual([{ token: s.native, amount: amount - refund }])
+}, 120_000)
+
+test('an onboarding swaps an approved token for the refund', async (ctx) => {
+  const s = await stack()
+  if (!s) {
+    if (process.env.CI) throw new Error(`no stack under CI at ${API}`)
+    return ctx.skip(`no relayer at ${API}; docker compose up --wait`)
+  }
+  const o = await identity(s)
+  // A token at 3000 a coin, and a router holding ETH to pay for it.
+  const deploy = async (name: 'MockToken' | 'MockSwapRouter', args: unknown[], value = 0n) => {
+    const hash = await s.sender.deployContract({ ...mock(name), args, value })
+    return (await s.mined(hash)).contractAddress as Address
+  }
+  const token = await deploy('MockToken', [])
+  const router = await deploy('MockSwapRouter', [3_000_000_000n], parseEther('1'))
+  const amount = 10_000_000n
+  const erc20 = { address: token, abi: erc20Abi } as const
+  const mint = {
+    ...erc20,
+    abi: mock('MockToken').abi,
+    functionName: 'mint',
+    args: [s.sender.account.address, amount],
+  }
+  await s.mined(await s.sender.writeContract(mint))
+  await s.mined(
+    await s.sender.writeContract({
+      ...erc20,
+      functionName: 'approve',
+      args: [s.escrow.address, amount],
+    }),
+  )
+  const args = [o.platform, o.handleNode, token, amount] as const
+  await s.mined(await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args }))
+
+  const route = { token, fee: 500, router, quoter: router, weth: router }
+  const { done, landed } = await onboarded(s, o, {
+    routes: { [s.config.chainId]: [route] },
+  })
+  // The swap sells exactly the allowance for at least the refund; the surplus
+  // ETH stays in the wallet.
+  const [swap] = done.swapped
+  const refund = done.linkFee + done.gasRefund
+  expect(swap.ethOutMin).toBe(refund)
+  const allowance = [o.wallet, router] as const
+  expect(
+    await s.client.readContract({ ...erc20, functionName: 'allowance', args: allowance }),
+  ).toBe(0n)
+  const [eth, left] = landed.received
+  expect(left).toEqual({ token, amount: amount - swap.amountIn })
+  expect(eth).toEqual({
+    token: s.native,
+    amount: (swap.amountIn * 10n ** 18n) / 3_000_000_000n - refund,
+  })
+}, 120_000)
+
+test('an onboarding adds a limited session; a second key signs in alone', async (ctx) => {
+  const s = await stack()
+  if (!s) {
+    if (process.env.CI) throw new Error(`no stack under CI at ${API}`)
+    return ctx.skip(`no relayer at ${API}; docker compose up --wait`)
+  }
+  const o = await identity(s)
+  const amount = parseEther('1')
+  const args = [o.platform, o.handleNode, s.native, amount] as const
+  await s.mined(
+    await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args, value: amount }),
+  )
+  // An agent's key beside the genesis key, active from the next second.
+  const k3 = privateKeyToAccount(generatePrivateKey())
+  const now = Number((await s.client.getBlock()).timestamp)
+  const agent = agentPolicy({ escrow: s.escrow.address, now })
+  await onboarded(s, o, { session: { key: k3.address, policy: agent.policy } })
+  const read = { address: o.wallet, abi: webWalletAbi, functionName: 'sessionOf' } as const
+  const extra = await s.client.readContract({ ...read, args: [k3.address] })
+  expect(extra).toMatchObject({
+    admin: false,
+    byProof: false,
+    policyHash: policyHashOf(agent.policy),
+  })
+
+  // The login at the head adds K2 in the block, so K2 alone signs its batch.
+  const k2 = privateKeyToAccount(generatePrivateKey())
+  const login = { chainId: s.config.chainId, wallet: o.wallet, key: k2.address, policy: admin }
+  const payload = stubPayload(ADD_SESSION_DOMAIN, signInTransactionData(login))
+  const before = await s.client.getBalance({ address: o.wallet })
+  const signingIn = {
+    relayerUrl: API,
+    client: s.client,
+    wallet: o.wallet,
+    proof: { platformId: o.platform, verifierVersion: 1, payload },
+    signer: { key: k2.address, sign: (hash: Hex) => k2.sign({ hash }) },
+    policy: admin,
+  }
+  // The onboarding's row holds the identity until `receipt_lag_blocks` blocks
+  // after it; anvil mines only on demand.
+  const anvil = createTestClient({ mode: 'anvil', transport: http(ANVIL) })
+  const done = await (async () => {
+    for (let tries = 1; ; tries++) {
+      try {
+        return await signIn(signingIn)
+      } catch (e) {
+        if ((e as Error).name !== 'IdentityBusy' || tries === 60) throw e
+        await anvil.mine({ blocks: 1 })
+        await new Promise((r) => setTimeout(r, 300))
+      }
+    }
+  })()
+  const landed = await waitFor(API, done.id, {
+    timeoutMs: 60_000,
+    client: s.client,
+    signedIn: done,
+  })
+  const session = await s.client.readContract({ ...read, args: [k2.address] })
+  expect(session.byProof).toBe(true)
+  // Active from the second before its block, so K2's signature counted in it.
+  const block = await s.client.getBlock({ blockNumber: BigInt(landed.blockNumber) })
+  expect(session.activeAt).toBe(Number(block.timestamp) - 1)
+  const after = await s.client.getBalance({ address: o.wallet })
+  expect(before - after).toBe(done.loginFee + done.gasRefund)
+
+  // Below quorum the agent alone tips another handle from the wallet, sent directly.
+  const [tip, tipped] = [parseEther('0.001'), generatePrivateKey()]
+  const deposit = calls.handleEscrow.deposit(
+    s.escrow.address,
+    tip,
+    o.platform,
+    tipped,
+    s.native,
+    tip,
+  )
+  const batch = [{ target: deposit.to, value: tip, callData: deposit.data }]
+  const wallet = { address: o.wallet, abi: webWalletAbi } as const
+  const [[, , version, , , salt], nonce, latest] = await Promise.all([
+    s.client.readContract({ ...wallet, functionName: 'eip712Domain' }),
+    s.client.readContract({ ...wallet, functionName: 'getNonce', args: [DIRECT_NONCE_KEY] }),
+    s.client.getBlock(),
+  ])
+  const at = Number(latest.timestamp)
+  const message = {
+    executionCalldata: encodeExecutions(batch),
+    value: 0n,
+    at,
+    nonce,
+    deadline: at + 600,
+    callGas: [0n],
+  }
+  const digest = executeDigest(message, s.config.chainId, o.wallet, BigInt(version), salt)
+  const signature = await k3.sign({ hash: belowQuorumHash(digest, at, k3.address) })
+  const data = authorizedData(message, {
+    signatures: [{ key: k3.address, signature }],
+    calls: agent.scope.calls(batch),
+    domainProof: [],
+    paymasterProof: [],
+  })
+  await s.mined(
+    await s.sender.writeContract({
+      ...wallet,
+      functionName: 'execute',
+      args: [AUTHORIZED_MODE, data],
+    }),
+  )
+  const escrowed = [tipped, s.native] as const
+  expect(
+    await s.client.readContract({ ...s.escrow, functionName: 'escrowed', args: escrowed }),
+  ).toBe(tip)
+  const spent = await s.client.readContract({
+    ...wallet,
+    functionName: 'allowanceOf',
+    args: [k3.address, NATIVE_TOKEN],
+  })
+  expect(spent.spent).toBe(tip)
+}, 120_000)

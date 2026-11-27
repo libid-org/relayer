@@ -228,6 +228,12 @@ the nonce check. Anvil mines only on transactions, so a paid row there stays
 until `receipt_lag_blocks` more blocks are mined. Beside `relayer.toml`, the one-shot writes `stack.json`, the
 identity registry's and the escrow's addresses.
 
+## Client
+
+[`ts/`](ts/README.md) is `@libid/relayer-client`, a TypeScript client that
+onboards a wallet through the API: link, bind, escrow claim, a token swap
+when the claimed ETH falls short, and refund, in one relayed transaction.
+
 ## Operate
 
 - Put a proxy in front of the relayer (Cloudflare, an AWS load balancer)
@@ -298,4 +304,7 @@ cargo test
 
 CI (`.github/workflows/ci.yml`) runs the vendor script, then formatting,
 clippy and the tests, on the Foundry and Rust versions it pins; its `e2e` job
-runs the e2e test against the compose stack.
+runs the client's checks, then the Rust and the client's e2e tests against the
+compose stack; its `swap-fork` job runs the client's swap routes on a fork of
+Base's live head (`pnpm -C ts test:fork`), the only job given `BASE_RPC_URL`,
+and is not meant to be required.
