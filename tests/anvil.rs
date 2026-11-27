@@ -222,7 +222,6 @@ async fn refuses_before_sending() {
         wallet: large.wallet,
         create: large.create,
         data: large.data,
-        below_quorum: false,
     };
     let refused = draft.quote(&o.relayer, &o.config()).await.err();
     assert!(refused.as_ref().is_some_and(too_large), "{refused:?}");

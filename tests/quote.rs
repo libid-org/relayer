@@ -94,7 +94,6 @@ impl Onboarding {
             wallet: self.wallet,
             create: self.path().await,
             data: self.authorize(b, None).await,
-            below_quorum: b.3.is_some(),
         };
         draft.quote(&self.relayer, config).await
     }
@@ -299,7 +298,6 @@ async fn the_create_path_lands_at_the_relay_time_limit() {
         wallet: o.wallet,
         create: None,
         data: o.authorize(&b, None).await,
-        below_quorum: false,
     };
     let refused = draft.quote(&o.relayer, &o.config()).await.err();
     let no_sign_in = matches!(refused, Some(Refusal::SignInMissing));
@@ -345,7 +343,6 @@ async fn session_batches_are_quoted_within_the_gas_margin() {
         wallet: o.wallet,
         create: None,
         data: message.authorized_data(authorization),
-        below_quorum: false,
     };
     let q3 = draft.quote(&o.relayer, &o.config()).await.unwrap();
     assert_eq!((q3.gas_limit, &q3.call_gas), (q.gas_limit, &q.call_gas));
@@ -411,7 +408,6 @@ async fn cuts_at_their_calldata_floor_are_quoted_the_whole_run() {
         wallet: o.wallet,
         create: None,
         data: data.clone(),
-        below_quorum: false,
     };
     let q = draft.quote(&o.relayer, &o.config()).await.unwrap();
     let run = o.simulated(&data, o.value).await.gas_used;
@@ -764,7 +760,6 @@ async fn floors_are_at_most_the_run_and_the_run_past_8_calls() {
             wallet,
             create,
             data,
-            below_quorum: false,
         };
         (draft.quote(&o.relayer, &o.config()).await.unwrap(), run)
     };

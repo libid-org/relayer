@@ -127,7 +127,7 @@ On `[http] port`:
 | Route                  | Body                     | Answer |
 | ---------------------- | ------------------------ | ------ |
 | `GET /v1/config`       |                          | `200` chain id, relayer, factory, registry, supported releases, limits |
-| `POST /v1/quote`       | `{wallet, create?, data, belowQuorum?}` | `200 {relayer, callGas, gasLimit, maxFeePerGas, l1FeeBound, minRefund, validUntil}` |
+| `POST /v1/quote`       | `{wallet, create?, data}` | `200 {relayer, callGas, gasLimit, maxFeePerGas, l1FeeBound, minRefund, validUntil}` |
 | `POST /v1/relay`       | `{wallet, create?, data, gasLimit}` | `202 {id, status}` |
 | `GET /v1/relay/{id}`   |                          | `200 {status, txHashes, blockNumber?, reverted?, error?}` |
 | `GET /health`          |                          | `200 OK`, or `503` once no tick succeeded for `tick_timeout` and ten poll intervals |

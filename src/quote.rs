@@ -64,9 +64,6 @@ pub struct Draft {
     pub create: Option<Create>,
     /// `execute(AUTHORIZED_MODE, data)`'s `data`, with dummy signatures.
     pub data: Bytes,
-    /// The client's hint that its signers fall short of quorum: the rules check runs.
-    #[serde(default)]
-    pub below_quorum: bool,
 }
 
 /// What the client signs: `call_gas`, and a refund of at least `value + min_refund`
@@ -140,13 +137,11 @@ impl Draft {
         let each = each.unwrap_or_else(|| vec![sim.gas_used; executions.len()]);
         let call_gas: Vec<_> = each.into_iter().map(|g| g.min(sim.gas_used)).collect();
         let before = cuts.map(|cuts| before(&cuts, &executions));
-        let below_quorum = self.below_quorum.then_some(executions.len());
         let refunds = refunds(&executions, config.relayer);
         if refunds.clone().next().is_none() {
             return Err(Refusal::RefundMissing);
         }
-        let unmeasured =
-            unmeasured(&message, &authorization, refunds, &call_gas, below_quorum);
+        let unmeasured = unmeasured(&message, &authorization, refunds, &call_gas);
         let (floors, create) = ((&call_gas[..], before.as_deref()), create.is_some());
         let gas_limit = gas::limit(&sim, unmeasured, floors.0, floors.1, create);
         under_max(gas_limit, config)?;
@@ -187,14 +182,13 @@ fn each(cuts: &[check::Cut], executions: &[Execution]) -> Option<Vec<u64>> {
 
 /// The gas the signed batch uses beyond its draft's run: the signatures the draft
 /// did not check, the rest of a valid `_verify`, the signed `call_gas` floors, the
-/// zero bytes the client fills as nonzero ([`gas::fillable`]), a value transfer for
-/// a refund drafted at 0, and, below quorum, the rules check of that many calls.
+/// zero bytes the client fills as nonzero ([`gas::fillable`]) and a value transfer
+/// for a refund drafted at 0.
 fn unmeasured(
     message: &ExecuteMessage,
     authorization: &ExecuteAuthorization,
     refunds: impl Iterator<Item = U256> + Clone,
     call_gas: &[u64],
-    below_quorum: Option<usize>,
 ) -> u64 {
     let costs = WalletGas::vendored();
     // `_verify` stops at the first failing signature, so it checked only the
@@ -210,12 +204,10 @@ fn unmeasured(
     let bytes = |g: &u64| u64::from(u64::BITS - g.leading_zeros()).div_ceil(8);
     let call_gas_bytes = call_gas.iter().map(bytes).sum::<u64>();
     let transfers = refunds.clone().filter(|r| r.is_zero()).count() as u64 * CALL_VALUE;
-    let rules = below_quorum.map_or(0, |n| costs.rules(n as u64));
     costs.verify_tail()
         + NONZERO_BYTE * call_gas_bytes
         + gas::fillable(message, authorization, refunds)
         + unchecked.sum::<u64>()
-        + rules
         + transfers
 }
 
@@ -239,7 +231,7 @@ mod tests {
         let base = WalletGas::vendored().verify_tail()
             + gas::fillable(&message, &authorization, refunds.clone());
         let priced =
-            |floors| unmeasured(&message, &authorization, refunds.clone(), floors, None);
+            |floors| unmeasured(&message, &authorization, refunds.clone(), floors);
         // The draft already carries the array's offset, length and one word a call.
         assert_eq!(priced(&[0, 0]), base);
         assert_eq!(priced(&[0x01_0000, 0xff]), base + 4 * NONZERO_BYTE);
