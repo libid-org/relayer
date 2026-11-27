@@ -140,8 +140,10 @@ fresh identity proof: a top-level call of the wallet (itself or
 `address(0)`) to `addSessionByLogin`, or to `linkIdentity` while the wallet
 has no code or never had a session, as a new wallet's onboarding does.
 Anything else is `SignInMissing`, quoted or relayed. A login in the wallet's
-own batch names the wallet as its submitter, and a live session signs the
-batch: the key it adds signs only from the next second. Below quorum a call
+own batch names the wallet as its submitter. A login at the head of the
+batch can sign that batch: a new device's key alone, or two platforms'
+logins at 2 of 3. A login after any other call signs only from the next
+second. Below quorum a call
 of the wallet is an admin operation, so a below-quorum batch is never paid
 for. `removeSessionsByLogin` does not count: it adds a session only when its
 payload carries a key.
