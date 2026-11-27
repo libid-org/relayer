@@ -534,6 +534,35 @@ describe('signIn', () => {
     expect(sent['/v1/relay']).toBeUndefined()
   })
 
+  test('quotes again once on GasLimitTooLow', async () => {
+    const tooLow: [number, unknown] = [
+      400,
+      { error: { name: 'GasLimitTooLow', message: 'm', args: { required: 1 } } },
+    ]
+    const repriced = (minRefund = '1000'): [number, unknown] => [
+      200,
+      { ...quote(1, minRefund), callGas: [50_000, 1] },
+    ]
+    const sent = relayer({
+      '/v1/quote': [priced, repriced()],
+      '/v1/relay': [tooLow, [202, { id: '0xcd', status: 'queued' }]],
+    })
+    const { quote: used } = await signIn(login(ETHER))
+    expect(used.callGas).toEqual([50_000, 1])
+    expect(decoded(sent['/v1/relay'][1].data as Hex, 5n, 3n, SALT).callGas).toEqual([50_000n, 1n])
+
+    relayer({ '/v1/quote': [priced, repriced()], '/v1/relay': [tooLow, tooLow] })
+    await expect(signIn(login(ETHER))).rejects.toMatchObject({ name: 'GasLimitTooLow' })
+
+    const short = relayer({ '/v1/quote': [priced, repriced('2000')], '/v1/relay': [tooLow] })
+    await expect(signIn(login(FEE + 1000n))).rejects.toMatchObject({
+      name: 'BalanceTooLow',
+      held: FEE + 1000n,
+      required: FEE + 2000n,
+    })
+    expect(short['/v1/relay']).toHaveLength(1)
+  })
+
   test("once dropped, waitFor settles once the key has a login's session", async () => {
     const unknown = [404, { error: { name: 'UnknownRequest', message: 'gone' } }]
     const chain = (byProof: boolean) =>
