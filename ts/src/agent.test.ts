@@ -108,3 +108,12 @@ test('agentPolicy: deposits and approvals within the allowances, for 30 days', (
   const until = agentPolicy({ escrow: ESCROW, now: NOW, validUntil: NOW + 60 }).policy
   expect(until.validUntil).toBe(NOW + 60)
 })
+
+test('agentPolicy refuses times in milliseconds', () => {
+  expect(() => agentPolicy({ escrow: ESCROW, now: NOW * 1000 })).toThrow('not in Unix seconds')
+  const late = { escrow: ESCROW, now: NOW, validUntil: NOW * 1000 }
+  expect(() => agentPolicy(late)).toThrow('not in Unix seconds')
+  expect(
+    agentPolicy({ escrow: ESCROW, now: 1e11 - 1, validUntil: 1e11 - 1 }).policy.validUntil,
+  ).toBe(1e11 - 1)
+})

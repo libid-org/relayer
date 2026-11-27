@@ -36,6 +36,7 @@ export type ScopeLeaf = { target: Address; selector: Hex; maxValue: bigint }
 export type AgentPolicyOptions = {
   escrow: Address
   /// Unix seconds; the session ends `AGENT_DEFAULTS.lifetime` after it.
+  /// A `now` or `validUntil` at or above 1e11, a time in milliseconds, throws.
   now: number
   validUntil?: number
   /// ERC-20s the agent may approve the escrow for, each up to `amount` a
@@ -64,6 +65,10 @@ export function agentPolicy(o: AgentPolicyOptions) {
     ...tokens.map((t) => ({ target: t.token, selector: approve, maxValue: 0n })),
   ]
   const s = scope(leaves)
+  const validUntil = o.validUntil ?? o.now + AGENT_DEFAULTS.lifetime
+  for (const t of [o.now, validUntil]) {
+    if (t >= 1e11) throw new Error(`${t} is not in Unix seconds`)
+  }
   const allowances = [{ token: NATIVE_TOKEN, amount: native }, ...tokens].map((a) => ({
     token: a.token,
     amount: a.amount,
@@ -71,7 +76,7 @@ export function agentPolicy(o: AgentPolicyOptions) {
   }))
   const policy: SessionPolicy = {
     validAfter: 0,
-    validUntil: o.validUntil ?? o.now + AGENT_DEFAULTS.lifetime,
+    validUntil,
     admin: false,
     signers: 1,
     rules: sortAllowances({
