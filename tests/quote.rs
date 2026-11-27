@@ -717,6 +717,35 @@ async fn an_existing_wallet_is_relayed_only_signing_in_again() {
     assert!(session.byProof, "no session by login");
 }
 
+/// A new device signs in alone: its login at the head of the batch adds K2, K2 alone
+/// signs the batch, and it is quoted and lands. After another call the same login
+/// signs nothing.
+#[tokio::test]
+async fn a_new_devices_login_at_the_head_signs_its_batch() {
+    let o = Onboarding::new(true).await;
+    o.land(&o.sign(&o.onboarding()).await, o.value).await;
+    let refund = o.repay(o.value + U256::from(CLAIMED / 100));
+    let k2 = PrivateKeySigner::random();
+    let login = o.login(&key_of(&k2), 2);
+    let late = Batch(
+        vec![refund.clone(), login.clone()],
+        o.value,
+        vec![&k2],
+        None,
+    );
+    let data = o.authorize(&late, Some(&[CALL_GAS; 2])).await;
+    let refused = o.check_at(&data, GAS_LIMIT).await.err();
+    let unsigned = matches!(&refused, Some(r) if reverted(r, "ExecutionNotSigned"));
+    assert!(unsigned, "{refused:?}");
+    let b = Batch(vec![login, refund], o.value, vec![&k2], None);
+    let q = o.quote_with(&o.config(), &b).await;
+    let data = o.authorize(&b, Some(&q.call_gas)).await;
+    o.send(&o.request_at(&data, q.gas_limit).await).await;
+    let wallet = IWebWallet::new(o.wallet, &o.owner);
+    let session = wallet.sessionOf(key_of(&k2)).call().await.unwrap();
+    assert!(session.byProof, "no session by login");
+}
+
 /// A call that burns most of the run is quoted at most the whole run's gas, not its
 /// own and a quarter; a batch of over 8 calls is quoted the whole run's for each.
 #[tokio::test]
