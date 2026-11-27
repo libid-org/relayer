@@ -1,6 +1,7 @@
 # @libid/relayer-client
 
-Onboards a libID web wallet through the relayer in one transaction. The
+Onboards a libID web wallet through the relayer in one transaction, and signs
+a new key in to it the same way (see "Sign in"). The onboarding
 transaction creates the wallet, links the identity with a genesis key as
 admin, binds the identity privately in the `IdentityRegistry`, claims the
 handle's `HandleEscrow` funds into the wallet, swaps an approved token for ETH
@@ -112,6 +113,38 @@ failure or a cancellation.
 Assumption: the claim page knows the X user id before the ceremony (from the
 Grok mention), so it can compute `idNode` and the wallet address that the
 proof must commit.
+
+## Sign in
+
+A new key signs in to an existing wallet in one relayed transaction, repaid
+from the wallet's own ETH.
+
+```ts
+// 1. Before the ceremony: what the login proof commits, under ADD_SESSION_DOMAIN.
+const transactionData = signInTransactionData({ chainId: config.chainId, wallet, key, policy })
+
+// 2. After it.
+const signedIn = await signIn({
+  relayerUrl,
+  client,
+  wallet,
+  proof: { platformId, verifierVersion, payload },
+  signer: { key, sign: (digest) => kms.sign(digest) },
+  policy,
+})
+await waitFor(relayerUrl, signedIn.id, { client, signedIn })
+```
+
+The batch is `signInBatch`: the wallet's `addSessionByLogin` of the new key at
+its head, then the refund, the login fee plus `minRefund`. A login at the head
+of the wallet's own batch is active in that block, so the new key alone signs
+the batch, under the wallet's `eip712Domain()` and nonce. It signs at quorum
+only when one session meets the wallet's threshold; a below-quorum batch is
+never relayed. `signIn` throws `BalanceTooLow {held, required}`, in wei,
+before relaying when the wallet's ETH is under the refund. It posts again and
+quotes again as `onboard` does, and returns the request `id`, `key`, `quote`,
+`deadline`, `loginFee` and `gasRefund`. Once the request is dropped, `waitFor`
+with `signedIn` settles when the key has a login's session.
 
 ### Holdings
 

@@ -1,13 +1,15 @@
 /// Onboardings through the compose stack (README, "Local stack"): a fresh
 /// identity, its handle's escrow claimed into a wallet that starts with no ETH,
 /// the relayer repaid from it, in ETH or by swapping a token through a mock of
-/// Uniswap's router. Skips without the stack; fails under CI.
+/// Uniswap's router; then a second key's sign-in, repaid from the wallet.
+/// Skips without the stack; fails under CI.
 
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  ADD_SESSION_DOMAIN,
   ceremonyProofVerifierAbi,
   handleEscrowAbi,
   OPERATIONS_DOMAIN,
@@ -37,6 +39,8 @@ import {
   onboard,
   onboardingTransactionData,
   relayerConfig,
+  signIn,
+  signInTransactionData,
   waitFor,
   walletAddress,
 } from '../src/index.js'
@@ -53,6 +57,16 @@ const stubAbi = JSON.parse(
 const STUB_PAYLOAD = parseAbiParameters(
   '(uint16 ceremonyVersion, bytes32 operationDomain, bytes32 authorizationNonce, bytes transactionData)',
 )
+/// A proof the stub accepts, committing `transactionData` under `operationDomain`.
+const stubPayload = (operationDomain: Hex, transactionData: Hex) =>
+  encodeAbiParameters(STUB_PAYLOAD, [
+    {
+      ceremonyVersion: 1,
+      operationDomain,
+      authorizationNonce: generatePrivateKey(),
+      transactionData,
+    },
+  ])
 
 const admin: SessionPolicy = {
   validAfter: 0,
@@ -131,14 +145,7 @@ async function identity(s: NonNullable<Awaited<ReturnType<typeof stack>>>) {
     key: k.address,
     policy: admin,
   })
-  const payload = encodeAbiParameters(STUB_PAYLOAD, [
-    {
-      ceremonyVersion: 1,
-      operationDomain: OPERATIONS_DOMAIN,
-      authorizationNonce: generatePrivateKey(),
-      transactionData,
-    },
-  ])
+  const payload = stubPayload(OPERATIONS_DOMAIN, transactionData)
   const onboarding = {
     relayerUrl: API,
     client: s.client,
@@ -250,4 +257,49 @@ test('an onboarding swaps an approved token for the refund', async (ctx) => {
     token: s.native,
     amount: (swap.amountIn * 10n ** 18n) / 3_000_000_000n - refund,
   })
+}, 120_000)
+
+test('a second key signs in alone, its login at the head of the batch it signs', async (ctx) => {
+  const s = await stack()
+  if (!s) {
+    if (process.env.CI) throw new Error(`no stack under CI at ${API}`)
+    return ctx.skip(`no relayer at ${API}; docker compose up --wait`)
+  }
+  const o = await identity(s)
+  const amount = parseEther('1')
+  const args = [o.platform, o.handleNode, s.native, amount] as const
+  await s.mined(
+    await s.sender.writeContract({ ...s.escrow, functionName: 'deposit', args, value: amount }),
+  )
+  await onboarded(s, o)
+
+  const k2 = privateKeyToAccount(generatePrivateKey())
+  const login = { chainId: s.config.chainId, wallet: o.wallet, key: k2.address, policy: admin }
+  const payload = stubPayload(ADD_SESSION_DOMAIN, signInTransactionData(login))
+  const before = await s.client.getBalance({ address: o.wallet })
+  const done = await signIn({
+    relayerUrl: API,
+    client: s.client,
+    wallet: o.wallet,
+    proof: { platformId: o.platform, verifierVersion: 1, payload },
+    signer: { key: k2.address, sign: (hash: Hex) => k2.sign({ hash }) },
+    policy: admin,
+  })
+  const landed = await waitFor(API, done.id, {
+    timeoutMs: 60_000,
+    client: s.client,
+    signedIn: done,
+  })
+  const session = await s.client.readContract({
+    address: o.wallet,
+    abi: webWalletAbi,
+    functionName: 'sessionOf',
+    args: [k2.address],
+  })
+  expect(session.byProof).toBe(true)
+  // Active from the second before its block, so K2's signature counted in it.
+  const block = await s.client.getBlock({ blockNumber: BigInt(landed.blockNumber) })
+  expect(session.activeAt).toBe(Number(block.timestamp) - 1)
+  const after = await s.client.getBalance({ address: o.wallet })
+  expect(before - after).toBe(done.loginFee + done.gasRefund)
 }, 120_000)

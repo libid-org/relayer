@@ -1,8 +1,15 @@
-import { executeDigest, handleEscrowAbi, walletSalt } from '@libid/contracts'
+import {
+  executeDigest,
+  handleEscrowAbi,
+  policyHashOf,
+  webWalletAbi,
+  walletSalt,
+} from '@libid/contracts'
 import {
   type Address,
   decodeAbiParameters,
   decodeFunctionData,
+  encodeAbiParameters,
   erc20Abi,
   type Hex,
   type PublicClient,
@@ -13,7 +20,17 @@ import {
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
-import { type Holding, type Onboarding, onboard, RelayerError, swapAbi, waitFor } from './index.js'
+import {
+  type Holding,
+  type Onboarding,
+  onboard,
+  RelayerError,
+  type SignIn,
+  signIn,
+  signInTransactionData,
+  swapAbi,
+  waitFor,
+} from './index.js'
 
 const a = (n: number) => `0x${n.toString(16).padStart(40, '0')}` as Address
 const [FACTORY, REGISTRY, RELAYER, WALLET, TOKEN, ROUTER] = [a(1), a(2), a(3), a(4), a(7), a(8)]
@@ -116,12 +133,13 @@ const EXECUTIONS = parseAbiParameters('(address target, uint256 value, bytes cal
 const AUTH = parseAbiParameters(
   '((bytes key, bytes signature)[] signatures, uint48 at, (uint256 maxValue, bytes32[] proof)[] calls, bytes32[] domainProof, bytes32[] paymasterProof)',
 )
-function decoded(data: Hex) {
+/// `data` decoded, and its digest under a wallet domain, by default a new wallet's.
+function decoded(data: Hex, nonce = 0n, version = 1n, salt = walletSalt(zeroHash, 0)) {
   const [calldata, value, deadline, callGas, auth] = decodeAbiParameters(DATA, data)
   const [executions] = decodeAbiParameters(EXECUTIONS, calldata)
   const [{ signatures, at }] = decodeAbiParameters(AUTH, auth)
-  const message = { executionCalldata: calldata, value, at, nonce: 0n, deadline, callGas }
-  const digest = executeDigest(message, config.chainId, WALLET, 1n, walletSalt(zeroHash, 0))
+  const message = { executionCalldata: calldata, value, at, nonce, deadline, callGas }
+  const digest = executeDigest(message, config.chainId, WALLET, version, salt)
   return { executions, value, deadline, callGas, signatures, digest }
 }
 
@@ -393,5 +411,97 @@ describe('waitFor', () => {
     await expect(waitFor('http://relayer.test', ID)).rejects.toMatchObject({
       name: 'UnknownRequest',
     })
+  })
+})
+
+describe('signIn', () => {
+  const k2 = privateKeyToAccount(generatePrivateKey())
+  const SALT = `0x${'5a'.repeat(32)}` as Hex
+  /// An existing wallet at nonce 5 under release 3, holding `held` wei.
+  const wallet = (held: bigint) =>
+    ({
+      ...client,
+      readContract: async ({ functionName }: { functionName: string }) =>
+        ({
+          quoteFor: FEE,
+          eip712Domain: ['0x0f', 'WebWallet', '3', 31337n, WALLET, SALT, []],
+          getNonce: 5n,
+        })[functionName],
+      getBalance: async () => held,
+    }) as unknown as PublicClient
+  const login = (held: bigint): SignIn => ({
+    relayerUrl: 'http://relayer.test',
+    client: wallet(held),
+    wallet: WALLET,
+    proof: { platformId: zeroHash, verifierVersion: 1, payload: '0x01' },
+    signer: { key: k2.address, sign: (hash) => k2.sign({ hash }) },
+    policy: ethOnly.policy,
+  })
+  const priced: [number, unknown] = [200, { ...quote(1), callGas: [40_000, 1] }]
+
+  test('commits the login of the key, submitted by the wallet itself', () => {
+    const p = { chainId: 31337, wallet: WALLET, key: k2.address, policy: ethOnly.policy }
+    const expected = encodeAbiParameters(
+      parseAbiParameters('uint256, address, address, bytes, bytes32'),
+      [31337n, WALLET, WALLET, k2.address, policyHashOf(ethOnly.policy)],
+    )
+    expect(signInTransactionData(p)).toBe(expected)
+  })
+
+  test("the new key alone signs the login at the head and the refund, under the wallet's domain", async () => {
+    const sent = relayer({
+      '/v1/quote': [priced],
+      '/v1/relay': [
+        [502, 'bad gateway'],
+        [202, { id: '0xab', status: 'queued' }],
+      ],
+    })
+    const done = await signIn(login(ETHER))
+    expect(done).toMatchObject({ id: '0xab', key: k2.address, loginFee: FEE, gasRefund: 1000n })
+    expect(sent['/v1/relay']).toHaveLength(2)
+
+    const relay = sent['/v1/relay'][0]
+    expect([sent['/v1/quote'][0].create, relay.create]).toEqual([undefined, undefined])
+    const signed = decoded(relay.data as Hex, 5n, 3n, SALT)
+    expect([signed.value, signed.callGas, signed.deadline]).toEqual([FEE, [40_000n, 1n], NOW + 75])
+    const [head, refund] = signed.executions
+    expect([head.target, head.value]).toEqual([WALLET, FEE])
+    const call = decodeFunctionData({ abi: webWalletAbi, data: head.callData })
+    expect(call.functionName).toBe('addSessionByLogin')
+    expect(call.args).toEqual([zeroHash, 1, '0x01', ethOnly.policy])
+    expect(refund).toEqual({ target: RELAYER, value: FEE + 1000n, callData: '0x' })
+    expect(signed.signatures.map((s) => s.key)).toEqual([k2.address.toLowerCase()])
+    const signer = await recoverAddress({
+      hash: signed.digest,
+      signature: signed.signatures[0].signature,
+    })
+    expect(signer).toBe(k2.address)
+  }, 10_000)
+
+  test('refuses a wallet whose ETH cannot repay, before relaying', async () => {
+    const sent = relayer({ '/v1/quote': [priced], '/v1/relay': [] })
+    await expect(signIn(login(FEE + 999n))).rejects.toMatchObject({
+      name: 'BalanceTooLow',
+      held: FEE + 999n,
+      required: FEE + 1000n,
+    })
+    expect(sent['/v1/relay']).toBeUndefined()
+  })
+
+  test("once dropped, waitFor settles once the key has a login's session", async () => {
+    const unknown = [404, { error: { name: 'UnknownRequest', message: 'gone' } }]
+    const chain = (byProof: boolean) =>
+      ({
+        getBlockNumber: async () => 42n,
+        getCode: async () => '0x01',
+        readContract: async () => ({ admin: false, byProof }),
+      }) as unknown as PublicClient
+    const signedIn = { wallet: WALLET, key: k2.address, deadline: NOW }
+    const wait = (byProof: boolean) =>
+      waitFor('http://relayer.test', ID, { timeoutMs: 50, client: chain(byProof), signedIn })
+    relayer({ [`/v1/relay/${ID}`]: [unknown as [number, unknown]] })
+    await expect(wait(true)).resolves.toEqual({ txHashes: [], blockNumber: 42, received: [] })
+    relayer({ [`/v1/relay/${ID}`]: [unknown as [number, unknown]] })
+    await expect(wait(false)).rejects.toMatchObject({ name: 'RequestDropped' })
   })
 })

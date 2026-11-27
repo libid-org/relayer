@@ -1,12 +1,15 @@
 /// Onboard a libID web wallet through the relayer: one relayed transaction
 /// creates the wallet, links the identity with the genesis key as admin, binds
 /// the identity privately, claims the handle's escrow into the wallet and
-/// repays the relayer from it. Wire format: the relayer's README, "HTTP API".
+/// repays the relayer from it. Sign a new key in to an existing wallet the same
+/// way, repaid from the wallet's ETH. Wire format: the relayer's README, "HTTP API".
 
 import {
   authorizedData,
   bindOperation,
+  type Call,
   calls,
+  DIRECT_NONCE_KEY,
   encodeOperationList,
   executeDigest,
   handleEscrowAbi,
@@ -170,7 +173,11 @@ export function onboardingBatch(
     calls.handleEscrow.claim(o.escrow, o.handleNode, b.tokens, wallet),
     ...swaps,
     { to: b.relayer, value: refund, data: '0x' as Hex },
-  ].map((c) => ({ target: c.to, value: c.value ?? 0n, callData: c.data }))
+  ].map(execution)
+}
+
+function execution(c: Call): Execution {
+  return { target: c.to, value: c.value ?? 0n, callData: c.data }
 }
 
 /// `GET /v1/config`: among others, the factory `walletAddress` reads.
@@ -203,11 +210,7 @@ export type Onboarded = {
 /// `ClaimTooSmall` when the holdings cannot repay the relayer.
 export async function onboard(o: Onboarding): Promise<Onboarded> {
   const http = relayerHttp(o.relayerUrl)
-  const config = await relayerConfig(o.relayerUrl)
-  const chainId = await o.client.getChainId()
-  if (chainId !== config.chainId) {
-    throw new Error(`the client is on chain ${chainId}, the relayer on ${config.chainId}`)
-  }
+  const { config, chainId } = await sameChain(o)
   const { platformId, verifierVersion, payload } = o.proof
   const salt = o.salt ?? 0n
   const native = { address: o.escrow, abi: handleEscrowAbi, functionName: 'NATIVE' } as const
@@ -256,18 +259,9 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
     swap?: SwapPlan,
   ) => {
     const batch = onboardingBatch(o, b, refund, deadline, swap)
-    const message = {
-      executionCalldata: encodeExecutions(batch),
-      value: fee,
-      at,
-      nonce: 0n,
-      deadline,
-      callGas: callGas ? callGas.map(BigInt) : batch.map(() => 0n),
-    }
-    const digest = executeDigest(message, chainId, wallet, version, walletSalt(zeroHash, 0))
-    const signature = await signer.sign(digest)
-    const signatures = [{ key: o.signer.key, signature }]
-    return authorizedData(message, { signatures, calls: [], domainProof: [], paymasterProof: [] })
+    const message = { value: fee, at, nonce: 0n, deadline, callGas }
+    const domain = { chainId, wallet, version, salt: walletSalt(zeroHash, 0) }
+    return authorized(batch, message, domain, o.signer.key, signer)
   }
   const create = { platformId, idNode: o.idNode, salt: salt.toString() }
   // The draft: well-formed, at zero floors, signed by a throwaway key under the real
@@ -318,11 +312,163 @@ export async function onboard(o: Onboarding): Promise<Onboarded> {
   }
 }
 
+/// What a login's proof commits under `ADD_SESSION_DOMAIN`, not an operation
+/// list: add `key` to `wallet` under `policy`, sent by the wallet's own batch.
+export function signInTransactionData(p: {
+  chainId: number | bigint
+  wallet: Address
+  key: Hex
+  policy: SessionPolicy
+}): Hex {
+  return walletTransactionData(p.chainId, p.wallet, p.wallet, p.key, p.policy)
+}
+
+export type SignIn = {
+  relayerUrl: string
+  client: PublicClient
+  wallet: Address
+  proof: { platformId: Hex; verifierVersion: number; payload: Hex }
+  /// The new key, the batch's only signer.
+  signer: Signer
+  policy: SessionPolicy
+}
+
+/// The wallet's login of the new key at the head, so the key signs the batch,
+/// then `refund` to the relayer.
+export function signInBatch(
+  o: Pick<SignIn, 'proof' | 'policy'>,
+  b: { wallet: Address; fee: bigint; relayer: Address },
+  refund: bigint,
+): Execution[] {
+  const { platformId, verifierVersion, payload } = o.proof
+  return [
+    calls.webWallet.addSessionByLogin(
+      b.wallet,
+      b.fee,
+      platformId,
+      verifierVersion,
+      payload,
+      o.policy,
+    ),
+    { to: b.relayer, value: refund, data: '0x' as Hex },
+  ].map(execution)
+}
+
+/// The wallet's ETH cannot repay the relayer: `held` and `required` in wei.
+export class BalanceTooLow extends Error {
+  override readonly name = 'BalanceTooLow'
+  constructor(
+    readonly held: bigint,
+    readonly required: bigint,
+  ) {
+    super(`the wallet holds ${held} wei, the refund needs ${required}`)
+  }
+}
+
+/// A relayed sign-in: the request, the quote it was signed under, and the
+/// refund's parts, `loginFee` and `gasRefund`.
+export type SignedIn = {
+  id: Hex
+  wallet: Address
+  /// The new session key.
+  key: Hex
+  quote: Quote
+  /// The batch's deadline, in Unix seconds: until then it may still land.
+  deadline: number
+  loginFee: bigint
+  gasRefund: bigint
+}
+
+/// Quote, sign with the new key alone and relay the sign-in; `waitFor` with
+/// `signedIn` follows it. Throws `BalanceTooLow`, before relaying, when the
+/// wallet's ETH is under the refund.
+export async function signIn(o: SignIn): Promise<SignedIn> {
+  const http = relayerHttp(o.relayerUrl)
+  const { config, chainId } = await sameChain(o)
+  const { wallet } = o
+  const { platformId, verifierVersion, payload } = o.proof
+  const read = { address: wallet, abi: webWalletAbi } as const
+  const [fee, block, [, , version, , , salt], nonce, held] = await Promise.all([
+    o.client.readContract({
+      address: config.registry,
+      abi: walletRegistryAbi,
+      functionName: 'quoteFor',
+      args: [platformId, verifierVersion, payload],
+    }),
+    o.client.getBlock(),
+    o.client.readContract({ ...read, functionName: 'eip712Domain' }),
+    o.client.readContract({ ...read, functionName: 'getNonce', args: [DIRECT_NONCE_KEY] }),
+    o.client.getBalance({ address: wallet }),
+  ])
+  const at = Number(block.timestamp)
+  const domain = { chainId, wallet, version: BigInt(version), salt }
+  const b = { wallet, fee, relayer: config.relayer }
+  const authorize = (
+    refund: bigint,
+    callGas: readonly number[] | undefined,
+    deadline: number,
+    signer: Signer,
+  ) => {
+    const message = { value: fee, at, nonce, deadline, callGas }
+    return authorized(signInBatch(o, b, refund), message, domain, o.signer.key, signer)
+  }
+  const quoted = async () => {
+    const data = await authorize(0n, undefined, at + 3600, throwaway())
+    return parseQuote(await http('POST', '/v1/quote', { wallet, data }))
+  }
+  let quote = await quoted()
+  for (let retried = false; ; retried = true) {
+    const refund = fee + quote.minRefund
+    if (held < refund) throw new BalanceTooLow(held, refund)
+    const deadline = quote.validUntil + config.queueWaitSeconds + config.inclusionWindowSeconds
+    const data = await authorize(refund, quote.callGas, deadline, o.signer)
+    try {
+      const body = { wallet, data, gasLimit: quote.gasLimit }
+      const { id } = (await posted(() => http('POST', '/v1/relay', body))) as { id: Hex }
+      const parts = { loginFee: fee, gasRefund: quote.minRefund }
+      return { id, wallet, key: o.signer.key, quote, deadline, ...parts }
+    } catch (e) {
+      if (retried || !(e instanceof RelayerError) || e.name !== 'GasLimitTooLow') throw e
+      quote = await quoted()
+    }
+  }
+}
+
+/// The relayer's config, once the client is on its chain.
+async function sameChain(o: { relayerUrl: string; client: PublicClient }) {
+  const config = await relayerConfig(o.relayerUrl)
+  const chainId = await o.client.getChainId()
+  if (chainId !== config.chainId) {
+    throw new Error(`the client is on chain ${chainId}, the relayer on ${config.chainId}`)
+  }
+  return { config, chainId }
+}
+
+/// `execute(AUTHORIZED_MODE, data)`'s data for `batch`, `signer` signing as
+/// `key`; without `callGas`, at a zero floor per call.
+async function authorized(
+  batch: Execution[],
+  m: { value: bigint; at: number; nonce: bigint; deadline: number; callGas?: readonly number[] },
+  d: { chainId: number; wallet: Address; version: bigint; salt: Hex },
+  key: Hex,
+  signer: Signer,
+): Promise<Hex> {
+  const message = {
+    ...m,
+    executionCalldata: encodeExecutions(batch),
+    callGas: m.callGas ? m.callGas.map(BigInt) : batch.map(() => 0n),
+  }
+  const digest = executeDigest(message, d.chainId, d.wallet, d.version, d.salt)
+  const signatures = [{ key, signature: await signer.sign(digest) }]
+  return authorizedData(message, { signatures, calls: [], domainProof: [], paymasterProof: [] })
+}
+
 type WaitOptions = {
   intervalMs?: number
   timeoutMs?: number
   client?: PublicClient
   onboarded?: Pick<Onboarded, 'wallet' | 'key' | 'native' | 'tokens' | 'deadline'>
+  signedIn?: Pick<SignedIn, 'wallet' | 'key' | 'deadline'>
 }
 
 /// `GET /v1/relay/{id}` every `intervalMs` until the request settles, through
@@ -337,15 +483,19 @@ type WaitOptions = {
 /// A cancelled batch may still land, sent by anyone, until its deadline: with
 /// `client` and an onboarding the chain answers once a block is past it;
 /// otherwise `Cancelled` throws at once, its `args.deadline` the onboarding's.
+/// With `signedIn` in place of an onboarding, the chain settles it once the new
+/// key has a login's session, and `received` is empty.
 export async function waitFor(
   relayerUrl: string,
   id: Hex,
-  { intervalMs = 500, timeoutMs = 120_000, client, onboarded }: WaitOptions = {},
+  { intervalMs = 500, timeoutMs = 120_000, client, onboarded, signedIn }: WaitOptions = {},
 ): Promise<{ txHashes: Hex[]; blockNumber: number; received: Holding[] }> {
   const http = relayerHttp(relayerUrl)
+  const landing = onboarded ?? signedIn
   const landed = async (): Promise<RelayStatus | undefined> => {
-    if (!client || !onboarded) return undefined
-    const at = await landedAt(client, onboarded)
+    if (!client || !landing) return undefined
+    const settles = onboarded ? (s: Session) => s.admin : (s: Session) => s.byProof
+    const at = await landedAt(client, landing, settles)
     return at === undefined ? undefined : { status: 'included', txHashes: [], blockNumber: at }
   }
   const pause = () => new Promise((r) => setTimeout(r, intervalMs))
@@ -354,7 +504,7 @@ export async function waitFor(
       async (e): Promise<RelayStatus | undefined> => {
         if (transient(e)) return undefined
         const unknown = e instanceof RelayerError && e.name === 'UnknownRequest'
-        if (!unknown || !client || !onboarded) throw e
+        if (!unknown || !client || !landing) throw e
         const settled = await landed()
         if (!settled) throw dropped(id)
         return settled
@@ -365,7 +515,7 @@ export async function waitFor(
       continue
     }
     if (s.status === 'cancelled') {
-      const deadline = onboarded?.deadline
+      const deadline = landing?.deadline
       const cancelled = () =>
         new RelayerError(200, 'Cancelled', 'the relayer cancelled it', { deadline })
       if (!client || deadline === undefined) throw cancelled()
@@ -418,17 +568,20 @@ async function posted<T>(post: () => Promise<T>): Promise<T> {
   }
 }
 
-/// The latest block once `wallet` has code and `key` is its admin session.
+type Session = { admin: boolean; byProof: boolean }
+
+/// The latest block once `wallet` has code and `key`'s session `settles`.
 async function landedAt(
   client: PublicClient,
   { wallet, key }: Pick<Onboarded, 'wallet' | 'key'>,
+  settles: (session: Session) => boolean,
 ): Promise<number | undefined> {
   const blockNumber = await client.getBlockNumber()
   const code = await client.getCode({ address: wallet, blockNumber })
   if (!code || code === '0x') return undefined
   const read = { address: wallet, abi: webWalletAbi, functionName: 'sessionOf' } as const
   const session = await client.readContract({ ...read, args: [key], blockNumber })
-  return session.admin ? Number(blockNumber) : undefined
+  return settles(session) ? Number(blockNumber) : undefined
 }
 
 /// `wallet`'s balance of ETH (`native`) and of each of `tokens` at `blockNumber`.
