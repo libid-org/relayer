@@ -221,7 +221,29 @@ fn unmeasured(
 
 #[cfg(test)]
 mod tests {
+    use libid_contracts::bindings::wallet::SessionSignature;
+
     use super::*;
+
+    #[test]
+    fn the_floors_cost_only_their_nonzero_bytes() {
+        let message = ExecuteMessage::default();
+        let authorization = ExecuteAuthorization {
+            signatures: vec![SessionSignature {
+                key: Bytes::from([1; 20]),
+                signature: Bytes::from([1; 65]),
+            }],
+            ..Default::default()
+        };
+        let refunds = [U256::from(1)].into_iter();
+        let base = WalletGas::vendored().verify_tail()
+            + gas::fillable(&message, &authorization, refunds.clone());
+        let priced =
+            |floors| unmeasured(&message, &authorization, refunds.clone(), floors, None);
+        // The draft already carries the array's offset, length and one word a call.
+        assert_eq!(priced(&[0, 0]), base);
+        assert_eq!(priced(&[0x01_0000, 0xff]), base + 4 * NONZERO_BYTE);
+    }
 
     #[test]
     fn a_cut_at_its_calldata_floor_falls_back_to_the_whole_run() {
